@@ -203,7 +203,15 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
     for message in messages {
         match message.role {
             Role::User => {
-                for block in &message.content {
+                // OpenAI-compat servers require each `tool` message to immediately
+                // follow the assistant message carrying the matching `tool_calls`, so
+                // emit tool results before any text within a user message.
+                let (tool_results, others): (Vec<_>, Vec<_>) = message
+                    .content
+                    .iter()
+                    .partition(|block| matches!(block, ContentBlock::ToolResult { .. }));
+
+                for block in tool_results.into_iter().chain(others) {
                     match block {
                         ContentBlock::Text { text } => {
                             wire_messages.push(OpenAiRequestMessage::User {
@@ -329,7 +337,7 @@ mod tests {
 
     #[test]
     fn to_wire_maps_a_full_tool_loop_history() {
-        // Arrange: user prompt → assistant tool call → tool results → assistant answer
+        // Arrange
         let history = vec![
             Message {
                 role: Role::User,
@@ -371,8 +379,10 @@ mod tests {
         // Act
         let wire = serde_json::to_value(to_wire(&history)).unwrap();
 
-        // Assert: one internal message can fan out (tool results) or fold (assistant);
-        // text-less content is null, empty tool_calls is ABSENT (not []), errors get a prefix
+        // Assert
+        // One internal message can fan out (tool results) or fold (assistant);
+        // text-less content is null, empty tool_calls is ABSENT (not []), errors
+        // get a prefix
         assert_eq!(
             wire,
             json!([
@@ -396,10 +406,39 @@ mod tests {
         );
     }
 
-    // ---- from_wire ------------------------------------------------------
-    // These build the wire message by deserializing JSON fixtures rather than
-    // constructing structs, so they also pin the response *parsing* — including
-    // tolerance of fields we don't model (role, index, refusal, ...).
+    #[test]
+    fn to_wire_emits_tool_results_before_text_in_a_mixed_user_message() {
+        // OpenAI-compat servers reject a `user` message appearing between an
+        // assistant `tool_calls` and its `tool` reply, so tool results must lead
+        // regardless of block order within the source message.
+
+        // Arrange
+        let history = vec![Message {
+            role: Role::User,
+            content: vec![
+                Text {
+                    text: "and also, what about this?".to_string(),
+                },
+                ToolResult {
+                    tool_use_id: "call_abc".to_string(),
+                    content: "ok".to_string(),
+                    is_error: false,
+                },
+            ],
+        }];
+
+        // Act
+        let wire = serde_json::to_value(to_wire(&history)).unwrap();
+
+        // Assert
+        assert_eq!(
+            wire,
+            json!([
+                { "role": "tool", "tool_call_id": "call_abc", "content": "ok" },
+                { "role": "user", "content": "and also, what about this?" }
+            ])
+        );
+    }
 
     #[test]
     fn from_wire_maps_a_text_response() {
@@ -410,9 +449,12 @@ mod tests {
         }))
         .unwrap();
 
-        // Act / Assert
+        // Act
+        let message = from_wire(wire);
+
+        // Assert
         assert_eq!(
-            from_wire(wire),
+            message,
             Message {
                 role: Role::Assistant,
                 content: vec![Text {
@@ -424,7 +466,7 @@ mod tests {
 
     #[test]
     fn from_wire_maps_a_tool_call_response() {
-        // Arrange: content is null, arguments is a STRING of JSON — both per the wire format
+        // Arrange
         let wire: OpenAiResponseMessage = serde_json::from_value(json!({
             "role": "assistant",
             "content": null,
@@ -439,9 +481,12 @@ mod tests {
         }))
         .unwrap();
 
-        // Act / Assert: arguments parsed into a Value; no empty Text block for null content
+        // Act
+        let message = from_wire(wire);
+
+        // Assert
         assert_eq!(
-            from_wire(wire),
+            message,
             Message {
                 role: Role::Assistant,
                 content: vec![ToolUse {
@@ -455,12 +500,6 @@ mod tests {
 
     #[test]
     fn from_wire_keeps_malformed_tool_arguments_as_a_raw_string() {
-        // This pins the "model mistakes are model feedback" choice (DESIGN §11):
-        // unparseable arguments become Value::String(raw) so tool dispatch can
-        // reject them with an error tool result instead of aborting the turn.
-        // If you go the ProviderError route instead, rewrite this test.
-        // Also: empty-string content should not produce a Text block.
-
         // Arrange
         let wire: OpenAiResponseMessage = serde_json::from_value(json!({
             "role": "assistant",
@@ -476,9 +515,12 @@ mod tests {
         }))
         .unwrap();
 
-        // Act / Assert
+        // Act
+        let message = from_wire(wire);
+
+        // Assert
         assert_eq!(
-            from_wire(wire),
+            message,
             Message {
                 role: Role::Assistant,
                 content: vec![ToolUse {
@@ -489,8 +531,6 @@ mod tests {
             }
         );
     }
-
-    // ---- map_stop_reason -------------------------------------------------
 
     #[test]
     fn map_stop_reason_maps_known_finish_reasons() {
@@ -512,12 +552,6 @@ mod tests {
             StopReason::Other("finish_reason missing".to_string())
         );
     }
-
-    // ---- complete ---------------------------------------------------------
-    // End-to-end through a mock HTTP server: request assembly on the way out,
-    // envelope parsing + stop-reason translation on the way back. Response
-    // fixtures carry the fields real servers send but we don't model (id,
-    // object, created, usage, index) so they double as tolerance tests.
 
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -625,7 +659,7 @@ mod tests {
             body["messages"],
             json!([{ "role": "user", "content": "What's in Cargo.toml?" }])
         );
-        // ToolDefinition → wire: tagged "function", schema under "parameters"
+        // ToolDefinition -> wire: tagged "function", schema under "parameters"
         assert_eq!(
             body["tools"],
             json!([{
@@ -645,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_omits_the_tools_key_when_there_are_no_tools() {
-        // Some compat servers 400 on "tools": [] — the key must be absent.
+        // Some compat servers 400 on "tools": [] so we don't include the key.
 
         // Arrange
         let server = MockServer::start().await;
@@ -740,8 +774,8 @@ mod tests {
     async fn complete_overrides_the_finish_reason_when_the_message_has_tool_calls() {
         // Some compat backends ship finish_reason "stop" alongside tool calls.
         // Trusting the label ends the turn with unanswered tool calls in
-        // history, and the *next* request 400s far from the cause — so the
-        // stop reason must be decided from the message content, not the label.
+        // history, and the *next* request 400s far from the cause. Due to that
+        // the stop reason must be decided from the message content, not the label.
 
         // Arrange
         let server = MockServer::start().await;
@@ -769,8 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_errors_instead_of_panicking_on_empty_choices() {
-        // A wobbly server sending "choices": [] is its bug, not ours — but it
-        // must surface as an Err, never an index panic.
+        // A wobbly server sending "choices": [] is it's bug, not ours.
 
         // Arrange
         let server = MockServer::start().await;
