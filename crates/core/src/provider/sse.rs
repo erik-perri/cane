@@ -266,4 +266,89 @@ mod tests {
         // Assert
         assert_eq!(events, vec![data_event("[DONE]")]);
     }
+
+    #[test]
+    fn find_end_of_chunk_returns_the_index_past_an_lf_terminator() {
+        // The returned index is the end of the block *including* its `\n\n`, so
+        // the caller can slice `[..end]` and drain the terminator with it.
+
+        // Arrange
+        let buffer = b"data: hi\n\ntrailing";
+
+        // Act
+        let end = find_end_of_chunk(buffer);
+
+        // Assert
+        assert_eq!(end, Some(10));
+    }
+
+    #[test]
+    fn find_end_of_chunk_returns_the_index_past_a_crlf_terminator() {
+        // `\r\n\r\n` is four bytes, so the index lands past all of them.
+
+        // Arrange
+        let buffer = b"data: hi\r\n\r\ntrailing";
+
+        // Act
+        let end = find_end_of_chunk(buffer);
+
+        // Assert
+        assert_eq!(end, Some(12));
+    }
+
+    #[test]
+    fn find_end_of_chunk_returns_none_without_a_terminator() {
+        // A block still accumulating in the buffer has no blank line yet.
+
+        // Arrange
+        let buffer = b"data: still going";
+
+        // Act
+        let end = find_end_of_chunk(buffer);
+
+        // Assert
+        assert_eq!(end, None);
+    }
+
+    #[test]
+    fn find_end_of_chunk_returns_none_for_a_partial_terminator() {
+        // A single trailing `\n` (or `\r\n\r`) is not yet a blank line; it must
+        // stay buffered until the next chunk completes the terminator.
+
+        // Arrange
+        let buffer = b"data: hi\n";
+
+        // Act
+        let end = find_end_of_chunk(buffer);
+
+        // Assert
+        assert_eq!(end, None);
+    }
+
+    #[test]
+    fn find_end_of_chunk_finds_the_first_of_several_terminators() {
+        // With two events buffered, only the first block is returned; the
+        // caller loops to drain the rest.
+
+        // Arrange
+        let buffer = b"data: first\n\ndata: second\n\n";
+
+        // Act
+        let end = find_end_of_chunk(buffer);
+
+        // Assert
+        assert_eq!(end, Some(13));
+    }
+
+    #[test]
+    fn find_end_of_chunk_returns_none_for_an_empty_buffer() {
+        // Arrange
+        let buffer = b"";
+
+        // Act
+        let end = find_end_of_chunk(buffer);
+
+        // Assert
+        assert_eq!(end, None);
+    }
 }
