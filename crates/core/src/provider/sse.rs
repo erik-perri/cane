@@ -9,6 +9,10 @@ pub(crate) struct SseEvent {
 #[derive(Default)]
 pub(crate) struct SseParser {
     buffer: Vec<u8>,
+    /// Bytes at the front of `buffer` already known to contain no terminator
+    /// start. Lets each `feed` scan only the newly appended region instead of
+    /// rescanning the whole buffer.
+    scan_from: usize,
 }
 
 impl SseParser {
@@ -28,8 +32,13 @@ impl SseParser {
 
         let mut events = Vec::new();
 
+        // A terminator can straddle the previous scan boundary, so back up by
+        // three bytes (the longest terminator is `\r\n\r\n`, and only its final
+        // byte can be new) before resuming the scan.
+        let mut search_from = self.scan_from.saturating_sub(3);
+
         loop {
-            match find_end_of_chunk(&self.buffer) {
+            match find_end_of_chunk(&self.buffer, search_from) {
                 Some(end_of_chunk) => {
                     let chunk_bytes = &self.buffer[..end_of_chunk];
                     let chunk = std::str::from_utf8(chunk_bytes)?.to_string();
@@ -67,8 +76,15 @@ impl SseParser {
                     }
 
                     self.buffer.drain(..end_of_chunk);
+
+                    // The buffer shifted; rescan the remainder from the front.
+                    search_from = 0;
+                    self.scan_from = 0;
                 }
-                None => break,
+                None => {
+                    self.scan_from = self.buffer.len();
+                    break;
+                }
             }
         }
 
@@ -76,8 +92,8 @@ impl SseParser {
     }
 }
 
-fn find_end_of_chunk(vec: &[u8]) -> Option<usize> {
-    (0..vec.len()).find_map(|i| {
+fn find_end_of_chunk(vec: &[u8], from: usize) -> Option<usize> {
+    (from..vec.len()).find_map(|i| {
         let remainder = &vec[i..];
 
         if remainder.starts_with(b"\r\n\r\n") {
@@ -268,6 +284,25 @@ mod tests {
     }
 
     #[test]
+    fn feed_completes_a_terminator_split_across_the_scan_boundary() {
+        // The first feed ends with `\r\n\r`, leaving the terminator incomplete
+        // and the scan cursor past it. The second feed supplies the final `\n`,
+        // which only completes the terminator because the resumed scan backs up
+        // over the boundary.
+
+        // Arrange
+        let mut parser = SseParser::default();
+
+        // Act
+        let first = parser.feed(b"data: hi\r\n\r").unwrap();
+        let second = parser.feed(b"\n").unwrap();
+
+        // Assert
+        assert!(first.is_empty(), "no complete event yet: {first:?}");
+        assert_eq!(second, vec![data_event("hi")]);
+    }
+
+    #[test]
     fn find_end_of_chunk_returns_the_index_past_an_lf_terminator() {
         // The returned index is the end of the block *including* its `\n\n`, so
         // the caller can slice `[..end]` and drain the terminator with it.
@@ -276,7 +311,7 @@ mod tests {
         let buffer = b"data: hi\n\ntrailing";
 
         // Act
-        let end = find_end_of_chunk(buffer);
+        let end = find_end_of_chunk(buffer, 0);
 
         // Assert
         assert_eq!(end, Some(10));
@@ -290,7 +325,7 @@ mod tests {
         let buffer = b"data: hi\r\n\r\ntrailing";
 
         // Act
-        let end = find_end_of_chunk(buffer);
+        let end = find_end_of_chunk(buffer, 0);
 
         // Assert
         assert_eq!(end, Some(12));
@@ -304,7 +339,7 @@ mod tests {
         let buffer = b"data: still going";
 
         // Act
-        let end = find_end_of_chunk(buffer);
+        let end = find_end_of_chunk(buffer, 0);
 
         // Assert
         assert_eq!(end, None);
@@ -319,7 +354,7 @@ mod tests {
         let buffer = b"data: hi\n";
 
         // Act
-        let end = find_end_of_chunk(buffer);
+        let end = find_end_of_chunk(buffer, 0);
 
         // Assert
         assert_eq!(end, None);
@@ -334,7 +369,7 @@ mod tests {
         let buffer = b"data: first\n\ndata: second\n\n";
 
         // Act
-        let end = find_end_of_chunk(buffer);
+        let end = find_end_of_chunk(buffer, 0);
 
         // Assert
         assert_eq!(end, Some(13));
@@ -346,7 +381,7 @@ mod tests {
         let buffer = b"";
 
         // Act
-        let end = find_end_of_chunk(buffer);
+        let end = find_end_of_chunk(buffer, 0);
 
         // Assert
         assert_eq!(end, None);
