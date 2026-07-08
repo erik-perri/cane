@@ -225,7 +225,9 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
                                 tool_call_id: tool_use_id.clone(),
                             });
                         }
-                        ContentBlock::ToolUse { .. } => unreachable!(),
+                        ContentBlock::ToolUse { .. } => {
+                            tracing::warn!("unexpected tool use content block")
+                        }
                     }
                 }
             }
@@ -251,7 +253,9 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
                                 kind: "function".to_string(),
                             });
                         }
-                        ContentBlock::ToolResult { .. } => unreachable!(),
+                        ContentBlock::ToolResult { .. } => {
+                            tracing::warn!("unexpected tool result content block")
+                        },
                     }
                 }
 
