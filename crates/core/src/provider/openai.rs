@@ -850,9 +850,7 @@ mod tests {
         }];
         let tools = Vec::new();
 
-        let (message, stop_reason) = client.complete(&messages, &tools)
-            .await
-            .unwrap();
+        let (message, stop_reason) = client.complete(&messages, &tools).await.unwrap();
 
         dbg!(&message);
 
