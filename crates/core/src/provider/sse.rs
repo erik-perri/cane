@@ -12,6 +12,17 @@ pub(crate) struct SseParser {
 }
 
 impl SseParser {
+    /// Feed a network chunk and return any events it completed.
+    ///
+    /// Supported grammar:
+    /// - Events terminate on a blank line: `\n\n` or `\r\n\r\n`.
+    ///   Mixed or lone-`\r` terminators are not recognized
+    /// - A single leading space is stripped from each field value
+    ///   (`data: x` -> `x`), per spec.
+    ///
+    /// Errors are **fatal for the stream**: a `Utf8Error` leaves the offending
+    /// block buffered, so re-feeding after an `Err` returns the same error. The
+    /// adapter must treat any `Err` as end-of-stream and stop feeding.
     pub(crate) fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, ProviderError> {
         self.buffer.extend_from_slice(chunk);
 
@@ -37,7 +48,7 @@ impl SseParser {
                         }
 
                         if let Some((line_type, line_data)) = line.split_once(':') {
-                            let trimmed_line_data = line_data.trim_start();
+                            let trimmed_line_data = line_data.strip_prefix(' ').unwrap_or(line_data);
                             match line_type {
                                 "event" => event = Some(trimmed_line_data.to_string()),
                                 "data" => data_lines.push(trimmed_line_data.to_string()),
