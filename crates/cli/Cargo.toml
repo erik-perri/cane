@@ -1,0 +1,10 @@
+[package]
+name = "natterjack-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "natter"
+path = "src/main.rs"
+
+[dependencies]
