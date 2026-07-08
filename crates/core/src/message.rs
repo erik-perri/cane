@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
@@ -13,6 +14,7 @@ pub struct Message {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
@@ -25,6 +27,7 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
 }
@@ -76,7 +79,7 @@ mod tests {
                 ToolResult {
                     tool_use_id: "Mock ID".to_string(),
                     content: "Mock Content".to_string(),
-                    is_error: false,
+                    is_error: true,
                 },
             ],
         };
@@ -87,15 +90,41 @@ mod tests {
 
         // Assert
         assert_eq!(message, unserialized);
-        // Shape check — this pins the format M2's JSONL sessions will write to disk
         assert_eq!(
             serde_json::to_value(&message).unwrap(),
             json!({
-                "role": "Assistant",
+                "role": "assistant",
                 "content": [
-                    { "Text": { "text": "Mock Text" } },
-                    { "ToolUse": { "id": "Mock ID", "name": "Mock Name", "input": "Mock Input" } },
-                    { "ToolResult": { "tool_use_id": "Mock ID", "content": "Mock Content", "is_error": false } }
+                    { "type": "text", "text": "Mock Text" },
+                    { "type": "tool_use", "id": "Mock ID", "name": "Mock Name", "input": "Mock Input" },
+                    { "type": "tool_result", "tool_use_id": "Mock ID", "content": "Mock Content", "is_error": true }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn message_excludes_is_error_when_false() {
+        // Arrange
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ToolResult {
+                tool_use_id: "Mock ID".to_string(),
+                content: "Mock Content".to_string(),
+                is_error: false,
+            }],
+        };
+
+        // Act
+        let shape = serde_json::to_value(&message).unwrap();
+
+        // Assert
+        assert_eq!(
+            shape,
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "Mock ID", "content": "Mock Content" }
                 ]
             })
         );
