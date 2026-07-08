@@ -108,7 +108,7 @@ impl OpenAiClient {
     ) -> Result<Self, ProviderError> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(60))
+            .read_timeout(Duration::from_secs(600))
             .build()?;
 
         Ok(Self {
