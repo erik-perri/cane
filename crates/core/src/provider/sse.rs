@@ -37,55 +37,47 @@ impl SseParser {
         // byte can be new) before resuming the scan.
         let mut search_from = self.scan_from.saturating_sub(3);
 
-        loop {
-            match find_end_of_chunk(&self.buffer, search_from) {
-                Some(end_of_chunk) => {
-                    let chunk_bytes = &self.buffer[..end_of_chunk];
-                    let chunk = std::str::from_utf8(chunk_bytes)?.to_string();
+        while let Some(end_of_chunk) = find_end_of_chunk(&self.buffer, search_from) {
+            let chunk_bytes = &self.buffer[..end_of_chunk];
+            let chunk = std::str::from_utf8(chunk_bytes)?.to_string();
 
-                    let mut event = None;
-                    let mut data_lines = Vec::new();
+            let mut event = None;
+            let mut data_lines = Vec::new();
 
-                    for line in chunk.lines() {
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        // Comment
-                        if line.starts_with(":") {
-                            continue;
-                        }
-
-                        if let Some((line_type, line_data)) = line.split_once(':') {
-                            let trimmed_line_data = line_data.strip_prefix(' ').unwrap_or(line_data);
-                            match line_type {
-                                "event" => event = Some(trimmed_line_data.to_string()),
-                                "data" => data_lines.push(trimmed_line_data.to_string()),
-                                _ => (),
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
-
-                    if !data_lines.is_empty() {
-                        events.push(SseEvent {
-                            data: data_lines.join("\n"),
-                            event,
-                        })
-                    }
-
-                    self.buffer.drain(..end_of_chunk);
-
-                    // The buffer shifted; rescan the remainder from the front.
-                    search_from = 0;
-                    self.scan_from = 0;
+            for line in chunk.lines() {
+                if line.is_empty() {
+                    continue;
                 }
-                None => {
-                    self.scan_from = self.buffer.len();
-                    break;
+
+                // Comment
+                if line.starts_with(":") {
+                    continue;
+                }
+
+                if let Some((line_type, line_data)) = line.split_once(':') {
+                    let trimmed_line_data = line_data.strip_prefix(' ').unwrap_or(line_data);
+                    match line_type {
+                        "event" => event = Some(trimmed_line_data.to_string()),
+                        "data" => data_lines.push(trimmed_line_data.to_string()),
+                        _ => (),
+                    }
+                } else {
+                    continue;
                 }
             }
+
+            if !data_lines.is_empty() {
+                events.push(SseEvent {
+                    data: data_lines.join("\n"),
+                    event,
+                })
+            }
+
+            self.buffer.drain(..end_of_chunk);
+
+            // The buffer shifted; rescan the remainder from the front.
+            search_from = 0;
+            self.scan_from = 0;
         }
 
         Ok(events)
@@ -170,7 +162,9 @@ mod tests {
         let mut parser = SseParser::default();
 
         // Act
-        let events = parser.feed(b": keep-alive\ndata: after comment\n\n").unwrap();
+        let events = parser
+            .feed(b": keep-alive\ndata: after comment\n\n")
+            .unwrap();
 
         // Assert
         assert_eq!(events, vec![data_event("after comment")]);
@@ -202,7 +196,9 @@ mod tests {
         let mut parser = SseParser::default();
 
         // Act
-        let events = parser.feed(b"event: content_block_delta\ndata: {\"text\":\"hi\"}\n\n").unwrap();
+        let events = parser
+            .feed(b"event: content_block_delta\ndata: {\"text\":\"hi\"}\n\n")
+            .unwrap();
 
         // Assert
         assert_eq!(
