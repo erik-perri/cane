@@ -6,7 +6,8 @@ mod sse;
 
 #[derive(Error, Debug)]
 pub enum ProviderError {
-    #[error("api error")]
+    /// A real non-2xx HTTP response. Status and body are the server's own.
+    #[error("api error ({status}): {body}")]
     Api { status: u16, body: String },
 
     #[error("network error")]
@@ -14,4 +15,8 @@ pub enum ProviderError {
 
     #[error("parsing error")]
     Parsing(#[from] Utf8Error),
+
+    /// The transport succeeded, but the payload broke the protocol contract.
+    #[error("protocol error: {detail}")]
+    Protocol { detail: String },
 }

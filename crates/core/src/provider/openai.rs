@@ -147,16 +147,23 @@ impl OpenAiClient {
             tools: openai_tools,
         };
 
-        let response = self.post(&body).await?.json::<OpenAiResponse>().await?;
-
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or(ProviderError::Api {
-                body: "No choices returned".to_string(),
-                status: 400,
+        // Read the body ourselves rather than `.json()` so a body that isn't
+        // the shape we expect surfaces as ProviderError::Protocol, not
+        // ProviderError::Network.
+        let text = self.post(&body).await?.text().await?;
+        let response: OpenAiResponse =
+            serde_json::from_str(&text).map_err(|err| ProviderError::Protocol {
+                detail: format!("could not decode response body: {err}"),
             })?;
+
+        let choice =
+            response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| ProviderError::Protocol {
+                    detail: "response contained no choices".to_string(),
+                })?;
 
         let message = from_wire(choice.message);
         let has_tool_use = message
@@ -820,15 +827,21 @@ mod tests {
         .await;
 
         // Act
-        let result = test_client(&server).complete(&user_history(), &[]).await;
+        let error = test_client(&server)
+            .complete(&user_history(), &[])
+            .await
+            .unwrap_err();
 
-        // Assert (tighten to your parse-flavored variant once it has a name)
-        assert!(result.is_err());
+        // Assert
+        assert!(
+            matches!(error, ProviderError::Protocol { .. }),
+            "expected ProviderError::Protocol, got {error:?}"
+        );
     }
 
     #[tokio::test]
     async fn complete_errors_on_a_non_json_response_body() {
-        // Proxies love returning HTML error pages with a 200.
+        // Proxies occasionally return HTML error pages with a 200.
 
         // Arrange
         let server = MockServer::start().await;
@@ -839,10 +852,16 @@ mod tests {
         .await;
 
         // Act
-        let result = test_client(&server).complete(&user_history(), &[]).await;
+        let error = test_client(&server)
+            .complete(&user_history(), &[])
+            .await
+            .unwrap_err();
 
-        // Assert (tighten to your parse-flavored variant once it has a name)
-        assert!(result.is_err());
+        // Assert
+        assert!(
+            matches!(error, ProviderError::Protocol { .. }),
+            "expected ProviderError::Protocol, got {error:?}"
+        );
     }
 
     #[tokio::test]
