@@ -1,12 +1,8 @@
 [package]
-name = "cane-cli"
+name = "cane"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "cane"
-path = "src/main.rs"
-
 [dependencies]
-cane-core = { path = "../core" }
+cane-core = { path = "../core", version = "0.1.0" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
