@@ -11,5 +11,5 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    natterjack_core::hello();
+    cane_core::hello();
 }

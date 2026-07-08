@@ -346,7 +346,7 @@ mod tests {
                 content: vec![
                     ToolResult {
                         tool_use_id: "call_abc".to_string(),
-                        content: "[package]\nname = \"natterjack\"".to_string(),
+                        content: "[package]\nname = \"cane\"".to_string(),
                         is_error: false,
                     },
                     ToolResult {
@@ -359,7 +359,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![Text {
-                    text: "It declares the natterjack package.".to_string(),
+                    text: "It declares the cane package.".to_string(),
                 }],
             },
         ];
@@ -385,9 +385,9 @@ mod tests {
                         }
                     }]
                 },
-                { "role": "tool", "tool_call_id": "call_abc", "content": "[package]\nname = \"natterjack\"" },
+                { "role": "tool", "tool_call_id": "call_abc", "content": "[package]\nname = \"cane\"" },
                 { "role": "tool", "tool_call_id": "call_def", "content": "Error: file not found: Cargo.lock" },
-                { "role": "assistant", "content": "It declares the natterjack package." }
+                { "role": "assistant", "content": "It declares the cane package." }
             ])
         );
     }
@@ -402,7 +402,7 @@ mod tests {
         // Arrange
         let wire: OpenAiResponseMessage = serde_json::from_value(json!({
             "role": "assistant",
-            "content": "It declares the natterjack package."
+            "content": "It declares the cane package."
         }))
         .unwrap();
 
@@ -412,7 +412,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![Text {
-                    text: "It declares the natterjack package.".to_string(),
+                    text: "It declares the cane package.".to_string(),
                 }],
             }
         );
@@ -676,7 +676,7 @@ mod tests {
         mount_response(
             &server,
             ResponseTemplate::new(200).set_body_json(envelope(
-                json!({ "role": "assistant", "content": "It declares the natterjack package." }),
+                json!({ "role": "assistant", "content": "It declares the cane package." }),
                 "stop",
             )),
         )
@@ -694,7 +694,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![Text {
-                    text: "It declares the natterjack package.".to_string(),
+                    text: "It declares the cane package.".to_string(),
                 }],
             }
         );
@@ -837,9 +837,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live server; run with -- --ignored"]
     async fn smoke_complete_against_a_live_server() {
-        let base_url = std::env::var("NATTER_BASE_URL").expect("set NATTER_BASE_URL");
-        let api_key = std::env::var("NATTER_API_KEY").unwrap_or("none".to_string());
-        let model = std::env::var("NATTER_MODEL").expect("set NATTER_MODEL");
+        let base_url = std::env::var("CANE_BASE_URL").expect("set CANE_BASE_URL");
+        let api_key = std::env::var("CANE_API_KEY").unwrap_or("none".to_string());
+        let model = std::env::var("CANE_MODEL").expect("set CANE_MODEL");
 
         let client = OpenAiClient::new(base_url, api_key, model, 1000).unwrap();
         let messages = vec![Message {

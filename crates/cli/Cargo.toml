@@ -1,12 +1,12 @@
 [package]
-name = "natterjack-cli"
+name = "cane-cli"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "natter"
+name = "cane"
 path = "src/main.rs"
 
 [dependencies]
-natterjack-core = { path = "../core" }
+cane-core = { path = "../core" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
