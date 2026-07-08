@@ -8,3 +8,5 @@ name = "natter"
 path = "src/main.rs"
 
 [dependencies]
+natterjack-core = { path = "../core" }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
