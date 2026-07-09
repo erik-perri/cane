@@ -68,6 +68,8 @@ async fn agent_loop(
             }
         };
 
+        let turn_start = history.len();
+
         match command {
             AgentCommand::UserInput(prompt) => {
                 history.push(Message {
@@ -86,6 +88,12 @@ async fn agent_loop(
                 Ok(result) => result,
                 Err(error) => {
                     let cancelled = matches!(&error, ProviderError::Cancelled);
+
+                    // History is committed only when the turn completes. A
+                    // failed stream may have already appended messages, and
+                    // retaining them would leave an incomplete turn in the
+                    // next request.
+                    history.truncate(turn_start);
 
                     let _ = events.send(AgentEvent::Error(error.to_string())).await;
                     let _ = events
@@ -164,6 +172,8 @@ async fn agent_loop(
             }
 
             if results.is_empty() {
+                history.truncate(turn_start);
+
                 let _ = events
                     .send(AgentEvent::Error(
                         "no tool results were generated".to_string(),
@@ -859,6 +869,10 @@ mod tests {
         assert!(
             shutdown_events.is_empty(),
             "clean shutdown emitted unexpected events: {shutdown_events:?}"
+        );
+        assert_eq!(
+            nth_request_messages(&server, 1).await,
+            json!([{ "role": "user", "content": "Try again." }])
         );
     }
 
