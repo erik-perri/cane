@@ -1,4 +1,4 @@
-use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason};
+use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
 use crate::{FileTool, Tool, ToolDefinition, dispatch};
 use tokio::sync::mpsc;
@@ -85,10 +85,27 @@ async fn agent_loop(
             let (assistant_msg, stop_reason) = match stream_result {
                 Ok(result) => result,
                 Err(error) => {
-                    if cancel.is_cancelled() {
-                        return Err(error);
-                    }
+                    let cancelled = matches!(&error, ProviderError::Cancelled);
+
                     let _ = events.send(AgentEvent::Error(error.to_string())).await;
+                    let _ = events
+                        .send(AgentEvent::TurnComplete {
+                            outcome: if cancelled {
+                                TurnOutcome::Cancelled
+                            } else {
+                                TurnOutcome::Failed
+                            },
+                        })
+                        .await;
+
+                    // A cancellation token cannot be reset, so this session
+                    // cannot accept another turn after its active turn ends.
+                    // End cleanly after delivering the terminal event rather
+                    // than returning an error to the task wrapper, which only
+                    // emits Error and would leave frontends waiting.
+                    if cancelled {
+                        return Ok(());
+                    }
                     break;
                 }
             };
@@ -98,7 +115,11 @@ async fn agent_loop(
             history.push(assistant_msg.clone());
 
             if stop_reason != StopReason::ToolUse {
-                let _ = events.send(AgentEvent::TurnComplete { stop_reason }).await;
+                let _ = events
+                    .send(AgentEvent::TurnComplete {
+                        outcome: TurnOutcome::Completed { stop_reason },
+                    })
+                    .await;
                 break;
             }
 
@@ -147,6 +168,11 @@ async fn agent_loop(
                     .send(AgentEvent::Error(
                         "no tool results were generated".to_string(),
                     ))
+                    .await;
+                let _ = events
+                    .send(AgentEvent::TurnComplete {
+                        outcome: TurnOutcome::Failed,
+                    })
                     .await;
                 break;
             }
@@ -326,7 +352,9 @@ mod tests {
             vec![
                 AgentEvent::TextDelta("Hello world".to_string()),
                 AgentEvent::TurnComplete {
-                    stop_reason: StopReason::EndTurn
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
                 },
             ]
         );
@@ -400,7 +428,9 @@ mod tests {
             vec![
                 AgentEvent::TextDelta("Hello!".to_string()),
                 AgentEvent::TurnComplete {
-                    stop_reason: StopReason::EndTurn
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
                 },
             ]
         );
@@ -409,7 +439,9 @@ mod tests {
             vec![
                 AgentEvent::TextDelta("Yes, I remember.".to_string()),
                 AgentEvent::TurnComplete {
-                    stop_reason: StopReason::EndTurn
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
                 },
             ]
         );
@@ -468,7 +500,9 @@ mod tests {
         assert!(matches!(
             first_turn.last(),
             Some(AgentEvent::TurnComplete {
-                stop_reason: StopReason::EndTurn
+                outcome: TurnOutcome::Completed {
+                    stop_reason: StopReason::EndTurn
+                }
             })
         ));
         assert!(matches!(
@@ -476,7 +510,9 @@ mod tests {
             [
                 AgentEvent::TextDelta(text),
                 AgentEvent::TurnComplete {
-                    stop_reason: StopReason::EndTurn
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
                 },
             ] if text == "Still alpha."
         ));
@@ -543,7 +579,9 @@ mod tests {
                 },
                 AgentEvent::TextDelta("It has one member.".to_string()),
                 AgentEvent::TurnComplete {
-                    stop_reason: StopReason::EndTurn
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
                 },
             ]
         );
@@ -610,7 +648,9 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(AgentEvent::TurnComplete {
-                stop_reason: StopReason::EndTurn
+                outcome: TurnOutcome::Completed {
+                    stop_reason: StopReason::EndTurn
+                }
             })
         ));
 
@@ -655,7 +695,9 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(AgentEvent::TurnComplete {
-                stop_reason: StopReason::EndTurn
+                outcome: TurnOutcome::Completed {
+                    stop_reason: StopReason::EndTurn
+                }
             })
         ));
         let messages = nth_request_messages(&server, 1).await;
@@ -744,8 +786,16 @@ mod tests {
 
         // Assert
         assert!(
-            matches!(&events[..], [AgentEvent::Error(msg)] if msg.contains("401")),
-            "expected a single Error event carrying the status, got {events:?}"
+            matches!(
+                &events[..],
+                [
+                    AgentEvent::Error(msg),
+                    AgentEvent::TurnComplete {
+                        outcome: TurnOutcome::Failed
+                    }
+                ] if msg.contains("401")
+            ),
+            "expected an Error followed by a failed TurnComplete, got {events:?}"
         );
     }
 
@@ -771,10 +821,7 @@ mod tests {
             .send(AgentCommand::UserInput("This will fail.".to_string()))
             .await
             .unwrap();
-        let error = timeout(Duration::from_secs(5), handle.events.recv())
-            .await
-            .expect("provider error was never emitted")
-            .expect("event channel closed after provider error");
+        let failed_turn = collect_turn(&mut handle.events).await;
 
         handle
             .commands
@@ -787,15 +834,25 @@ mod tests {
 
         // Assert
         assert!(
-            matches!(&error, AgentEvent::Error(msg) if msg.contains("401")),
-            "expected a provider error carrying the status, got {error:?}"
+            matches!(
+                &failed_turn[..],
+                [
+                    AgentEvent::Error(msg),
+                    AgentEvent::TurnComplete {
+                        outcome: TurnOutcome::Failed
+                    }
+                ] if msg.contains("401")
+            ),
+            "expected an Error followed by a failed TurnComplete, got {failed_turn:?}"
         );
         assert_eq!(
             recovery_turn,
             vec![
                 AgentEvent::TextDelta("This turn succeeded.".to_string()),
                 AgentEvent::TurnComplete {
-                    stop_reason: StopReason::EndTurn
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
                 },
             ]
         );
@@ -834,8 +891,16 @@ mod tests {
 
         // Assert
         assert!(
-            matches!(&events[..], [AgentEvent::Error(msg)] if msg.contains("cancel")),
-            "expected a single cancellation Error event, got {events:?}"
+            matches!(
+                &events[..],
+                [
+                    AgentEvent::Error(msg),
+                    AgentEvent::TurnComplete {
+                        outcome: TurnOutcome::Cancelled
+                    }
+                ] if msg.contains("cancel")
+            ),
+            "expected an Error followed by a cancelled TurnComplete, got {events:?}"
         );
     }
 }
