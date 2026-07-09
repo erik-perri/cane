@@ -160,32 +160,39 @@ impl OpenAiClient {
         })
     }
 
-    pub(crate) async fn complete(
+    fn build_request(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason), ProviderError> {
-        let openai_messages = to_wire(messages);
-        let mut openai_tools = Vec::new();
-
-        for tool in tools {
-            openai_tools.push(OpenAiRequestTool {
+        stream: bool,
+    ) -> OpenAiRequest {
+        let openai_tools = tools
+            .iter()
+            .map(|tool| OpenAiRequestTool {
                 function: OpenAiRequestFunction {
                     description: tool.description.clone(),
                     name: tool.name.clone(),
                     parameters: tool.input_schema.clone(),
                 },
                 kind: "function".to_string(),
-            });
-        }
+            })
+            .collect();
 
-        let body = OpenAiRequest {
+        OpenAiRequest {
             max_tokens: self.max_tokens,
-            messages: openai_messages,
+            messages: to_wire(messages),
             model: self.model.clone(),
-            stream: false,
+            stream,
             tools: openai_tools,
-        };
+        }
+    }
+
+    pub(crate) async fn complete(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<(Message, StopReason), ProviderError> {
+        let body = self.build_request(messages, tools, false);
 
         // Read the body ourselves rather than `.json()` so a body that isn't
         // the shape we expect surfaces as ProviderError::Protocol, not
@@ -206,16 +213,7 @@ impl OpenAiClient {
                 })?;
 
         let message = from_wire(choice.message);
-        let has_tool_use = message
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
-
-        let end_reason = if has_tool_use {
-            StopReason::ToolUse
-        } else {
-            map_stop_reason(choice.finish_reason.as_deref())
-        };
+        let end_reason = resolve_stop_reason(&message.content, choice.finish_reason.as_deref());
 
         Ok((message, end_reason))
     }
@@ -229,27 +227,7 @@ impl OpenAiClient {
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<(Message, StopReason), ProviderError> {
-        let openai_messages = to_wire(messages);
-        let mut openai_tools = Vec::new();
-
-        for tool in tools {
-            openai_tools.push(OpenAiRequestTool {
-                function: OpenAiRequestFunction {
-                    description: tool.description.clone(),
-                    name: tool.name.clone(),
-                    parameters: tool.input_schema.clone(),
-                },
-                kind: "function".to_string(),
-            });
-        }
-
-        let body = OpenAiRequest {
-            max_tokens: self.max_tokens,
-            messages: openai_messages,
-            model: self.model.clone(),
-            stream: true,
-            tools: openai_tools,
-        };
+        let body = self.build_request(messages, tools, true);
 
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -367,27 +345,14 @@ impl OpenAiClient {
                     });
                 }
 
-                let input = match serde_json::from_str(&tool_call.args_buf) {
-                    Ok(value) => value,
-                    Err(_) => serde_json::Value::String(tool_call.args_buf),
-                };
-
                 content.push(ContentBlock::ToolUse {
                     id: tool_call.id,
-                    input,
+                    input: parse_tool_arguments(tool_call.args_buf),
                     name: tool_call.name,
                 })
             }
 
-            let has_tool_use = content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
-
-            let end_reason = if has_tool_use {
-                StopReason::ToolUse
-            } else {
-                map_stop_reason(Some(&finish))
-            };
+            let end_reason = resolve_stop_reason(&content, Some(&finish));
 
             return Ok((
                 Message {
@@ -534,15 +499,9 @@ fn from_wire(msg: OpenAiResponseMessage) -> Message {
     }
 
     for tool_call in msg.tool_calls.unwrap_or_default() {
-        let raw = tool_call.function.arguments;
-        let input = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(_) => serde_json::Value::String(raw),
-        };
-
         content.push(ContentBlock::ToolUse {
             id: tool_call.id,
-            input,
+            input: parse_tool_arguments(tool_call.function.arguments),
             name: tool_call.function.name,
         })
     }
@@ -550,6 +509,30 @@ fn from_wire(msg: OpenAiResponseMessage) -> Message {
     Message {
         content,
         role: Role::Assistant,
+    }
+}
+
+/// Tool arguments arrive as a JSON-encoded string; a string that doesn't parse
+/// is kept raw so the tool layer can reject it with context instead of the
+/// turn failing here.
+fn parse_tool_arguments(raw: String) -> serde_json::Value {
+    match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => serde_json::Value::String(raw),
+    }
+}
+
+/// Some compat backends ship finish_reason "stop" alongside tool calls, so the
+/// stop reason is decided from the message content, not the server's label.
+fn resolve_stop_reason(content: &[ContentBlock], finish_reason: Option<&str>) -> StopReason {
+    let has_tool_use = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+
+    if has_tool_use {
+        StopReason::ToolUse
+    } else {
+        map_stop_reason(finish_reason)
     }
 }
 
@@ -1432,9 +1415,9 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_errors_when_the_stream_ends_without_done_or_finish_reason() {
-        // DESIGN §11 invariant: only complete messages count. If the connection
-        // closes after a content delta but before `[DONE]`/a finish_reason, the
-        // partial must surface as an error, never be handed to the agent loop.
+        // Only complete messages count. If the connection closes after a
+        // content delta but before `[DONE]`/a finish_reason, the partial
+        // must surface as an error, never be handed to the agent loop.
 
         // Arrange
         let server = MockServer::start().await;
@@ -1494,9 +1477,9 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_aborts_promptly_when_cancelled() {
-        // DESIGN §3, non-negotiable: a tripped CancellationToken aborts the HTTP
-        // stream. With the token already cancelled and the server stalling, the
-        // call must return `Cancelled` at once rather than waiting on the wire.
+        // A tripped CancellationToken aborts the HTTP stream. With the token
+        // already cancelled and the server stalling, the call must return
+        // `Cancelled` at once rather than waiting on the wire.
 
         // Arrange
         let server = MockServer::start().await;
