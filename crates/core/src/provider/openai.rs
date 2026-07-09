@@ -285,7 +285,9 @@ impl OpenAiClient {
                 match parsed_data {
                     Ok(data) => {
                         for choice in data.choices {
-                            if let Some(delta) = choice.delta.content {
+                            if let Some(delta) = choice.delta.content
+                                && !delta.is_empty()
+                            {
                                 text.push_str(&delta);
 
                                 tokio::select! {
@@ -304,7 +306,10 @@ impl OpenAiClient {
                                 for delta in delta_tool_calls {
                                     if delta.index >= MAX_TOOL_CALLS_PER_TURN {
                                         return Err(ProviderError::Protocol {
-                                            detail: format!("tool call index {} exceeds the per-turn cap", delta.index),
+                                            detail: format!(
+                                                "tool call index {} exceeds the per-turn cap",
+                                                delta.index
+                                            ),
                                         });
                                     }
 
