@@ -1,8 +1,8 @@
 use anyhow::Context;
+use cane_core::AgentCommand;
 use std::io::{Write, stdout};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt};
-use cane_core::AgentCommand;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
