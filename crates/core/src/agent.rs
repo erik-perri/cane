@@ -126,7 +126,7 @@ async fn agent_loop(
 
             tracing::debug!(history_len = history.len(), ?stop_reason);
 
-            history.push(assistant_msg.clone());
+            history.push(assistant_msg);
 
             if stop_reason != StopReason::ToolUse {
                 let _ = events
@@ -139,7 +139,7 @@ async fn agent_loop(
 
             let mut results = Vec::new();
 
-            for block in assistant_msg.content {
+            for block in &history.last().expect("just pushed").content {
                 match block {
                     ContentBlock::ToolUse {
                         id, input, name, ..
@@ -175,7 +175,7 @@ async fn agent_loop(
                         results.push(ContentBlock::ToolResult {
                             content,
                             is_error,
-                            tool_use_id: id,
+                            tool_use_id: id.clone(),
                         });
                     }
                     ContentBlock::Text { .. } => {}
