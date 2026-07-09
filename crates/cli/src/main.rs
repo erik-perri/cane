@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    print!("\n");
+    println!();
 
     Ok(())
 }
