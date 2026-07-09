@@ -155,7 +155,7 @@ async fn agent_loop(
                             return Ok(());
                         }
 
-                        let (content, is_error) = match dispatch(&tools, &name, input.clone()).await
+                        let (content, is_error) = match dispatch(&tools, name, input.clone()).await
                         {
                             Ok(output) => (output, false),
                             Err(err) => (err, true),
