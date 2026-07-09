@@ -288,7 +288,16 @@ impl OpenAiClient {
                             if let Some(delta) = choice.delta.content {
                                 text.push_str(&delta);
 
-                                let _ = events.send(AgentEvent::TextDelta(delta)).await;
+                                tokio::select! {
+                                    _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                                    sent = events.send(AgentEvent::TextDelta(delta)) => {
+                                        // A dropped receiver means the frontend is gone; stop
+                                        // pulling the stream for nobody.
+                                        if sent.is_err() {
+                                            return Err(ProviderError::Cancelled);
+                                        }
+                                    }
+                                }
                             }
 
                             if let Some(delta_tool_calls) = choice.delta.tool_calls {
