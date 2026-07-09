@@ -474,7 +474,7 @@ mod tests {
             .unwrap();
         let second_turn = collect_turn(&mut handle.events).await;
         drop(handle.commands);
-        collect_until_events_close(&mut handle.events).await;
+        let shutdown_events = collect_until_events_close(&mut handle.events).await;
 
         // Assert
         assert!(matches!(
@@ -492,6 +492,10 @@ mod tests {
                 },
             ] if text == "Still alpha."
         ));
+        assert!(
+            shutdown_events.is_empty(),
+            "clean shutdown emitted unexpected events: {shutdown_events:?}"
+        );
         assert_eq!(
             nth_request_messages(&server, 2).await,
             json!([
@@ -835,14 +839,7 @@ mod tests {
             .unwrap();
         wait_for_request_count(&server, 1).await;
         handle.cancel.cancel();
-        let mut events = Vec::new();
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = handle.events.recv().await {
-                events.push(event);
-            }
-        })
-        .await
-        .expect("cancel did not abort the in-flight turn promptly");
+        let events = collect_until_events_close(&mut handle.events).await;
 
         // Assert
         assert!(
