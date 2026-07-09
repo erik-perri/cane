@@ -1,4 +1,26 @@
+use serde::Deserialize;
 use serde_json::Value;
+
+const DEFAULT_READ_FILE_LIMIT: u64 = 2_000;
+const MAX_READ_FILE_LIMIT: u64 = 2_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadFileInput {
+    path: String,
+    #[serde(default = "default_offset")]
+    offset: u64,
+    #[serde(default = "default_read_file_limit")]
+    limit: u64,
+}
+
+fn default_offset() -> u64 {
+    1
+}
+
+fn default_read_file_limit() -> u64 {
+    DEFAULT_READ_FILE_LIMIT
+}
 
 /// A tool the model can call.
 #[derive(Clone, Debug)]
@@ -40,46 +62,53 @@ impl Tool for FileTool {
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "1-based line number to start from."
+                        "description": "1-based line number to start from. Defaults to 1.",
+                        "minimum": 1
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to return."
+                        "description": "Maximum number of lines to return. Defaults to 2000.",
+                        "minimum": 1,
+                        "maximum": MAX_READ_FILE_LIMIT
                     },
                 },
-                "required": ["path"]
+                "required": ["path"],
+                "additionalProperties": false
             })
         }
     }
 
     async fn execute(&self, input: Value) -> Result<String, String> {
-        let input = input.as_object().ok_or("invalid input")?;
-        let path = input
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or("missing 'path' field")?;
-        let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1);
-        let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(0);
+        let input: ReadFileInput = serde_json::from_value(input)
+            .map_err(|error| format!("invalid read_file input: {error}"))?;
 
-        let path = path.to_owned();
-        tokio::task::spawn_blocking(move || read_lines_from_file(&path, offset, limit))
-            .await
-            .map_err(|e| e.to_string())?
+        if input.path.is_empty() {
+            return Err("invalid read_file input: path cannot be empty".to_string());
+        }
+        if input.offset == 0 {
+            return Err("invalid read_file input: offset must be at least 1".to_string());
+        }
+        if input.limit == 0 || input.limit > MAX_READ_FILE_LIMIT {
+            return Err(format!(
+                "invalid read_file input: limit must be between 1 and {MAX_READ_FILE_LIMIT}"
+            ));
+        }
+
+        tokio::task::spawn_blocking(move || {
+            read_lines_from_file(&input.path, input.offset, input.limit)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 }
 
-/// `offset` is a 1-based starting line (0 is treated as 1); `limit` of 0
-/// means no limit.
+/// `offset` and `limit` have already been validated by `ReadFileInput`.
 fn read_lines_from_file(path: &str, offset: u64, limit: u64) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
 
     let lines = text.lines().skip(offset.saturating_sub(1) as usize);
-    let selected: Vec<&str> = if limit > 0 {
-        lines.take(limit as usize).collect()
-    } else {
-        lines.collect()
-    };
+    let selected: Vec<&str> = lines.take(limit as usize).collect();
 
     Ok(selected.join("\n"))
 }
@@ -102,7 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_reads_the_whole_file_by_default() {
+    async fn execute_reads_up_to_the_default_line_limit() {
         // Arrange
         let file = temp_file_with(b"line one\nline two\nline three");
 
@@ -156,6 +185,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_applies_the_default_line_limit() {
+        // Arrange
+        let contents = (0..=DEFAULT_READ_FILE_LIMIT)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file = temp_file_with(contents.as_bytes());
+
+        // Act
+        let output = FileTool {}
+            .execute(json!({ "path": path_of(&file) }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(output.lines().count(), DEFAULT_READ_FILE_LIMIT as usize);
+        assert_eq!(output.lines().last(), Some("1999"));
+    }
+
+    #[tokio::test]
     async fn execute_returns_empty_string_when_offset_is_past_the_last_line() {
         // Arrange
         let file = temp_file_with(b"one\ntwo");
@@ -187,7 +236,7 @@ mod tests {
         let result = FileTool {}.execute(json!({ "offset": 1 })).await;
 
         // Assert
-        assert_eq!(result, Err("missing 'path' field".to_string()));
+        assert!(result.unwrap_err().contains("missing field `path`"));
     }
 
     #[tokio::test]
@@ -196,7 +245,24 @@ mod tests {
         let result = FileTool {}.execute(json!("just a string")).await;
 
         // Assert
-        assert_eq!(result, Err("invalid input".to_string()));
+        assert!(result.unwrap_err().starts_with("invalid read_file input:"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_invalid_or_out_of_range_parameters() {
+        for input in [
+            json!({ "path": "file.txt", "offset": 0 }),
+            json!({ "path": "file.txt", "limit": 0 }),
+            json!({ "path": "file.txt", "limit": MAX_READ_FILE_LIMIT + 1 }),
+            json!({ "path": "file.txt", "offset": "one" }),
+            json!({ "path": "file.txt", "unexpected": true }),
+        ] {
+            let result = FileTool {}.execute(input).await;
+            assert!(
+                result.is_err(),
+                "invalid input should be rejected, got {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
