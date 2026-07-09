@@ -340,6 +340,12 @@ impl OpenAiClient {
             }
 
             for tool_call in tool_calls {
+                if tool_call.id.is_empty() || tool_call.name.is_empty() {
+                    return Err(ProviderError::Protocol {
+                        detail: "tool call id and name cannot be empty".to_string(),
+                    });
+                }
+
                 let input = match serde_json::from_str(&tool_call.args_buf) {
                     Ok(value) => value,
                     Err(_) => serde_json::Value::String(tool_call.args_buf),
