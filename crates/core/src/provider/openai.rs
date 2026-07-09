@@ -8,6 +8,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+const MAX_TOOL_CALLS_PER_TURN: usize = 64;
+
 #[derive(Debug, Eq, PartialEq, Serialize)]
 struct OpenAiRequest {
     max_tokens: u32,
@@ -291,6 +293,12 @@ impl OpenAiClient {
 
                             if let Some(delta_tool_calls) = choice.delta.tool_calls {
                                 for delta in delta_tool_calls {
+                                    if delta.index >= MAX_TOOL_CALLS_PER_TURN {
+                                        return Err(ProviderError::Protocol {
+                                            detail: format!("tool call index {} exceeds the per-turn cap", delta.index),
+                                        });
+                                    }
+
                                     if delta.index >= tool_calls.len() {
                                         tool_calls
                                             .resize_with(delta.index + 1, PartialToolCall::default);
