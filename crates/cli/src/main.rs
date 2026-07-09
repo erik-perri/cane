@@ -54,8 +54,10 @@ async fn main() -> anyhow::Result<()> {
             cane_core::AgentEvent::ToolFinished { .. } => {}
             cane_core::AgentEvent::TurnComplete { .. } => break,
             cane_core::AgentEvent::Error(e) => {
-                eprintln!("\nerror: {e}");
-                break;
+                // Terminate any partially streamed line; anyhow prints the
+                // error itself when main returns Err.
+                eprintln!();
+                return Err(anyhow::anyhow!(e));
             }
         }
     }
