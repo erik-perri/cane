@@ -51,35 +51,6 @@ enum OpenAiRequestMessage {
     },
 }
 
-#[derive(Debug, Eq, PartialEq, Deserialize)]
-struct OpenAiResponse {
-    choices: Vec<OpenAiResponseChoice>,
-}
-
-#[derive(Debug, Eq, PartialEq, Deserialize)]
-struct OpenAiResponseChoice {
-    finish_reason: Option<String>,
-    message: OpenAiResponseMessage,
-}
-
-#[derive(Debug, Eq, PartialEq, Deserialize)]
-struct OpenAiResponseMessage {
-    content: Option<String>,
-    tool_calls: Option<Vec<OpenAiResponseToolCall>>,
-}
-
-#[derive(Debug, Eq, PartialEq, Deserialize)]
-struct OpenAiResponseToolCall {
-    function: OpenAiResponseFunctionCall,
-    id: String,
-}
-
-#[derive(Debug, Eq, PartialEq, Deserialize)]
-struct OpenAiResponseFunctionCall {
-    arguments: String,
-    name: String,
-}
-
 #[derive(Debug, Eq, PartialEq, Serialize)]
 struct OpenAiRequestToolCall {
     function: OpenAiRequestFunctionCall,
@@ -160,12 +131,7 @@ impl OpenAiClient {
         })
     }
 
-    fn build_request(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-        stream: bool,
-    ) -> OpenAiRequest {
+    fn build_request(&self, messages: &[Message], tools: &[ToolDefinition]) -> OpenAiRequest {
         let openai_tools = tools
             .iter()
             .map(|tool| OpenAiRequestTool {
@@ -182,40 +148,9 @@ impl OpenAiClient {
             max_tokens: self.max_tokens,
             messages: to_wire(messages),
             model: self.model.clone(),
-            stream,
+            stream: true,
             tools: openai_tools,
         }
-    }
-
-    pub(crate) async fn complete(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason), ProviderError> {
-        let body = self.build_request(messages, tools, false);
-
-        // Read the body ourselves rather than `.json()` so a body that isn't
-        // the shape we expect surfaces as ProviderError::Protocol, not
-        // ProviderError::Network.
-        let text = self.post(&body).await?.text().await?;
-        let response: OpenAiResponse =
-            serde_json::from_str(&text).map_err(|err| ProviderError::Protocol {
-                detail: format!("could not decode response body: {err}"),
-            })?;
-
-        let choice =
-            response
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| ProviderError::Protocol {
-                    detail: "response contained no choices".to_string(),
-                })?;
-
-        let message = from_wire(choice.message);
-        let end_reason = resolve_stop_reason(&message.content, choice.finish_reason.as_deref());
-
-        Ok((message, end_reason))
     }
 
     /// Streams the response: sends `TextDelta` events out as they arrive and
@@ -227,7 +162,7 @@ impl OpenAiClient {
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<(Message, StopReason), ProviderError> {
-        let body = self.build_request(messages, tools, true);
+        let body = self.build_request(messages, tools);
 
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -489,33 +424,16 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
     wire_messages
 }
 
-fn from_wire(msg: OpenAiResponseMessage) -> Message {
-    let mut content = Vec::new();
-
-    if let Some(text) = msg.content
-        && !text.is_empty()
-    {
-        content.push(ContentBlock::Text { text });
-    }
-
-    for tool_call in msg.tool_calls.unwrap_or_default() {
-        content.push(ContentBlock::ToolUse {
-            id: tool_call.id,
-            input: parse_tool_arguments(tool_call.function.arguments),
-            name: tool_call.function.name,
-        })
-    }
-
-    Message {
-        content,
-        role: Role::Assistant,
-    }
-}
-
-/// Tool arguments arrive as a JSON-encoded string; a string that doesn't parse
-/// is kept raw so the tool layer can reject it with context instead of the
-/// turn failing here.
+/// Tool arguments arrive as a JSON-encoded string. Some compat backends send
+/// an empty string for a no-parameter tool call. That's a well-formed call,
+/// not an error, so it maps to `{}`. A non-empty string that doesn't parse is
+/// kept raw so the tool layer can reject it with context instead of the turn
+/// failing here: model mistakes are model feedback, not protocol failures.
 fn parse_tool_arguments(raw: String) -> serde_json::Value {
+    if raw.trim().is_empty() {
+        return serde_json::json!({});
+    }
+
     match serde_json::from_str(&raw) {
         Ok(value) => value,
         Err(_) => serde_json::Value::String(raw),
@@ -658,98 +576,6 @@ mod tests {
     }
 
     #[test]
-    fn from_wire_maps_a_text_response() {
-        // Arrange
-        let wire: OpenAiResponseMessage = serde_json::from_value(json!({
-            "role": "assistant",
-            "content": "It declares the cane package."
-        }))
-        .unwrap();
-
-        // Act
-        let message = from_wire(wire);
-
-        // Assert
-        assert_eq!(
-            message,
-            Message {
-                role: Role::Assistant,
-                content: vec![Text {
-                    text: "It declares the cane package.".to_string(),
-                }],
-            }
-        );
-    }
-
-    #[test]
-    fn from_wire_maps_a_tool_call_response() {
-        // Arrange
-        let wire: OpenAiResponseMessage = serde_json::from_value(json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{
-                "id": "call_abc",
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "arguments": "{\"path\":\"Cargo.toml\"}"
-                }
-            }]
-        }))
-        .unwrap();
-
-        // Act
-        let message = from_wire(wire);
-
-        // Assert
-        assert_eq!(
-            message,
-            Message {
-                role: Role::Assistant,
-                content: vec![ToolUse {
-                    id: "call_abc".to_string(),
-                    name: "read_file".to_string(),
-                    input: json!({ "path": "Cargo.toml" }),
-                }],
-            }
-        );
-    }
-
-    #[test]
-    fn from_wire_keeps_malformed_tool_arguments_as_a_raw_string() {
-        // Arrange
-        let wire: OpenAiResponseMessage = serde_json::from_value(json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "call_bad",
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "arguments": "{\"path\": unclosed"
-                }
-            }]
-        }))
-        .unwrap();
-
-        // Act
-        let message = from_wire(wire);
-
-        // Assert
-        assert_eq!(
-            message,
-            Message {
-                role: Role::Assistant,
-                content: vec![ToolUse {
-                    id: "call_bad".to_string(),
-                    name: "read_file".to_string(),
-                    input: serde_json::Value::String("{\"path\": unclosed".to_string()),
-                }],
-            }
-        );
-    }
-
-    #[test]
     fn map_stop_reason_maps_known_finish_reasons() {
         assert_eq!(map_stop_reason(Some("stop")), StopReason::EndTurn);
         assert_eq!(map_stop_reason(Some("tool_calls")), StopReason::ToolUse);
@@ -759,7 +585,7 @@ mod tests {
     #[test]
     fn map_stop_reason_preserves_unknown_finish_reasons() {
         // Compat servers emit values we don't model ("content_filter",
-        // "function_call", ...) — carry them through rather than guessing.
+        // "function_call", ...). Carry them through rather than guessing.
         assert_eq!(
             map_stop_reason(Some("content_filter")),
             StopReason::Other("content_filter".to_string())
@@ -792,36 +618,6 @@ mod tests {
         }]
     }
 
-    fn envelope(message: serde_json::Value, finish_reason: &str) -> serde_json::Value {
-        json!({
-            "id": "chatcmpl-123",
-            "object": "chat.completion",
-            "created": 1751980000,
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason
-            }],
-            "usage": { "prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19 }
-        })
-    }
-
-    fn tool_call_message() -> serde_json::Value {
-        json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{
-                "id": "call_abc",
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "arguments": "{\"path\":\"Cargo.toml\"}"
-                }
-            }]
-        })
-    }
-
     async fn mount_response(server: &MockServer, response: ResponseTemplate) {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -830,301 +626,6 @@ mod tests {
             .mount(server)
             .await;
     }
-
-    #[tokio::test]
-    async fn complete_sends_a_well_formed_request() {
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(200).set_body_json(envelope(
-                json!({ "role": "assistant", "content": "hi" }),
-                "stop",
-            )),
-        )
-        .await;
-        let tools = vec![ToolDefinition {
-            name: "read_file".to_string(),
-            description: "Read a file from disk".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"]
-            }),
-        }];
-
-        // Act
-        test_client(&server)
-            .complete(&user_history(), &tools)
-            .await
-            .unwrap();
-
-        // Assert
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
-        assert_eq!(
-            request.headers.get("authorization").unwrap(),
-            "Bearer test-key"
-        );
-
-        let body: serde_json::Value = request.body_json().unwrap();
-        assert_eq!(body["model"], "test-model");
-        assert_eq!(body["stream"], false);
-        assert!(body["max_tokens"].is_u64(), "max_tokens missing: {body}");
-        assert_eq!(
-            body["messages"],
-            json!([{ "role": "user", "content": "What's in Cargo.toml?" }])
-        );
-        // ToolDefinition -> wire: tagged "function", schema under "parameters"
-        assert_eq!(
-            body["tools"],
-            json!([{
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "Read a file from disk",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "path": { "type": "string" } },
-                        "required": ["path"]
-                    }
-                }
-            }])
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_omits_the_tools_key_when_there_are_no_tools() {
-        // Some compat servers 400 on "tools": [] so we don't include the key.
-
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(200).set_body_json(envelope(
-                json!({ "role": "assistant", "content": "hi" }),
-                "stop",
-            )),
-        )
-        .await;
-
-        // Act
-        test_client(&server)
-            .complete(&user_history(), &[])
-            .await
-            .unwrap();
-
-        // Assert
-        let requests = server.received_requests().await.unwrap();
-        let body: serde_json::Value = requests[0].body_json().unwrap();
-        assert!(
-            body.get("tools").is_none(),
-            "tools should be absent: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_maps_a_text_response() {
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(200).set_body_json(envelope(
-                json!({ "role": "assistant", "content": "It declares the cane package." }),
-                "stop",
-            )),
-        )
-        .await;
-
-        // Act
-        let (message, stop_reason) = test_client(&server)
-            .complete(&user_history(), &[])
-            .await
-            .unwrap();
-
-        // Assert
-        assert_eq!(
-            message,
-            Message {
-                role: Role::Assistant,
-                content: vec![Text {
-                    text: "It declares the cane package.".to_string(),
-                }],
-            }
-        );
-        assert_eq!(stop_reason, StopReason::EndTurn);
-    }
-
-    #[tokio::test]
-    async fn complete_maps_a_tool_call_response() {
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(200).set_body_json(envelope(tool_call_message(), "tool_calls")),
-        )
-        .await;
-
-        // Act
-        let (message, stop_reason) = test_client(&server)
-            .complete(&user_history(), &[])
-            .await
-            .unwrap();
-
-        // Assert
-        assert_eq!(
-            message,
-            Message {
-                role: Role::Assistant,
-                content: vec![ToolUse {
-                    id: "call_abc".to_string(),
-                    name: "read_file".to_string(),
-                    input: json!({ "path": "Cargo.toml" }),
-                }],
-            }
-        );
-        assert_eq!(stop_reason, StopReason::ToolUse);
-    }
-
-    #[tokio::test]
-    async fn complete_overrides_the_finish_reason_when_the_message_has_tool_calls() {
-        // Some compat backends ship finish_reason "stop" alongside tool calls.
-        // Trusting the label ends the turn with unanswered tool calls in
-        // history, and the *next* request 400s far from the cause. Due to that
-        // the stop reason must be decided from the message content, not the label.
-
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(200).set_body_json(envelope(tool_call_message(), "stop")),
-        )
-        .await;
-
-        // Act
-        let (message, stop_reason) = test_client(&server)
-            .complete(&user_history(), &[])
-            .await
-            .unwrap();
-
-        // Assert
-        assert_eq!(stop_reason, StopReason::ToolUse);
-        assert!(
-            message
-                .content
-                .iter()
-                .any(|block| matches!(block, ToolUse { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_errors_instead_of_panicking_on_empty_choices() {
-        // A wobbly server sending "choices": [] is it's bug, not ours.
-
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-123",
-                "object": "chat.completion",
-                "created": 1751980000,
-                "model": "test-model",
-                "choices": []
-            })),
-        )
-        .await;
-
-        // Act
-        let error = test_client(&server)
-            .complete(&user_history(), &[])
-            .await
-            .unwrap_err();
-
-        // Assert
-        assert!(
-            matches!(error, ProviderError::Protocol { .. }),
-            "expected ProviderError::Protocol, got {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_errors_on_a_non_json_response_body() {
-        // Proxies occasionally return HTML error pages with a 200.
-
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(200).set_body_string("<html>Bad Gateway</html>"),
-        )
-        .await;
-
-        // Act
-        let error = test_client(&server)
-            .complete(&user_history(), &[])
-            .await
-            .unwrap_err();
-
-        // Assert
-        assert!(
-            matches!(error, ProviderError::Protocol { .. }),
-            "expected ProviderError::Protocol, got {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_surfaces_api_errors_with_status_and_body() {
-        // Arrange
-        let server = MockServer::start().await;
-        mount_response(
-            &server,
-            ResponseTemplate::new(429).set_body_string("rate limited"),
-        )
-        .await;
-
-        // Act
-        let error = test_client(&server)
-            .complete(&user_history(), &[])
-            .await
-            .unwrap_err();
-
-        // Assert
-        match error {
-            ProviderError::Api { status, body } => {
-                assert_eq!(status, 429);
-                assert_eq!(body, "rate limited");
-            }
-            other => panic!("expected ProviderError::Api, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires a live server; run with -- --ignored"]
-    async fn smoke_complete_against_a_live_server() {
-        let base_url = std::env::var("CANE_BASE_URL").expect("set CANE_BASE_URL");
-        let api_key = std::env::var("CANE_API_KEY").unwrap_or("none".to_string());
-        let model = std::env::var("CANE_MODEL").expect("set CANE_MODEL");
-
-        let client = OpenAiClient::new(base_url, api_key, model, 1000).unwrap();
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "Say hi".to_string(),
-            }],
-        }];
-        let tools = Vec::new();
-
-        let (message, stop_reason) = client.complete(&messages, &tools).await.unwrap();
-
-        dbg!(&message);
-
-        assert!(!message.content.is_empty());
-        assert_eq!(stop_reason, StopReason::EndTurn);
-    }
-
-    // --- Step 5: streaming adapter (chat.completion.chunk -> our events) ---
 
     /// Wrap one `choices[0]` delta in a `chat.completion.chunk` envelope. A null
     /// `finish_reason` (the common case mid-stream) is passed as `None`.
@@ -1138,8 +639,7 @@ mod tests {
         })
     }
 
-    /// Serialize chunks as a data-only SSE stream terminated by `[DONE]` — the
-    /// exact shape an OpenAI-compat server sends over the wire.
+    /// Serialize chunks as a data-only SSE stream terminated by `[DONE]`.
     fn sse_stream(chunks: &[serde_json::Value]) -> String {
         let mut body = String::new();
         for chunk in chunks {
@@ -1178,6 +678,131 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_message_sends_a_well_formed_request() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[stream_chunk(
+                json!({ "role": "assistant", "content": "hi" }),
+                Some("stop"),
+            )]),
+        )
+        .await;
+        let tools = vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file from disk".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        }];
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        test_client(&server)
+            .stream_message(&user_history(), &tools, &tx, &cancel)
+            .await
+            .unwrap();
+
+        // Assert
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer test-key"
+        );
+
+        let body: serde_json::Value = request.body_json().unwrap();
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["stream"], true);
+        assert!(body["max_tokens"].is_u64(), "max_tokens missing: {body}");
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "What's in Cargo.toml?" }])
+        );
+        // ToolDefinition -> wire: tagged "function", schema under "parameters"
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file from disk",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }
+                }
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_message_omits_the_tools_key_when_there_are_no_tools() {
+        // Some compat servers 400 on "tools": [] so we don't include the key.
+
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[stream_chunk(
+                json!({ "role": "assistant", "content": "hi" }),
+                Some("stop"),
+            )]),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap();
+
+        // Assert
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert!(
+            body.get("tools").is_none(),
+            "tools should be absent: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_message_surfaces_api_errors_with_status_and_body() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_response(
+            &server,
+            ResponseTemplate::new(429).set_body_string("rate limited"),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let error = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap_err();
+
+        // Assert
+        match error {
+            ProviderError::Api { status, body } => {
+                assert_eq!(status, 429);
+                assert_eq!(body, "rate limited");
+            }
+            other => panic!("expected ProviderError::Api, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1281,6 +906,157 @@ mod tests {
             joined_text_deltas(&drain_events(&mut rx)).is_empty(),
             "tool-call arguments must not leak out as text deltas"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_message_overrides_the_finish_reason_when_the_message_has_tool_calls() {
+        // Some compat backends ship finish_reason "stop" alongside tool calls.
+        // Trusting the label ends the turn with unanswered tool calls in
+        // history, and the *next* request 400s far from the cause. Due to that
+        // the stop reason must be decided from the message content, not the label.
+
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[
+                stream_chunk(
+                    json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\":\"Cargo.toml\"}" }
+                        }]
+                    }),
+                    None,
+                ),
+                stream_chunk(json!({}), Some("stop")),
+            ]),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let (message, stop_reason) = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(stop_reason, StopReason::ToolUse);
+        assert!(
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ToolUse { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_message_maps_empty_tool_arguments_to_an_empty_object() {
+        // Several compat backends stream `"arguments": ""` for a call to a
+        // no-parameter tool and never append another fragment. That's a
+        // well-formed call, not an error. It must finalize as `{}`, not
+        // abort the turn.
+
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[
+                stream_chunk(
+                    json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": { "name": "list_tools", "arguments": "" }
+                        }]
+                    }),
+                    None,
+                ),
+                stream_chunk(json!({}), Some("tool_calls")),
+            ]),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let (message, stop_reason) = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            message,
+            Message {
+                role: Role::Assistant,
+                content: vec![ToolUse {
+                    id: "call_abc".to_string(),
+                    name: "list_tools".to_string(),
+                    input: json!({}),
+                }],
+            }
+        );
+        assert_eq!(stop_reason, StopReason::ToolUse);
+    }
+
+    #[tokio::test]
+    async fn stream_message_keeps_malformed_tool_arguments_as_a_raw_string() {
+        // Model mistakes are model feedback, not protocol failures: arguments
+        // that don't parse as JSON are kept raw so the tool layer can reject
+        // them with context instead of the turn dying here.
+
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[
+                stream_chunk(
+                    json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_bad",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\": " }
+                        }]
+                    }),
+                    None,
+                ),
+                stream_chunk(
+                    json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "unclosed" } }] }),
+                    None,
+                ),
+                stream_chunk(json!({}), Some("tool_calls")),
+            ]),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let (message, stop_reason) = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            message,
+            Message {
+                role: Role::Assistant,
+                content: vec![ToolUse {
+                    id: "call_bad".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::Value::String("{\"path\": unclosed".to_string()),
+                }],
+            }
+        );
+        assert_eq!(stop_reason, StopReason::ToolUse);
     }
 
     #[tokio::test]
@@ -1423,7 +1199,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_stream(
             &server,
-            // No `[DONE]`, no finish_reason — a truncated stream.
+            // No `[DONE]`, no finish_reason.
             format!(
                 "data: {}\n\n",
                 stream_chunk(json!({ "role": "assistant", "content": "Hel" }), None)
@@ -1449,7 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn stream_message_errors_on_a_chunk_that_is_not_valid_json() {
         // Compat servers occasionally interleave a non-JSON data line. A chunk we
-        // can't deserialize breaks the protocol contract — it is not model
+        // can't deserialize breaks the protocol contract. It is not model
         // feedback, so it aborts the turn as a ProviderError.
 
         // Arrange
