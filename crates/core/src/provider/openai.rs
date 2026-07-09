@@ -67,7 +67,7 @@ struct OpenAiRequestFunctionCall {
 
 pub(crate) struct OpenAiClient {
     api_key: String,
-    base_url: String,
+    endpoint: reqwest::Url,
     http: reqwest::Client,
     max_tokens: u32,
     model: String,
@@ -117,6 +117,7 @@ impl OpenAiClient {
         model: String,
         max_tokens: u32,
     ) -> Result<Self, ProviderError> {
+        let endpoint = endpoint_from_base_url(base_url)?;
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(600))
@@ -124,7 +125,7 @@ impl OpenAiClient {
 
         Ok(Self {
             api_key,
-            base_url,
+            endpoint,
             http,
             max_tokens,
             model,
@@ -310,7 +311,7 @@ impl OpenAiClient {
     async fn post(&self, body: &OpenAiRequest) -> Result<reqwest::Response, ProviderError> {
         let response = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(self.endpoint.clone())
             .bearer_auth(&self.api_key)
             .json(body)
             .send()
@@ -438,6 +439,40 @@ fn parse_tool_arguments(raw: String) -> serde_json::Value {
         Ok(value) => value,
         Err(_) => serde_json::Value::String(raw),
     }
+}
+
+fn endpoint_from_base_url(base_url: String) -> Result<reqwest::Url, ProviderError> {
+    let mut url =
+        reqwest::Url::parse(&base_url).map_err(|error| ProviderError::InvalidBaseUrl {
+            detail: error.to_string(),
+            base_url: base_url.clone(),
+        })?;
+
+    if url.cannot_be_a_base() || url.fragment().is_some() {
+        return Err(ProviderError::InvalidBaseUrl {
+            base_url,
+            detail: "must be a hierarchical URL without a fragment".to_string(),
+        });
+    }
+
+    // `join` discards the base's query (e.g. Azure's `?api-version=`), so
+    // detach it and restore it on the joined endpoint.
+    let query = url.query().map(str::to_owned);
+    url.set_query(None);
+
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+
+    let mut endpoint =
+        url.join("chat/completions")
+            .map_err(|error| ProviderError::InvalidBaseUrl {
+                base_url,
+                detail: error.to_string(),
+            })?;
+    endpoint.set_query(query.as_deref());
+
+    Ok(endpoint)
 }
 
 /// Some compat backends ship finish_reason "stop" alongside tool calls, so the
@@ -573,6 +608,39 @@ mod tests {
                 { "role": "user", "content": "and also, what about this?" }
             ])
         );
+    }
+
+    #[test]
+    fn endpoint_normalizes_base_urls_with_or_without_a_trailing_slash() {
+        for base_url in ["https://example.test/v1", "https://example.test/v1/"] {
+            let endpoint = endpoint_from_base_url(base_url.to_string()).unwrap();
+            assert_eq!(
+                endpoint.as_str(),
+                "https://example.test/v1/chat/completions"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_preserves_the_base_url_query_string() {
+        // Azure-style endpoints carry required query params (`?api-version=`).
+        let endpoint = endpoint_from_base_url(
+            "https://example.test/openai/v1?api-version=preview".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            endpoint.as_str(),
+            "https://example.test/openai/v1/chat/completions?api-version=preview"
+        );
+    }
+
+    #[test]
+    fn endpoint_rejects_invalid_base_urls() {
+        for base_url in ["not a URL", "https://example.test/v1#fragment"] {
+            let error = endpoint_from_base_url(base_url.to_string()).unwrap_err();
+            assert!(matches!(error, ProviderError::InvalidBaseUrl { .. }));
+        }
     }
 
     #[test]

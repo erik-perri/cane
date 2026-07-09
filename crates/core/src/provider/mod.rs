@@ -23,6 +23,9 @@ pub enum ProviderError {
     #[error("cancelled")]
     Cancelled,
 
+    #[error("invalid base URL '{base_url}': {detail}")]
+    InvalidBaseUrl { base_url: String, detail: String },
+
     #[error("network error")]
     Network(#[from] reqwest::Error),
 
