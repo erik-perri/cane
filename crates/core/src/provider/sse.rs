@@ -80,6 +80,10 @@ impl SseParser {
             self.scan_from = 0;
         }
 
+        // No complete event remains. The next feed only needs to reconsider
+        // the final three bytes, which may begin a split CRLF terminator.
+        self.scan_from = self.buffer.len();
+
         Ok(events)
     }
 }
@@ -296,6 +300,27 @@ mod tests {
         // Assert
         assert!(first.is_empty(), "no complete event yet: {first:?}");
         assert_eq!(second, vec![data_event("hi")]);
+    }
+
+    #[test]
+    fn feed_advances_the_scan_cursor_for_an_incomplete_event() {
+        // The cursor prevents a byte-at-a-time network stream from rescanning
+        // the complete unterminated event on every feed.
+
+        // Arrange
+        let mut parser = SseParser::default();
+
+        // Act
+        let first = parser.feed(b"data: partial").unwrap();
+        let first_cursor = parser.scan_from;
+        let second = parser.feed(b" event").unwrap();
+        let second_cursor = parser.scan_from;
+
+        // Assert
+        assert!(first.is_empty());
+        assert_eq!(first_cursor, b"data: partial".len());
+        assert!(second.is_empty());
+        assert_eq!(second_cursor, b"data: partial event".len());
     }
 
     #[test]
