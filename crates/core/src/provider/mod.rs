@@ -4,6 +4,15 @@ use thiserror::Error;
 mod openai;
 mod sse;
 
+pub(crate) use openai::OpenAiClient;
+
+pub(crate) struct ProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: u32,
+}
+
 #[derive(Error, Debug)]
 pub enum ProviderError {
     /// A real non-2xx HTTP response. Status and body are the server's own.
