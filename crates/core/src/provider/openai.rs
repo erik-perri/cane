@@ -340,11 +340,10 @@ impl OpenAiClient {
             }
 
             for tool_call in tool_calls {
-                let input = serde_json::from_str(&tool_call.args_buf).map_err(|error| {
-                    ProviderError::Protocol {
-                        detail: format!("unable to parse tool call arguments: {}", error),
-                    }
-                })?;
+                let input = match serde_json::from_str(&tool_call.args_buf) {
+                    Ok(value) => value,
+                    Err(_) => serde_json::Value::String(tool_call.args_buf),
+                };
 
                 content.push(ContentBlock::ToolUse {
                     id: tool_call.id,
