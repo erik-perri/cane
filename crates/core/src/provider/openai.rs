@@ -259,6 +259,7 @@ impl OpenAiClient {
         let mut text = String::new();
         let mut tool_calls: Vec<PartialToolCall> = Vec::new();
         let mut finish = None;
+        let mut saw_done = false;
 
         loop {
             let chunk = tokio::select! {
@@ -272,11 +273,9 @@ impl OpenAiClient {
                 None => break,
             };
 
-            let mut done = false;
-
             for event in parser.feed(&bytes)? {
                 if event.data == "[DONE]" {
-                    done = true;
+                    saw_done = true;
                     break;
                 }
 
@@ -327,7 +326,7 @@ impl OpenAiClient {
                 }
             }
 
-            if done {
+            if saw_done {
                 break;
             }
         }
@@ -378,7 +377,11 @@ impl OpenAiClient {
         }
 
         Err(ProviderError::Protocol {
-            detail: "stream died unexpectedly".to_string(),
+            detail: if saw_done {
+                "stream completed ([DONE]) but no chunk carried a finish_reason".to_string()
+            } else {
+                "stream ended before a finish_reason arrived (truncated?)".to_string()
+            },
         })
     }
 
