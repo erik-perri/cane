@@ -10,6 +10,10 @@ pub enum ProviderError {
     #[error("api error ({status}): {body}")]
     Api { status: u16, body: String },
 
+    /// The turn was cancelled before its stream produced a complete message.
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("network error")]
     Network(#[from] reqwest::Error),
 

@@ -32,6 +32,7 @@ pub enum ContentBlock {
     },
 }
 
+#[derive(Debug)]
 pub enum AgentEvent {
     TextDelta(String),
     ToolStarted {
