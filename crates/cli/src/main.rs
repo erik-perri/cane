@@ -42,7 +42,13 @@ async fn main() -> anyhow::Result<()> {
 
     agent.commands.send(AgentCommand::UserInput(prompt)).await?;
 
-    while let Some(ev) = agent.events.recv().await {
+    loop {
+        let ev = agent
+            .events
+            .recv()
+            .await
+            .context("agent stopped before completing the turn")?;
+
         match ev {
             cane_core::AgentEvent::TextDelta(t) => {
                 print!("{t}");
