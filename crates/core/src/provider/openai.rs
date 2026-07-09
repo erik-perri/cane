@@ -281,10 +281,13 @@ impl OpenAiClient {
                     });
                 }
 
+                let (input, raw_input) = parse_tool_arguments(tool_call.args_buf);
+
                 content.push(ContentBlock::ToolUse {
                     id: tool_call.id,
-                    input: parse_tool_arguments(tool_call.args_buf),
+                    input,
                     name: tool_call.name,
+                    raw_input,
                 })
             }
 
@@ -383,9 +386,16 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
                         ContentBlock::Text { text } => {
                             combined_text.push_str(text);
                         }
-                        ContentBlock::ToolUse { id, input, name } => {
-                            let arguments = serde_json::to_string(&input)
-                                .expect("failed to serialize tool call arguments");
+                        ContentBlock::ToolUse {
+                            id,
+                            input,
+                            name,
+                            raw_input,
+                        } => {
+                            let arguments = raw_input.clone().unwrap_or_else(|| {
+                                serde_json::to_string(&input)
+                                    .expect("failed to serialize tool call arguments")
+                            });
 
                             tool_calls.push(OpenAiRequestToolCall {
                                 function: OpenAiRequestFunctionCall {
@@ -430,14 +440,14 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
 /// not an error, so it maps to `{}`. A non-empty string that doesn't parse is
 /// kept raw so the tool layer can reject it with context instead of the turn
 /// failing here: model mistakes are model feedback, not protocol failures.
-fn parse_tool_arguments(raw: String) -> serde_json::Value {
+fn parse_tool_arguments(raw: String) -> (serde_json::Value, Option<String>) {
     if raw.trim().is_empty() {
-        return serde_json::json!({});
+        return (serde_json::json!({}), None);
     }
 
     match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(_) => serde_json::Value::String(raw),
+        Ok(value) => (value, None),
+        Err(_) => (serde_json::Value::String(raw.clone()), Some(raw)),
     }
 }
 
@@ -521,6 +531,7 @@ mod tests {
                     id: "call_abc".to_string(),
                     name: "read_file".to_string(),
                     input: json!({"path": "Cargo.toml"}),
+                    raw_input: None,
                 }],
             },
             Message {
@@ -608,6 +619,26 @@ mod tests {
                 { "role": "user", "content": "and also, what about this?" }
             ])
         );
+    }
+
+    #[test]
+    fn to_wire_preserves_malformed_tool_arguments_verbatim() {
+        // An invalid argument string still needs to be echoed faithfully before
+        // the model receives its error tool result.
+        let raw_input = "{\"path\": unclosed";
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: vec![ToolUse {
+                id: "call_bad".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::Value::String(raw_input.to_string()),
+                raw_input: Some(raw_input.to_string()),
+            }],
+        }];
+
+        let wire = serde_json::to_value(to_wire(&history)).unwrap();
+
+        assert_eq!(wire[0]["tool_calls"][0]["function"]["arguments"], raw_input);
     }
 
     #[test]
@@ -966,6 +997,7 @@ mod tests {
                     id: "call_abc".to_string(),
                     name: "read_file".to_string(),
                     input: json!({ "path": "Cargo.toml" }),
+                    raw_input: None,
                 }],
             }
         );
@@ -1067,6 +1099,7 @@ mod tests {
                     id: "call_abc".to_string(),
                     name: "list_tools".to_string(),
                     input: json!({}),
+                    raw_input: None,
                 }],
             }
         );
@@ -1121,6 +1154,7 @@ mod tests {
                     id: "call_bad".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::Value::String("{\"path\": unclosed".to_string()),
+                    raw_input: Some("{\"path\": unclosed".to_string()),
                 }],
             }
         );
@@ -1182,11 +1216,13 @@ mod tests {
                         id: "call_abc".to_string(),
                         name: "read_file".to_string(),
                         input: json!({ "path": "a.txt" }),
+                        raw_input: None,
                     },
                     ToolUse {
                         id: "call_def".to_string(),
                         name: "read_file".to_string(),
                         input: json!({ "path": "b.txt" }),
+                        raw_input: None,
                     },
                 ],
             }
@@ -1250,6 +1286,7 @@ mod tests {
                         id: "call_abc".to_string(),
                         name: "read_file".to_string(),
                         input: json!({ "path": "Cargo.toml" }),
+                        raw_input: None,
                     },
                 ],
             }

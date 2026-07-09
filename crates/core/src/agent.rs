@@ -68,7 +68,9 @@ async fn agent_loop(
 
         for block in assistant_msg.content {
             match block {
-                ContentBlock::ToolUse { id, input, name } => {
+                ContentBlock::ToolUse {
+                    id, input, name, ..
+                } => {
                     let _ = events
                         .send(AgentEvent::ToolStarted {
                             input: input.clone(),

@@ -23,6 +23,8 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_input: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -76,6 +78,7 @@ mod tests {
                     id: "Mock ID".to_string(),
                     name: "Mock Name".to_string(),
                     input: serde_json::Value::String("Mock Input".to_string()),
+                    raw_input: None,
                 },
                 ToolResult {
                     tool_use_id: "Mock ID".to_string(),
