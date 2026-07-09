@@ -1517,4 +1517,58 @@ mod tests {
             "expected ProviderError::Cancelled, got {result:?}"
         );
     }
+
+    #[tokio::test]
+    #[ignore = "requires a live server; run with -- --ignored"]
+    async fn smoke_stream_message_against_a_live_server() {
+        let base_url = std::env::var("CANE_BASE_URL").expect("set CANE_BASE_URL");
+        let api_key = std::env::var("CANE_API_KEY").unwrap_or("none".to_string());
+        let model = std::env::var("CANE_MODEL").expect("set CANE_MODEL");
+
+        // Generous budget: thinking models (qwen3, deepseek-r1, ...) spend
+        // tokens on reasoning before any content, and can burn 1000+ on it.
+        let client = OpenAiClient::new(base_url, api_key, model, 8192).unwrap();
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Count to five".to_string(),
+            }],
+        }];
+
+        // Drain concurrently: a live model can emit more deltas than the
+        // channel holds, and stream_message blocks on a full channel.
+        let (tx, mut rx) = mpsc::channel(16);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let cancel = CancellationToken::new();
+
+        let (message, stop_reason) = client
+            .stream_message(&messages, &[], &tx, &cancel)
+            .await
+            .unwrap();
+
+        drop(tx); // close the channel so the collector finishes
+        let events = collector.await.unwrap();
+
+        dbg!(&message, &stop_reason, events.len());
+
+        let streamed = joined_text_deltas(&events);
+        assert!(!streamed.is_empty(), "expected TextDelta events");
+        assert!(
+            events.len() > 1,
+            "expected the text to arrive as multiple deltas, not one blob"
+        );
+        assert_eq!(stop_reason, StopReason::EndTurn);
+
+        // The deltas and the accumulated message must tell the same story.
+        match &message.content[..] {
+            [ContentBlock::Text { text }] => assert_eq!(text, &streamed),
+            other => panic!("expected a single text block, got {other:?}"),
+        }
+    }
 }
