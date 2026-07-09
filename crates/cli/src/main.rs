@@ -2,6 +2,7 @@ use anyhow::Context;
 use std::io::{Write, stdout};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt};
+use cane_core::AgentCommand;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,15 +24,12 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("CANE_MAX_TOKENS must be an integer")?;
 
-    let mut agent = cane_core::spawn_agent(
-        prompt,
-        cane_core::ProviderConfig {
-            base_url,
-            api_key,
-            max_tokens,
-            model,
-        },
-    );
+    let mut agent = cane_core::spawn_agent(cane_core::ProviderConfig {
+        base_url,
+        api_key,
+        max_tokens,
+        model,
+    });
 
     // Esc-to-interrupt stand-in: Ctrl-C trips the cancellation token
     tokio::spawn({
@@ -41,6 +39,8 @@ async fn main() -> anyhow::Result<()> {
             cancel.cancel();
         }
     });
+
+    agent.commands.send(AgentCommand::UserInput(prompt)).await?;
 
     while let Some(ev) = agent.events.recv().await {
         match ev {

@@ -4,33 +4,40 @@ use crate::{FileTool, Tool, ToolDefinition, dispatch};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub struct AgentHandle {
-    pub events: mpsc::Receiver<AgentEvent>,
-    pub cancel: CancellationToken,
+pub enum AgentCommand {
+    UserInput(String),
 }
 
-pub fn spawn_agent(prompt: String, provider: ProviderConfig) -> AgentHandle {
+pub struct AgentHandle {
+    pub cancel: CancellationToken,
+    pub commands: mpsc::Sender<AgentCommand>,
+    pub events: mpsc::Receiver<AgentEvent>,
+}
+
+pub fn spawn_agent(provider: ProviderConfig) -> AgentHandle {
     let (events_tx, events_rx) = mpsc::channel(64);
+    let (commands_tx, commands_rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
 
     let task_cancel = cancel.clone();
     tokio::spawn(async move {
-        if let Err(e) = agent_loop(prompt, provider, events_tx.clone(), task_cancel).await {
+        if let Err(e) = agent_loop(provider, events_tx.clone(), task_cancel, commands_rx).await {
             let _ = events_tx.send(AgentEvent::Error(e.to_string())).await;
         }
     });
 
     AgentHandle {
-        events: events_rx,
         cancel,
+        commands: commands_tx,
+        events: events_rx,
     }
 }
 
 async fn agent_loop(
-    prompt: String,
     provider: ProviderConfig,
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
+    mut commands: mpsc::Receiver<AgentCommand>,
 ) -> Result<(), ProviderError> {
     let client = OpenAiClient::new(
         provider.base_url,
@@ -39,10 +46,7 @@ async fn agent_loop(
         provider.max_tokens,
     )?;
 
-    let mut history = vec![Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text { text: prompt }],
-    }];
+    let mut history = Vec::new();
 
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(FileTool {})];
     let tool_definitions = tools
@@ -51,68 +55,106 @@ async fn agent_loop(
         .collect::<Vec<ToolDefinition>>();
 
     loop {
-        let (assistant_msg, stop_reason) = client
-            .stream_message(&history, &tool_definitions, &events, &cancel)
-            .await?;
-
-        tracing::debug!(history_len = history.len(), ?stop_reason);
-
-        history.push(assistant_msg.clone());
-
-        if stop_reason != StopReason::ToolUse {
-            let _ = events.send(AgentEvent::TurnComplete { stop_reason }).await;
-            return Ok(());
-        }
-
-        let mut results = Vec::new();
-
-        for block in assistant_msg.content {
-            match block {
-                ContentBlock::ToolUse {
-                    id, input, name, ..
-                } => {
-                    let _ = events
-                        .send(AgentEvent::ToolStarted {
-                            input: input.clone(),
-                            name: name.clone(),
-                        })
-                        .await;
-
-                    let (content, is_error) = match dispatch(&tools, &name, input.clone()).await {
-                        Ok(output) => (output, false),
-                        Err(err) => (err, true),
-                    };
-
-                    let _ = events
-                        .send(AgentEvent::ToolFinished {
-                            name: name.clone(),
-                            output: content.clone(),
-                        })
-                        .await;
-
-                    results.push(ContentBlock::ToolResult {
-                        content,
-                        is_error,
-                        tool_use_id: id,
-                    });
+        let command = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(ProviderError::Cancelled);
+            }
+            command = commands.recv() => {
+                match command {
+                    Some(command) => command,
+                    None => return Ok(()),
                 }
-                ContentBlock::Text { .. } => {}
-                ContentBlock::ToolResult { .. } => {
-                    tracing::warn!("unexpected tool result content block")
-                }
+            }
+        };
+
+        match command {
+            AgentCommand::UserInput(prompt) => {
+                history.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: prompt }],
+                });
             }
         }
 
-        if results.is_empty() {
-            return Err(ProviderError::Protocol {
-                detail: "no tool results were generated".to_string(),
+        loop {
+            let stream_result = client
+                .stream_message(&history, &tool_definitions, &events, &cancel)
+                .await;
+
+            let (assistant_msg, stop_reason) = match stream_result {
+                Ok(result) => result,
+                Err(error) => {
+                    if cancel.is_cancelled() {
+                        return Err(error);
+                    }
+                    let _ = events.send(AgentEvent::Error(error.to_string())).await;
+                    break;
+                }
+            };
+
+            tracing::debug!(history_len = history.len(), ?stop_reason);
+
+            history.push(assistant_msg.clone());
+
+            if stop_reason != StopReason::ToolUse {
+                let _ = events.send(AgentEvent::TurnComplete { stop_reason }).await;
+                break;
+            }
+
+            let mut results = Vec::new();
+
+            for block in assistant_msg.content {
+                match block {
+                    ContentBlock::ToolUse {
+                        id, input, name, ..
+                    } => {
+                        let _ = events
+                            .send(AgentEvent::ToolStarted {
+                                input: input.clone(),
+                                name: name.clone(),
+                            })
+                            .await;
+
+                        let (content, is_error) = match dispatch(&tools, &name, input.clone()).await
+                        {
+                            Ok(output) => (output, false),
+                            Err(err) => (err, true),
+                        };
+
+                        let _ = events
+                            .send(AgentEvent::ToolFinished {
+                                name: name.clone(),
+                                output: content.clone(),
+                            })
+                            .await;
+
+                        results.push(ContentBlock::ToolResult {
+                            content,
+                            is_error,
+                            tool_use_id: id,
+                        });
+                    }
+                    ContentBlock::Text { .. } => {}
+                    ContentBlock::ToolResult { .. } => {
+                        tracing::warn!("unexpected tool result content block")
+                    }
+                }
+            }
+
+            if results.is_empty() {
+                let _ = events
+                    .send(AgentEvent::Error(
+                        "no tool results were generated".to_string(),
+                    ))
+                    .await;
+                break;
+            }
+
+            history.push(Message {
+                role: Role::User,
+                content: results,
             });
         }
-
-        history.push(Message {
-            role: Role::User,
-            content: results,
-        });
     }
 }
 
@@ -204,20 +246,69 @@ mod tests {
         }
     }
 
-    /// Spawn the agent and collect every event until the channel closes.
-    /// The timeout turns a non-terminating loop into a test failure
-    /// instead of a hung suite.
+    /// Send one input, close the command channel, and collect every event
+    /// until the agent exits. This keeps the old one-shot tests focused on a
+    /// single turn while exercising the session-shaped public API.
     async fn run_agent(prompt: &str, server: &MockServer) -> Vec<AgentEvent> {
-        let mut handle = spawn_agent(prompt.to_string(), test_provider(server));
+        let mut handle = spawn_agent(test_provider(server));
+        handle
+            .commands
+            .send(AgentCommand::UserInput(prompt.to_string()))
+            .await
+            .expect("agent command channel closed before accepting input");
+        drop(handle.commands);
+
+        collect_until_events_close(&mut handle.events).await
+    }
+
+    /// The timeout turns a non-terminating loop into a test failure instead
+    /// of a hung suite.
+    async fn collect_until_events_close(
+        events_rx: &mut mpsc::Receiver<AgentEvent>,
+    ) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         timeout(Duration::from_secs(5), async {
-            while let Some(event) = handle.events.recv().await {
+            while let Some(event) = events_rx.recv().await {
                 events.push(event);
             }
         })
         .await
         .expect("event channel never closed; is the agent loop terminating?");
         events
+    }
+
+    /// Collect precisely one completed turn, leaving the session alive for a
+    /// follow-up command.
+    async fn collect_turn(events_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            loop {
+                let event = events_rx
+                    .recv()
+                    .await
+                    .expect("event channel closed before TurnComplete");
+                let complete = matches!(event, AgentEvent::TurnComplete { .. });
+                events.push(event);
+                if complete {
+                    return events;
+                }
+            }
+        })
+        .await
+        .expect("agent turn never completed")
+    }
+
+    async fn wait_for_request_count(server: &MockServer, expected_count: usize) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if server.received_requests().await.unwrap().len() == expected_count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent did not start its provider request promptly");
     }
 
     fn temp_file_with(contents: &[u8]) -> NamedTempFile {
@@ -258,6 +349,169 @@ mod tests {
         assert_eq!(
             body["messages"],
             json!([{ "role": "user", "content": "Say hi" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_waits_for_input_and_exits_when_command_channel_closes() {
+        // A session must not contact the provider until its frontend supplies
+        // input. Closing that frontend command channel is clean shutdown.
+
+        // Arrange
+        let server = MockServer::start().await;
+        let mut handle = spawn_agent(test_provider(&server));
+
+        // Act
+        drop(handle.commands);
+        let events = collect_until_events_close(&mut handle.events).await;
+
+        // Assert
+        assert!(
+            events.is_empty(),
+            "idle session emitted unexpected events: {events:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "idle session made a provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_user_inputs_produce_two_completed_turns_and_preserve_history() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![text_turn("Hello!"), text_turn("Yes, I remember.")],
+        )
+        .await;
+        let mut handle = spawn_agent(test_provider(&server));
+
+        // Act
+        handle
+            .commands
+            .send(AgentCommand::UserInput("My name is Ada.".to_string()))
+            .await
+            .unwrap();
+        let first_turn = collect_turn(&mut handle.events).await;
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput(
+                "Do you remember my name?".to_string(),
+            ))
+            .await
+            .unwrap();
+        let second_turn = collect_turn(&mut handle.events).await;
+        drop(handle.commands);
+        let shutdown_events = collect_until_events_close(&mut handle.events).await;
+
+        // Assert
+        assert_eq!(
+            first_turn,
+            vec![
+                AgentEvent::TextDelta("Hello!".to_string()),
+                AgentEvent::TurnComplete {
+                    stop_reason: StopReason::EndTurn
+                },
+            ]
+        );
+        assert_eq!(
+            second_turn,
+            vec![
+                AgentEvent::TextDelta("Yes, I remember.".to_string()),
+                AgentEvent::TurnComplete {
+                    stop_reason: StopReason::EndTurn
+                },
+            ]
+        );
+        assert!(
+            shutdown_events.is_empty(),
+            "clean shutdown emitted unexpected events: {shutdown_events:?}"
+        );
+        assert_eq!(
+            nth_request_messages(&server, 1).await,
+            json!([
+                { "role": "user", "content": "My name is Ada." },
+                { "role": "assistant", "content": "Hello!" },
+                { "role": "user", "content": "Do you remember my name?" },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_tool_turn_is_preserved_for_the_next_user_input() {
+        // Tool-use history needs to outlive its turn too: the assistant echo
+        // and tool result must remain paired when the next turn is sent.
+
+        // Arrange
+        let file = temp_file_with(b"alpha");
+        let file_path = file.path().to_str().unwrap();
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[("call_abc", "read_file", json!({ "path": file_path }))]),
+                text_turn("The file says alpha."),
+                text_turn("Still alpha."),
+            ],
+        )
+        .await;
+        let mut handle = spawn_agent(test_provider(&server));
+
+        // Act
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Read the file.".to_string()))
+            .await
+            .unwrap();
+        let first_turn = collect_turn(&mut handle.events).await;
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("What did it say?".to_string()))
+            .await
+            .unwrap();
+        let second_turn = collect_turn(&mut handle.events).await;
+        drop(handle.commands);
+        collect_until_events_close(&mut handle.events).await;
+
+        // Assert
+        assert!(matches!(
+            first_turn.last(),
+            Some(AgentEvent::TurnComplete {
+                stop_reason: StopReason::EndTurn
+            })
+        ));
+        assert!(matches!(
+            second_turn.as_slice(),
+            [
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete {
+                    stop_reason: StopReason::EndTurn
+                },
+            ] if text == "Still alpha."
+        ));
+        assert_eq!(
+            nth_request_messages(&server, 2).await,
+            json!([
+                { "role": "user", "content": "Read the file." },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json!({ "path": file_path }).to_string(),
+                        },
+                    }],
+                },
+                { "role": "tool", "tool_call_id": "call_abc", "content": "alpha" },
+                { "role": "assistant", "content": "The file says alpha." },
+                { "role": "user", "content": "What did it say?" },
+            ])
         );
     }
 
@@ -481,8 +735,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_provider_error_becomes_an_error_event() {
-        // Provider errors are the *other* plane, they abort the turn and
-        // surface as a single Error event, then the channel closes.
+        // Provider errors are the *other* plane: they abort the current turn
+        // and surface as an Error event. This helper closes the command
+        // channel after that one input, so the session then exits cleanly.
 
         // Arrange
         let server = MockServer::start().await;
@@ -503,6 +758,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_error_does_not_prevent_a_later_user_input() {
+        // Provider errors end the affected turn, not the long-lived session.
+
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                ResponseTemplate::new(401).set_body_string("bad key"),
+                text_turn("This turn succeeded."),
+            ],
+        )
+        .await;
+        let mut handle = spawn_agent(test_provider(&server));
+
+        // Act
+        handle
+            .commands
+            .send(AgentCommand::UserInput("This will fail.".to_string()))
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(5), handle.events.recv())
+            .await
+            .expect("provider error was never emitted")
+            .expect("event channel closed after provider error");
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Try again.".to_string()))
+            .await
+            .expect("session did not accept input after provider error");
+        let recovery_turn = collect_turn(&mut handle.events).await;
+        drop(handle.commands);
+        let shutdown_events = collect_until_events_close(&mut handle.events).await;
+
+        // Assert
+        assert!(
+            matches!(&error, AgentEvent::Error(msg) if msg.contains("401")),
+            "expected a provider error carrying the status, got {error:?}"
+        );
+        assert_eq!(
+            recovery_turn,
+            vec![
+                AgentEvent::TextDelta("This turn succeeded.".to_string()),
+                AgentEvent::TurnComplete {
+                    stop_reason: StopReason::EndTurn
+                },
+            ]
+        );
+        assert!(
+            shutdown_events.is_empty(),
+            "clean shutdown emitted unexpected events: {shutdown_events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_aborts_the_turn_promptly() {
         // Cancellation is non-negotiable. Tripping the token must abort
         // the in-flight stream without waiting for the server.
@@ -514,9 +825,15 @@ mod tests {
             .respond_with(text_turn("too late").set_delay(Duration::from_secs(30)))
             .mount(&server)
             .await;
-        let mut handle = spawn_agent("Say hi".to_string(), test_provider(&server));
+        let mut handle = spawn_agent(test_provider(&server));
 
         // Act
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Say hi".to_string()))
+            .await
+            .unwrap();
+        wait_for_request_count(&server, 1).await;
         handle.cancel.cancel();
         let mut events = Vec::new();
         timeout(Duration::from_secs(2), async {
