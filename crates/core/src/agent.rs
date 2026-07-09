@@ -299,19 +299,6 @@ mod tests {
         .expect("agent turn never completed")
     }
 
-    async fn wait_for_request_count(server: &MockServer, expected_count: usize) {
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if server.received_requests().await.unwrap().len() == expected_count {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("agent did not start its provider request promptly");
-    }
-
     fn temp_file_with(contents: &[u8]) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(contents).unwrap();
@@ -825,10 +812,11 @@ mod tests {
 
         // Arrange
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        let request = Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(text_turn("too late").set_delay(Duration::from_secs(30)))
-            .mount(&server)
+            .expect(1)
+            .mount_as_scoped(&server)
             .await;
         let mut handle = spawn_agent(test_provider(&server));
 
@@ -838,7 +826,9 @@ mod tests {
             .send(AgentCommand::UserInput("Say hi".to_string()))
             .await
             .unwrap();
-        wait_for_request_count(&server, 1).await;
+        timeout(Duration::from_secs(2), request.wait_until_satisfied())
+            .await
+            .expect("agent did not start its provider request promptly");
         handle.cancel.cancel();
         let events = collect_until_events_close(&mut handle.events).await;
 
