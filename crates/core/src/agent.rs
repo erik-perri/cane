@@ -60,6 +60,9 @@ async fn agent_loop(
             _ = cancel.cancelled() => {
                 return Err(ProviderError::Cancelled);
             }
+            _ = events.closed() => {
+                return Ok(());
+            }
             command = commands.recv() => {
                 match command {
                     Some(command) => command,
@@ -80,9 +83,12 @@ async fn agent_loop(
         }
 
         loop {
-            let stream_result = client
-                .stream_message(&history, &tool_definitions, &events, &cancel)
-                .await;
+            let stream_result = tokio::select! {
+                _ = events.closed() => return Ok(()),
+                result = client.stream_message(&history, &tool_definitions, &events, &cancel) => {
+                    result
+                }
+            };
 
             let (assistant_msg, stop_reason) = match stream_result {
                 Ok(result) => result,
@@ -138,12 +144,16 @@ async fn agent_loop(
                     ContentBlock::ToolUse {
                         id, input, name, ..
                     } => {
-                        let _ = events
+                        if events
                             .send(AgentEvent::ToolStarted {
                                 input: input.clone(),
                                 name: name.clone(),
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
 
                         let (content, is_error) = match dispatch(&tools, &name, input.clone()).await
                         {
@@ -151,12 +161,16 @@ async fn agent_loop(
                             Err(err) => (err, true),
                         };
 
-                        let _ = events
+                        if events
                             .send(AgentEvent::ToolFinished {
                                 name: name.clone(),
                                 output: content.clone(),
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
 
                         results.push(ContentBlock::ToolResult {
                             content,
@@ -396,6 +410,30 @@ mod tests {
             events.is_empty(),
             "idle session emitted unexpected events: {events:?}"
         );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "idle session made a provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_events_stops_agent_even_when_command_sender_remains_alive() {
+        // Arrange
+        let server = MockServer::start().await;
+        let handle = spawn_agent(test_provider(&server));
+        let AgentHandle {
+            cancel: _cancel,
+            commands,
+            events,
+        } = handle;
+
+        // Act
+        drop(events);
+
+        // Assert
+        timeout(Duration::from_secs(5), commands.closed())
+            .await
+            .expect("agent remained alive after its event receiver was dropped");
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "idle session made a provider request"
