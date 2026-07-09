@@ -6,7 +6,7 @@ mod sse;
 
 pub(crate) use openai::OpenAiClient;
 
-pub(crate) struct ProviderConfig {
+pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
