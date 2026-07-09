@@ -4,6 +4,7 @@ use crate::{FileTool, Tool, ToolDefinition, dispatch};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, PartialEq)]
 pub enum AgentCommand {
     UserInput(String),
 }
