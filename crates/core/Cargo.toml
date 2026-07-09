@@ -12,6 +12,8 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "fs", "time"] }
 tokio-util = "0.7.18"
 tracing = "0.1.44"
+async-trait = "0.1.89"
 
 [dev-dependencies]
+tempfile = "3"
 wiremock = "0.6.5"
