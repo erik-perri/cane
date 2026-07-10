@@ -1,4 +1,4 @@
-use crate::tools::{Tool, ToolDefinition};
+use crate::tools::{Tool, ToolDefinition, background_task_failed, invalid_input, operation_failed};
 use crate::workspace::Workspace;
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,7 +41,7 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Reads a file from the local filesystem. Call this whenever the user asks about a file's contents or you need to read a file for context. Returns the file as text.".to_string(),
+            description: "Read a text file from the local filesystem. Returns the requested lines as raw text.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -68,34 +68,38 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, input: Value) -> Result<String, String> {
-        let input: ReadFileInput = serde_json::from_value(input)
-            .map_err(|error| format!("invalid read_file input: {error}"))?;
+        let input: ReadFileInput =
+            serde_json::from_value(input).map_err(|error| invalid_input("read_file", error))?;
 
-        let resolved_path = self
-            .workspace
-            .resolve(&input.path)
-            .map_err(|error| format!("invalid read_file input: {error}"))?;
-
+        if input.path.is_empty() {
+            return Err(invalid_input("read_file", "path must not be empty"));
+        }
         if input.offset == 0 {
-            return Err("invalid read_file input: offset must be at least 1".to_string());
+            return Err(invalid_input("read_file", "offset must be at least 1"));
         }
         if input.limit == 0 || input.limit > MAX_READ_FILE_LIMIT {
-            return Err(format!(
-                "invalid read_file input: limit must be between 1 and {MAX_READ_FILE_LIMIT}"
+            return Err(invalid_input(
+                "read_file",
+                format_args!("limit must be between 1 and {MAX_READ_FILE_LIMIT}"),
             ));
         }
+
+        let resolved_path = self.workspace.resolve(&input.path)?;
+
+        let requested_path = input.path;
 
         tokio::task::spawn_blocking(move || {
             read_lines_from_file(&resolved_path, input.offset, input.limit)
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| background_task_failed("read", &requested_path, error))?
+        .map_err(|error| operation_failed("read", &requested_path, error))
     }
 }
 
 /// `offset` and `limit` have already been validated by `ReadFileInput`.
-fn read_lines_from_file(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+fn read_lines_from_file(path: &Path, offset: u64, limit: u64) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
     let text = String::from_utf8_lossy(&bytes);
 
     let lines = text.lines().skip(offset.saturating_sub(1) as usize);
@@ -110,7 +114,7 @@ mod tests {
     use crate::tools::Tool;
     use serde_json::json;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, tempdir};
 
     fn temp_file_with(contents: &[u8]) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -231,48 +235,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_rejects_input_without_a_path() {
-        // Act
-        let result = read_file_tool().execute(json!({ "offset": 1 })).await;
-
-        // Assert
-        assert!(result.unwrap_err().contains("missing field `path`"));
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_non_object_input() {
-        // Act
-        let result = read_file_tool().execute(json!("just a string")).await;
-
-        // Assert
-        assert!(result.unwrap_err().starts_with("invalid read_file input:"));
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_invalid_or_out_of_range_parameters() {
-        for input in [
-            json!({ "path": "file.txt", "offset": 0 }),
-            json!({ "path": "file.txt", "limit": 0 }),
-            json!({ "path": "file.txt", "limit": MAX_READ_FILE_LIMIT + 1 }),
-            json!({ "path": "file.txt", "offset": "one" }),
-            json!({ "path": "file.txt", "unexpected": true }),
+    async fn execute_rejects_missing_fields_wrong_types_unknown_fields_and_non_objects() {
+        for (input, expected) in [
+            (
+                json!({ "offset": 1 }),
+                "invalid read_file input: missing field `path`",
+            ),
+            (
+                json!({ "path": 7 }),
+                "invalid read_file input: invalid type: integer `7`, expected a string",
+            ),
+            (
+                json!({ "path": "file.txt", "offset": "one" }),
+                "invalid read_file input: invalid type: string \"one\", expected u64",
+            ),
+            (
+                json!({ "path": "file.txt", "limit": "many" }),
+                "invalid read_file input: invalid type: string \"many\", expected u64",
+            ),
+            (
+                json!({ "path": "file.txt", "unexpected": true }),
+                "invalid read_file input: unknown field `unexpected`, expected one of `path`, `offset`, `limit`",
+            ),
+            (
+                json!("just a string"),
+                "invalid read_file input: invalid type: string \"just a string\", expected struct ReadFileInput",
+            ),
+            (
+                json!(null),
+                "invalid read_file input: invalid type: null, expected struct ReadFileInput",
+            ),
         ] {
-            let result = read_file_tool().execute(input).await;
-            assert!(
-                result.is_err(),
-                "invalid input should be rejected, got {result:?}"
-            );
+            let error = read_file_tool().execute(input).await.unwrap_err();
+            assert_eq!(error, expected);
         }
     }
 
     #[tokio::test]
-    async fn execute_reports_an_error_for_a_missing_file() {
-        // Act
-        let result = read_file_tool()
-            .execute(json!({ "path": "/definitely/not/a/real/file" }))
-            .await;
+    async fn execute_rejects_empty_and_out_of_range_parameters() {
+        for (input, expected) in [
+            (
+                json!({ "path": "" }),
+                "invalid read_file input: path must not be empty".to_string(),
+            ),
+            (
+                json!({ "path": "file.txt", "offset": 0 }),
+                "invalid read_file input: offset must be at least 1".to_string(),
+            ),
+            (
+                json!({ "path": "file.txt", "limit": 0 }),
+                format!(
+                    "invalid read_file input: limit must be between 1 and {MAX_READ_FILE_LIMIT}"
+                ),
+            ),
+            (
+                json!({ "path": "file.txt", "limit": MAX_READ_FILE_LIMIT + 1 }),
+                format!(
+                    "invalid read_file input: limit must be between 1 and {MAX_READ_FILE_LIMIT}"
+                ),
+            ),
+        ] {
+            let error = read_file_tool().execute(input).await.unwrap_err();
+            assert_eq!(error, expected);
+        }
+    }
 
-        // Assert
-        assert!(result.is_err());
+    #[tokio::test]
+    async fn execute_reports_access_denial_without_calling_it_invalid_input() {
+        let tool = read_file_tool();
+        let outside = tool.workspace.root().parent().unwrap().join("outside.txt");
+        let expected = format!(
+            "access denied: path `{}` is outside workspace root `{}`",
+            outside.display(),
+            tool.workspace.root().display()
+        );
+
+        let error = tool
+            .execute(json!({ "path": path_of_path(&outside) }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, expected);
+    }
+
+    #[tokio::test]
+    async fn execute_adds_operation_and_path_context_to_filesystem_errors() {
+        let parent = tempdir().unwrap();
+        let missing = parent.path().join("missing.txt");
+
+        let error = read_file_tool()
+            .execute(json!({ "path": path_of_path(&missing) }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.starts_with(&format!("failed to read `{}`: ", missing.display())),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn path_of_path(path: &Path) -> &str {
+        path.to_str().unwrap()
     }
 }

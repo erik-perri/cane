@@ -780,7 +780,7 @@ mod tests {
             json!({
                 "role": "tool",
                 "tool_call_id": "call_abc",
-                "content": "Error: unknown tool: write_the_file_at_the_path"
+                "content": "Error: unknown tool: `write_the_file_at_the_path`"
             })
         );
     }

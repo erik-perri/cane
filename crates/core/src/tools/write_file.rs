@@ -1,5 +1,5 @@
 use crate::Workspace;
-use crate::tools::{Tool, ToolDefinition};
+use crate::tools::{Tool, ToolDefinition, background_task_failed, invalid_input, operation_failed};
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
@@ -27,13 +27,15 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".to_string(),
-            description: "Write a file to the local filesystem. Call this whenever the user asks to write contents or you need to create a file for a request.".to_string(),
+            description:
+                "Create or overwrite a file in the workspace, creating missing parent directories."
+                    .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to read."
+                        "description": "Path to the file to write."
                     },
                     "content": {
                         "type": "string",
@@ -42,53 +44,52 @@ impl Tool for WriteFileTool {
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false
-            })
+            }),
         }
     }
 
     async fn execute(&self, input: Value) -> Result<String, String> {
-        let input: WriteFileInput = serde_json::from_value(input)
-            .map_err(|error| format!("invalid write_file input: {error}"))?;
+        let input: WriteFileInput =
+            serde_json::from_value(input).map_err(|error| invalid_input("write_file", error))?;
 
-        let resolved_path = self
-            .workspace
-            .resolve(&input.path)
-            .map_err(|error| format!("invalid write_file input: {error}"))?;
+        if input.path.is_empty() {
+            return Err(invalid_input("write_file", "path must not be empty"));
+        }
+
+        let resolved_path = self.workspace.resolve(&input.path)?;
 
         if resolved_path == self.workspace.root() {
-            return Err(
-                "invalid write_file input: path must name a file inside the workspace".to_string(),
-            );
+            return Err(invalid_input(
+                "write_file",
+                "path must name a file inside the workspace",
+            ));
         }
 
         let existed = resolved_path.exists();
+        let requested_path = input.path;
 
         let written =
             tokio::task::spawn_blocking(move || write_to_file(&resolved_path, input.content))
                 .await
-                .map_err(|error| format!("failed to write to file: {error}"))??;
+                .map_err(|error| background_task_failed("write", &requested_path, error))?
+                .map_err(|error| operation_failed("write", &requested_path, error))?;
 
         let message = if existed {
-            format!("file updated; {written} bytes written")
+            format!("updated `{requested_path}`; {written} bytes written")
         } else {
-            format!("file created; {written} bytes written")
+            format!("created `{requested_path}`; {written} bytes written")
         };
 
         Ok(message)
     }
 }
 
-fn write_to_file(path: &Path, content: String) -> Result<usize, String> {
+fn write_to_file(path: &Path, content: String) -> std::io::Result<usize> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create parent directories for `{}`: {error}",
-                path.display()
-            )
-        })?;
+        std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(path, &content).map_err(|error| error.to_string())?;
+    std::fs::write(path, &content)?;
 
     Ok(content.len())
 }
@@ -152,7 +153,7 @@ mod tests {
 
         // Assert
         assert_eq!(fs::read_to_string(target).unwrap(), "hello");
-        assert_eq!(output, "file created; 5 bytes written");
+        assert_eq!(output, "created `notes.txt`; 5 bytes written");
     }
 
     #[tokio::test]
@@ -168,8 +169,11 @@ mod tests {
             .unwrap();
 
         // Assert
-        assert_eq!(fs::read_to_string(target).unwrap(), "absolute");
-        assert_eq!(output, "file created; 8 bytes written");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "absolute");
+        assert_eq!(
+            output,
+            format!("created `{}`; 8 bytes written", target.display())
+        );
     }
 
     #[tokio::test]
@@ -189,7 +193,10 @@ mod tests {
 
         // Assert
         assert_eq!(fs::read_to_string(target).unwrap(), "generated");
-        assert_eq!(output, "file created; 9 bytes written");
+        assert_eq!(
+            output,
+            "created `generated/nested/output.txt`; 9 bytes written"
+        );
     }
 
     #[tokio::test]
@@ -207,7 +214,7 @@ mod tests {
 
         // Assert
         assert_eq!(fs::read_to_string(target).unwrap(), "short");
-        assert_eq!(output, "file updated; 5 bytes written");
+        assert_eq!(output, "updated `existing.txt`; 5 bytes written");
     }
 
     #[tokio::test]
@@ -224,7 +231,7 @@ mod tests {
 
         // Assert
         assert_eq!(fs::read(target).unwrap(), b"");
-        assert_eq!(output, "file created; 0 bytes written");
+        assert_eq!(output, "created `empty.txt`; 0 bytes written");
     }
 
     #[tokio::test]
@@ -244,7 +251,7 @@ mod tests {
             fs::read(root.path().join("unicode.txt")).unwrap(),
             content.as_bytes()
         );
-        assert_eq!(output, "file created; 4 bytes written");
+        assert_eq!(output, "created `unicode.txt`; 4 bytes written");
     }
 
     #[tokio::test]
@@ -351,7 +358,7 @@ mod tests {
         let target = outside.path().join("important.txt");
         fs::write(&target, "original").unwrap();
         let expected_error = format!(
-            "invalid write_file input: tool access denied: path `{}` is outside workspace root `{}`",
+            "access denied: path `{}` is outside workspace root `{}`",
             target.display(),
             tool.workspace.root().display()
         );
@@ -379,7 +386,7 @@ mod tests {
         let candidate = format!("../{escaped_name}");
         let _ = fs::remove_file(&outside);
         let expected_error = format!(
-            "invalid write_file input: tool access denied: path `{candidate}` is outside workspace root `{}`",
+            "access denied: path `{candidate}` is outside workspace root `{}`",
             tool.workspace.root().display()
         );
 
@@ -402,12 +409,16 @@ mod tests {
         fs::create_dir(&target).unwrap();
 
         // Act
-        let result = tool
+        let error = tool
             .execute(json!({ "path": "directory", "content": "hello" }))
-            .await;
+            .await
+            .unwrap_err();
 
         // Assert
-        assert!(result.is_err());
+        assert!(
+            error.starts_with("failed to write `directory`: "),
+            "unexpected error: {error}"
+        );
         assert!(target.is_dir());
     }
 
@@ -419,12 +430,16 @@ mod tests {
         fs::write(&parent_file, "original").unwrap();
 
         // Act
-        let result = tool
+        let error = tool
             .execute(json!({ "path": "Cargo.toml/nested.txt", "content": "hello" }))
-            .await;
+            .await
+            .unwrap_err();
 
         // Assert
-        assert!(result.is_err());
+        assert!(
+            error.starts_with("failed to resolve `Cargo.toml/nested.txt`: "),
+            "unexpected error: {error}"
+        );
         assert_eq!(fs::read_to_string(parent_file).unwrap(), "original");
     }
 
@@ -449,7 +464,7 @@ mod tests {
         // Assert
         assert_eq!(fs::read_to_string(target).unwrap(), "changed");
         assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
-        assert_eq!(output, "file updated; 7 bytes written");
+        assert_eq!(output, "updated `link.txt`; 7 bytes written");
     }
 
     #[cfg(unix)]
@@ -464,7 +479,7 @@ mod tests {
         fs::write(&target, "original").unwrap();
         symlink(&target, root.path().join("link.txt")).unwrap();
         let expected_error = format!(
-            "invalid write_file input: tool access denied: path `link.txt` is outside workspace root `{}`",
+            "access denied: path `link.txt` is outside workspace root `{}`",
             tool.workspace.root().display()
         );
 

@@ -20,12 +20,28 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: Value) -> Result<String, String>;
 }
 
+fn invalid_input(tool: &str, reason: impl std::fmt::Display) -> String {
+    format!("invalid {tool} input: {reason}")
+}
+
+fn operation_failed(operation: &str, path: &str, error: impl std::fmt::Display) -> String {
+    format!("failed to {operation} `{path}`: {error}")
+}
+
+fn background_task_failed(operation: &str, path: &str, error: impl std::fmt::Display) -> String {
+    operation_failed(
+        operation,
+        path,
+        format_args!("background task failed: {error}"),
+    )
+}
+
 /// Look up a tool by name and run it. An unknown name is an error tool
 /// result, not a panic.
 pub async fn dispatch(tools: &[Box<dyn Tool>], name: &str, input: Value) -> Result<String, String> {
     match tools.iter().find(|t| t.definition().name == name) {
         Some(tool) => tool.execute(input).await,
-        None => Err(format!("unknown tool: {name}")),
+        None => Err(format!("unknown tool: `{name}`")),
     }
 }
 
@@ -72,6 +88,22 @@ mod tests {
         let result = dispatch(&tools, "write_file", json!({})).await;
 
         // Assert
-        assert_eq!(result, Err("unknown tool: write_file".to_string()));
+        assert_eq!(result, Err("unknown tool: `write_file`".to_string()));
+    }
+
+    #[test]
+    fn operation_errors_follow_the_shared_message_format() {
+        assert_eq!(
+            invalid_input("read_file", "path must not be empty"),
+            "invalid read_file input: path must not be empty"
+        );
+        assert_eq!(
+            operation_failed("read", "notes.txt", "permission denied"),
+            "failed to read `notes.txt`: permission denied"
+        );
+        assert_eq!(
+            background_task_failed("write", "notes.txt", "task cancelled"),
+            "failed to write `notes.txt`: background task failed: task cancelled"
+        );
     }
 }

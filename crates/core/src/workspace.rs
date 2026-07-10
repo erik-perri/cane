@@ -32,13 +32,13 @@ impl Workspace {
         };
         let normalized_candidate = lexical_normalize(&absolute_candidate);
         let canonical_user = canonicalize_with_missing_tail(&normalized_candidate)
-            .map_err(|err| format!("failed to canonicalize path: {err}"))?;
+            .map_err(|err| format!("failed to resolve `{}`: {err}", candidate.display()))?;
 
         if canonical_user.starts_with(&self.canonical_root) {
             Ok(canonical_user)
         } else {
             Err(format!(
-                "tool access denied: path `{}` is outside workspace root `{}`",
+                "access denied: path `{}` is outside workspace root `{}`",
                 candidate.display(),
                 self.canonical_root.display()
             ))
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(
             error,
             format!(
-                "tool access denied: path `../outside.txt` is outside workspace root `{}`",
+                "access denied: path `../outside.txt` is outside workspace root `{}`",
                 workspace.root().display()
             )
         );
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             error,
             format!(
-                "tool access denied: path `{}` is outside workspace root `{}`",
+                "access denied: path `{}` is outside workspace root `{}`",
                 outside.display(),
                 workspace.root().display()
             )
@@ -376,7 +376,7 @@ mod tests {
         let error = workspace.resolve("Cargo.toml/nested.txt").unwrap_err();
 
         // Assert
-        assert!(error.starts_with("failed to canonicalize path:"));
+        assert!(error.starts_with("failed to resolve `Cargo.toml/nested.txt`:"));
     }
 
     #[cfg(unix)]
