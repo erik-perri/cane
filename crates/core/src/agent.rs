@@ -1,6 +1,6 @@
 use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
-use crate::{FileTool, Tool, ToolDefinition, Workspace, dispatch};
+use crate::{ReadFileTool, Tool, ToolDefinition, Workspace, dispatch};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +60,7 @@ async fn agent_loop(
 
     let mut history = Vec::new();
 
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(FileTool::new(Arc::clone(&workspace)))];
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFileTool::new(Arc::clone(&workspace)))];
     let tool_definitions = tools
         .iter()
         .map(|tool| tool.definition())

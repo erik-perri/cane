@@ -1,3 +1,4 @@
+use crate::tools::{Tool, ToolDefinition};
 use crate::workspace::Workspace;
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,41 +26,18 @@ fn default_read_file_limit() -> u64 {
     DEFAULT_READ_FILE_LIMIT
 }
 
-/// A tool the model can call.
-#[derive(Clone, Debug)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-}
-
-#[async_trait::async_trait]
-pub trait Tool: Send + Sync {
-    fn definition(&self) -> ToolDefinition;
-    async fn execute(&self, input: Value) -> Result<String, String>;
-}
-
-/// Look up a tool by name and run it. An unknown name is an error tool
-/// result, not a panic.
-pub async fn dispatch(tools: &[Box<dyn Tool>], name: &str, input: Value) -> Result<String, String> {
-    match tools.iter().find(|t| t.definition().name == name) {
-        Some(tool) => tool.execute(input).await,
-        None => Err(format!("unknown tool: {name}")),
-    }
-}
-
-pub struct FileTool {
+pub struct ReadFileTool {
     workspace: Arc<Workspace>,
 }
 
-impl FileTool {
+impl ReadFileTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
     }
 }
 
 #[async_trait::async_trait]
-impl Tool for FileTool {
+impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
@@ -130,6 +108,7 @@ fn read_lines_from_file(path: &Path, offset: u64, limit: u64) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
     use serde_json::json;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -144,8 +123,8 @@ mod tests {
         file.path().to_str().unwrap()
     }
 
-    fn file_tool() -> FileTool {
-        FileTool::new(Arc::new(Workspace::new(std::env::temp_dir()).unwrap()))
+    fn read_file_tool() -> ReadFileTool {
+        ReadFileTool::new(Arc::new(Workspace::new(std::env::temp_dir()).unwrap()))
     }
 
     #[tokio::test]
@@ -154,7 +133,9 @@ mod tests {
         let file = temp_file_with(b"line one\nline two\nline three");
 
         // Act
-        let result = file_tool().execute(json!({ "path": path_of(&file) })).await;
+        let result = read_file_tool()
+            .execute(json!({ "path": path_of(&file) }))
+            .await;
 
         // Assert
         assert_eq!(result, Ok("line one\nline two\nline three".to_string()));
@@ -166,7 +147,7 @@ mod tests {
         let file = temp_file_with(b"one\ntwo\nthree\nfour\nfive");
 
         // Act
-        let result = file_tool()
+        let result = read_file_tool()
             .execute(json!({ "path": path_of(&file), "offset": 2, "limit": 3 }))
             .await;
 
@@ -180,7 +161,7 @@ mod tests {
         let file = temp_file_with(b"first\nsecond");
 
         // Act
-        let result = file_tool()
+        let result = read_file_tool()
             .execute(json!({ "path": path_of(&file), "offset": 1 }))
             .await;
 
@@ -194,7 +175,7 @@ mod tests {
         let file = temp_file_with(b"one\ntwo");
 
         // Act
-        let result = file_tool()
+        let result = read_file_tool()
             .execute(json!({ "path": path_of(&file), "limit": 100 }))
             .await;
 
@@ -212,7 +193,7 @@ mod tests {
         let file = temp_file_with(contents.as_bytes());
 
         // Act
-        let output = file_tool()
+        let output = read_file_tool()
             .execute(json!({ "path": path_of(&file) }))
             .await
             .unwrap();
@@ -228,7 +209,7 @@ mod tests {
         let file = temp_file_with(b"one\ntwo");
 
         // Act
-        let result = file_tool()
+        let result = read_file_tool()
             .execute(json!({ "path": path_of(&file), "offset": 100 }))
             .await;
 
@@ -242,7 +223,9 @@ mod tests {
         let file = temp_file_with(b"ok \xff\xfe bytes");
 
         // Act
-        let result = file_tool().execute(json!({ "path": path_of(&file) })).await;
+        let result = read_file_tool()
+            .execute(json!({ "path": path_of(&file) }))
+            .await;
 
         // Assert
         assert_eq!(result, Ok("ok \u{FFFD}\u{FFFD} bytes".to_string()));
@@ -251,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_input_without_a_path() {
         // Act
-        let result = file_tool().execute(json!({ "offset": 1 })).await;
+        let result = read_file_tool().execute(json!({ "offset": 1 })).await;
 
         // Assert
         assert!(result.unwrap_err().contains("missing field `path`"));
@@ -260,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_non_object_input() {
         // Act
-        let result = file_tool().execute(json!("just a string")).await;
+        let result = read_file_tool().execute(json!("just a string")).await;
 
         // Assert
         assert!(result.unwrap_err().starts_with("invalid read_file input:"));
@@ -275,7 +258,7 @@ mod tests {
             json!({ "path": "file.txt", "offset": "one" }),
             json!({ "path": "file.txt", "unexpected": true }),
         ] {
-            let result = file_tool().execute(input).await;
+            let result = read_file_tool().execute(input).await;
             assert!(
                 result.is_err(),
                 "invalid input should be rejected, got {result:?}"
@@ -286,36 +269,11 @@ mod tests {
     #[tokio::test]
     async fn execute_reports_an_error_for_a_missing_file() {
         // Act
-        let result = file_tool()
+        let result = read_file_tool()
             .execute(json!({ "path": "/definitely/not/a/real/file" }))
             .await;
 
         // Assert
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn dispatch_runs_the_tool_matching_the_name() {
-        // Arrange
-        let file = temp_file_with(b"dispatched");
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(file_tool())];
-
-        // Act
-        let result = dispatch(&tools, "read_file", json!({ "path": path_of(&file) })).await;
-
-        // Assert
-        assert_eq!(result, Ok("dispatched".to_string()));
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_an_error_for_an_unknown_tool_name() {
-        // Arrange
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(file_tool())];
-
-        // Act
-        let result = dispatch(&tools, "write_file", json!({})).await;
-
-        // Assert
-        assert_eq!(result, Err("unknown tool: write_file".to_string()));
     }
 }

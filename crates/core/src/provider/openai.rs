@@ -1,7 +1,7 @@
 use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason};
 use crate::provider::ProviderError;
 use crate::provider::sse::SseParser;
-use crate::tool::ToolDefinition;
+use crate::tools::ToolDefinition;
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
