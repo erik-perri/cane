@@ -1,6 +1,6 @@
+mod repl;
+
 use anyhow::Context;
-use cane_core::AgentCommand;
-use std::io::{Write, stdout};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -15,7 +15,6 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let prompt = std::env::args().nth(1).context("usage: cane <prompt>")?;
     let api_key = std::env::var("CANE_API_KEY").context("CANE_API_KEY not set")?;
     let base_url = std::env::var("CANE_BASE_URL").context("CANE_BASE_URL not set")?;
     let model = std::env::var("CANE_MODEL").context("CANE_MODEL not set")?;
@@ -24,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("CANE_MAX_TOKENS must be an integer")?;
 
-    let mut agent = cane_core::spawn_agent(cane_core::ProviderConfig {
+    let agent = cane_core::spawn_agent(cane_core::ProviderConfig {
         base_url,
         api_key,
         max_tokens,
@@ -40,33 +39,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    agent.commands.send(AgentCommand::UserInput(prompt)).await?;
+    let stdin = std::io::stdin();
+    let input = stdin.lock();
 
-    loop {
-        let ev = agent
-            .events
-            .recv()
-            .await
-            .context("agent stopped before completing the turn")?;
+    let stdout = std::io::stdout();
+    let output = stdout.lock();
 
-        match ev {
-            cane_core::AgentEvent::TextDelta(t) => {
-                print!("{t}");
-                stdout().flush()?;
-            }
-            cane_core::AgentEvent::ToolStarted { name, input } => {
-                println!("\n[tool: {name} {input}]")
-            }
-            cane_core::AgentEvent::ToolFinished { .. } => {}
-            cane_core::AgentEvent::TurnComplete { .. } => break,
-            cane_core::AgentEvent::Error(e) => {
-                // Terminate any partially streamed line; anyhow prints the
-                // error itself when main returns Err.
-                eprintln!();
-                return Err(anyhow::anyhow!(e));
-            }
-        }
-    }
+    repl::run(agent, input, output).await?;
 
     println!();
 
