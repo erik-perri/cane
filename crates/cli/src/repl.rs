@@ -40,8 +40,17 @@ pub(crate) async fn run(
                 }
 
                 AgentEvent::ToolStarted { name, input } => {
-                    let message = format!("\n[tool: {name} {input}]");
-                    output.write_all(message.as_bytes())?;
+                    writeln!(output, "\n[tool: {name} {input}]")?;
+                    output.flush()?;
+                }
+
+                AgentEvent::ToolFinished {
+                    output: tool_output,
+                    is_error: true,
+                    ..
+                } => {
+                    writeln!(output, "[tool error: {tool_output}]")?;
+                    output.flush()?;
                 }
 
                 AgentEvent::ToolFinished { .. } => {}

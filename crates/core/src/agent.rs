@@ -1,6 +1,7 @@
 use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
-use crate::{FileTool, Tool, ToolDefinition, dispatch};
+use crate::{FileTool, Tool, ToolDefinition, Workspace, dispatch};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -15,14 +16,22 @@ pub struct AgentHandle {
     pub events: mpsc::Receiver<AgentEvent>,
 }
 
-pub fn spawn_agent(provider: ProviderConfig) -> AgentHandle {
+pub fn spawn_agent(provider: ProviderConfig, workspace: Workspace) -> AgentHandle {
     let (events_tx, events_rx) = mpsc::channel(64);
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
 
     let task_cancel = cancel.clone();
     tokio::spawn(async move {
-        if let Err(e) = agent_loop(provider, events_tx.clone(), task_cancel, commands_rx).await {
+        if let Err(e) = agent_loop(
+            provider,
+            workspace,
+            events_tx.clone(),
+            task_cancel,
+            commands_rx,
+        )
+        .await
+        {
             let _ = events_tx.send(AgentEvent::Error(e.to_string())).await;
         }
     });
@@ -36,10 +45,12 @@ pub fn spawn_agent(provider: ProviderConfig) -> AgentHandle {
 
 async fn agent_loop(
     provider: ProviderConfig,
+    workspace: Workspace,
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     mut commands: mpsc::Receiver<AgentCommand>,
 ) -> Result<(), ProviderError> {
+    let workspace = Arc::new(workspace);
     let client = OpenAiClient::new(
         provider.base_url,
         provider.api_key,
@@ -49,7 +60,7 @@ async fn agent_loop(
 
     let mut history = Vec::new();
 
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(FileTool {})];
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(FileTool::new(Arc::clone(&workspace)))];
     let tool_definitions = tools
         .iter()
         .map(|tool| tool.definition())
@@ -165,6 +176,7 @@ async fn agent_loop(
                             .send(AgentEvent::ToolFinished {
                                 name: name.clone(),
                                 output: content.clone(),
+                                is_error,
                             })
                             .await
                             .is_err()
@@ -297,11 +309,15 @@ mod tests {
         }
     }
 
+    fn test_workspace() -> Workspace {
+        Workspace::new(std::env::temp_dir()).unwrap()
+    }
+
     /// Send one input, close the command channel, and collect every event
     /// until the agent exits. This keeps the old one-shot tests focused on a
     /// single turn while exercising the session-shaped public API.
     async fn run_agent(prompt: &str, server: &MockServer) -> Vec<AgentEvent> {
-        let mut handle = spawn_agent(test_provider(server));
+        let mut handle = spawn_agent(test_provider(server), test_workspace());
         handle
             .commands
             .send(AgentCommand::UserInput(prompt.to_string()))
@@ -399,7 +415,7 @@ mod tests {
 
         // Arrange
         let server = MockServer::start().await;
-        let mut handle = spawn_agent(test_provider(&server));
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
 
         // Act
         drop(handle.commands);
@@ -420,7 +436,7 @@ mod tests {
     async fn dropping_events_stops_agent_even_when_command_sender_remains_alive() {
         // Arrange
         let server = MockServer::start().await;
-        let handle = spawn_agent(test_provider(&server));
+        let handle = spawn_agent(test_provider(&server), test_workspace());
         let AgentHandle {
             cancel: _cancel,
             commands,
@@ -449,7 +465,7 @@ mod tests {
             vec![text_turn("Hello!"), text_turn("Yes, I remember.")],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server));
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
 
         // Act
         handle
@@ -525,7 +541,7 @@ mod tests {
             ],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server));
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
 
         // Act
         handle
@@ -624,6 +640,7 @@ mod tests {
                 AgentEvent::ToolFinished {
                     name: "read_file".to_string(),
                     output: "[workspace]\nmembers = [\"crates/core\"]".to_string(),
+                    is_error: false,
                 },
                 AgentEvent::TextDelta("It has one member.".to_string()),
                 AgentEvent::TurnComplete {
@@ -692,6 +709,11 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::Error(_))),
             "a tool error must not surface as an agent Error: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolFinished { is_error: true, .. }))
         );
         assert!(matches!(
             events.last(),
@@ -861,7 +883,7 @@ mod tests {
             ],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server));
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
 
         // Act
         handle
@@ -927,7 +949,7 @@ mod tests {
             .expect(1)
             .mount_as_scoped(&server)
             .await;
-        let mut handle = spawn_agent(test_provider(&server));
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
 
         // Act
         handle

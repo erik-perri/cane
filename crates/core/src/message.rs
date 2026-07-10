@@ -44,6 +44,7 @@ pub enum AgentEvent {
     ToolFinished {
         name: String,
         output: String,
+        is_error: bool,
     },
     TurnComplete {
         outcome: TurnOutcome,

@@ -22,13 +22,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "8192".into())
         .parse()
         .context("CANE_MAX_TOKENS must be an integer")?;
+    let path = std::env::current_dir()?;
 
-    let agent = cane_core::spawn_agent(cane_core::ProviderConfig {
+    let provider = cane_core::ProviderConfig {
         base_url,
         api_key,
         max_tokens,
         model,
-    });
+    };
+    let workspace = cane_core::Workspace::new(path)?;
+
+    let agent = cane_core::spawn_agent(provider, workspace);
 
     // Esc-to-interrupt stand-in: Ctrl-C trips the cancellation token
     tokio::spawn({

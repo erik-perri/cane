@@ -12,6 +12,11 @@ impl Workspace {
         Ok(Self { canonical_root })
     }
 
+    /// Return the canonical workspace root.
+    pub fn root(&self) -> &Path {
+        &self.canonical_root
+    }
+
     /// Resolve a tool-supplied path (absolute or relative-to-root) and
     /// error if it escapes the root.
     pub fn resolve(&self, candidate: &str) -> Result<PathBuf, String> {
@@ -33,8 +38,9 @@ impl Workspace {
             Ok(canonical_user)
         } else {
             Err(format!(
-                "you do not have access to path {}",
-                candidate.display()
+                "tool access denied: path `{}` is outside workspace root `{}`",
+                candidate.display(),
+                self.canonical_root.display()
             ))
         }
     }
@@ -124,7 +130,7 @@ mod tests {
         let workspace = Workspace::new(non_canonical_root).unwrap();
 
         // Assert
-        assert_eq!(workspace.canonical_root, dunce::canonicalize(root).unwrap());
+        assert_eq!(workspace.root(), dunce::canonicalize(root).unwrap());
     }
 
     #[test]
@@ -213,7 +219,13 @@ mod tests {
         let error = workspace.resolve("../outside.txt").unwrap_err();
 
         // Assert
-        assert_eq!(error, "you do not have access to path ../outside.txt");
+        assert_eq!(
+            error,
+            format!(
+                "tool access denied: path `../outside.txt` is outside workspace root `{}`",
+                workspace.root().display()
+            )
+        );
     }
 
     #[test]
@@ -231,7 +243,11 @@ mod tests {
         // Assert
         assert_eq!(
             error,
-            format!("you do not have access to path {}", outside.display())
+            format!(
+                "tool access denied: path `{}` is outside workspace root `{}`",
+                outside.display(),
+                workspace.root().display()
+            )
         );
     }
 

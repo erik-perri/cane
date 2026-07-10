@@ -1,5 +1,8 @@
+use crate::workspace::Workspace;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::Path;
+use std::sync::Arc;
 
 const DEFAULT_READ_FILE_LIMIT: u64 = 2_000;
 const MAX_READ_FILE_LIMIT: u64 = 2_000;
@@ -45,7 +48,15 @@ pub async fn dispatch(tools: &[Box<dyn Tool>], name: &str, input: Value) -> Resu
     }
 }
 
-pub struct FileTool {}
+pub struct FileTool {
+    workspace: Arc<Workspace>,
+}
+
+impl FileTool {
+    pub fn new(workspace: Arc<Workspace>) -> Self {
+        Self { workspace }
+    }
+}
 
 #[async_trait::async_trait]
 impl Tool for FileTool {
@@ -85,6 +96,9 @@ impl Tool for FileTool {
         if input.path.is_empty() {
             return Err("invalid read_file input: path cannot be empty".to_string());
         }
+
+        let resolved_path = self.workspace.resolve(&input.path)?;
+
         if input.offset == 0 {
             return Err("invalid read_file input: offset must be at least 1".to_string());
         }
@@ -95,7 +109,7 @@ impl Tool for FileTool {
         }
 
         tokio::task::spawn_blocking(move || {
-            read_lines_from_file(&input.path, input.offset, input.limit)
+            read_lines_from_file(&resolved_path, input.offset, input.limit)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -103,7 +117,7 @@ impl Tool for FileTool {
 }
 
 /// `offset` and `limit` have already been validated by `ReadFileInput`.
-fn read_lines_from_file(path: &str, offset: u64, limit: u64) -> Result<String, String> {
+fn read_lines_from_file(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
 
@@ -130,13 +144,17 @@ mod tests {
         file.path().to_str().unwrap()
     }
 
+    fn file_tool() -> FileTool {
+        FileTool::new(Arc::new(Workspace::new(std::env::temp_dir()).unwrap()))
+    }
+
     #[tokio::test]
     async fn execute_reads_up_to_the_default_line_limit() {
         // Arrange
         let file = temp_file_with(b"line one\nline two\nline three");
 
         // Act
-        let result = FileTool {}.execute(json!({ "path": path_of(&file) })).await;
+        let result = file_tool().execute(json!({ "path": path_of(&file) })).await;
 
         // Assert
         assert_eq!(result, Ok("line one\nline two\nline three".to_string()));
@@ -148,7 +166,7 @@ mod tests {
         let file = temp_file_with(b"one\ntwo\nthree\nfour\nfive");
 
         // Act
-        let result = FileTool {}
+        let result = file_tool()
             .execute(json!({ "path": path_of(&file), "offset": 2, "limit": 3 }))
             .await;
 
@@ -162,7 +180,7 @@ mod tests {
         let file = temp_file_with(b"first\nsecond");
 
         // Act
-        let result = FileTool {}
+        let result = file_tool()
             .execute(json!({ "path": path_of(&file), "offset": 1 }))
             .await;
 
@@ -176,7 +194,7 @@ mod tests {
         let file = temp_file_with(b"one\ntwo");
 
         // Act
-        let result = FileTool {}
+        let result = file_tool()
             .execute(json!({ "path": path_of(&file), "limit": 100 }))
             .await;
 
@@ -194,7 +212,7 @@ mod tests {
         let file = temp_file_with(contents.as_bytes());
 
         // Act
-        let output = FileTool {}
+        let output = file_tool()
             .execute(json!({ "path": path_of(&file) }))
             .await
             .unwrap();
@@ -210,7 +228,7 @@ mod tests {
         let file = temp_file_with(b"one\ntwo");
 
         // Act
-        let result = FileTool {}
+        let result = file_tool()
             .execute(json!({ "path": path_of(&file), "offset": 100 }))
             .await;
 
@@ -224,7 +242,7 @@ mod tests {
         let file = temp_file_with(b"ok \xff\xfe bytes");
 
         // Act
-        let result = FileTool {}.execute(json!({ "path": path_of(&file) })).await;
+        let result = file_tool().execute(json!({ "path": path_of(&file) })).await;
 
         // Assert
         assert_eq!(result, Ok("ok \u{FFFD}\u{FFFD} bytes".to_string()));
@@ -233,7 +251,7 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_input_without_a_path() {
         // Act
-        let result = FileTool {}.execute(json!({ "offset": 1 })).await;
+        let result = file_tool().execute(json!({ "offset": 1 })).await;
 
         // Assert
         assert!(result.unwrap_err().contains("missing field `path`"));
@@ -242,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_non_object_input() {
         // Act
-        let result = FileTool {}.execute(json!("just a string")).await;
+        let result = file_tool().execute(json!("just a string")).await;
 
         // Assert
         assert!(result.unwrap_err().starts_with("invalid read_file input:"));
@@ -257,7 +275,7 @@ mod tests {
             json!({ "path": "file.txt", "offset": "one" }),
             json!({ "path": "file.txt", "unexpected": true }),
         ] {
-            let result = FileTool {}.execute(input).await;
+            let result = file_tool().execute(input).await;
             assert!(
                 result.is_err(),
                 "invalid input should be rejected, got {result:?}"
@@ -268,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn execute_reports_an_error_for_a_missing_file() {
         // Act
-        let result = FileTool {}
+        let result = file_tool()
             .execute(json!({ "path": "/definitely/not/a/real/file" }))
             .await;
 
@@ -280,7 +298,7 @@ mod tests {
     async fn dispatch_runs_the_tool_matching_the_name() {
         // Arrange
         let file = temp_file_with(b"dispatched");
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FileTool {})];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(file_tool())];
 
         // Act
         let result = dispatch(&tools, "read_file", json!({ "path": path_of(&file) })).await;
@@ -292,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_an_error_for_an_unknown_tool_name() {
         // Arrange
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FileTool {})];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(file_tool())];
 
         // Act
         let result = dispatch(&tools, "write_file", json!({})).await;
