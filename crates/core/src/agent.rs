@@ -1,7 +1,7 @@
 use crate::Workspace;
 use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
-use crate::tools::{ReadFileTool, Tool, ToolDefinition, WriteFileTool, dispatch};
+use crate::tools::{EditFileTool, ReadFileTool, Tool, ToolDefinition, WriteFileTool, dispatch};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +62,7 @@ async fn agent_loop(
     let mut history = Vec::new();
 
     let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(EditFileTool::new(Arc::clone(&workspace))),
         Box::new(ReadFileTool::new(Arc::clone(&workspace))),
         Box::new(WriteFileTool::new(Arc::clone(&workspace))),
     ];
@@ -405,11 +406,34 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = requests[0].body_json().unwrap();
-        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
         assert_eq!(
             body["messages"],
             json!([{ "role": "user", "content": "Say hi" }])
         );
+    }
+
+    #[tokio::test]
+    async fn requests_advertise_all_registered_tools() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(&server, vec![text_turn("Hello world")]).await;
+
+        // Act
+        run_agent("Say hi", &server).await;
+
+        // Assert
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        let mut names = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+
+        assert_eq!(names, vec!["edit_file", "read_file", "write_file"]);
     }
 
     #[tokio::test]
