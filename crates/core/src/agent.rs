@@ -1,6 +1,7 @@
+use crate::Workspace;
 use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
-use crate::{ReadFileTool, Tool, ToolDefinition, Workspace, dispatch};
+use crate::tools::{ReadFileTool, Tool, ToolDefinition, WriteFileTool, dispatch};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +61,10 @@ async fn agent_loop(
 
     let mut history = Vec::new();
 
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFileTool::new(Arc::clone(&workspace)))];
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(ReadFileTool::new(Arc::clone(&workspace))),
+        Box::new(WriteFileTool::new(Arc::clone(&workspace))),
+    ];
     let tool_definitions = tools
         .iter()
         .map(|tool| tool.definition())
@@ -750,7 +754,7 @@ mod tests {
             vec![
                 tool_call_turn(&[(
                     "call_abc",
-                    "write_file",
+                    "write_the_file_at_the_path",
                     json!({ "path": "x.txt", "content": "y" }),
                 )]),
                 text_turn("I can't write files."),
@@ -776,7 +780,7 @@ mod tests {
             json!({
                 "role": "tool",
                 "tool_call_id": "call_abc",
-                "content": "Error: unknown tool: write_file"
+                "content": "Error: unknown tool: write_the_file_at_the_path"
             })
         );
     }

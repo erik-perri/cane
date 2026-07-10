@@ -1,8 +1,10 @@
 use serde_json::Value;
 
 mod read_file;
+mod write_file;
 
 pub use read_file::ReadFileTool;
+pub use write_file::WriteFileTool;
 
 /// A tool the model can call.
 #[derive(Clone, Debug)]
