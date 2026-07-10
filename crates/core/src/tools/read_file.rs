@@ -71,11 +71,10 @@ impl Tool for ReadFileTool {
         let input: ReadFileInput = serde_json::from_value(input)
             .map_err(|error| format!("invalid read_file input: {error}"))?;
 
-        if input.path.is_empty() {
-            return Err("invalid read_file input: path cannot be empty".to_string());
-        }
-
-        let resolved_path = self.workspace.resolve(&input.path)?;
+        let resolved_path = self
+            .workspace
+            .resolve(&input.path)
+            .map_err(|error| format!("invalid read_file input: {error}"))?;
 
         if input.offset == 0 {
             return Err("invalid read_file input: offset must be at least 1".to_string());
