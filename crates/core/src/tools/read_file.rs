@@ -1,4 +1,7 @@
-use crate::tools::{Tool, ToolDefinition, background_task_failed, invalid_input, operation_failed};
+use crate::tools::{
+    MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, Tool, ToolDefinition, background_task_failed,
+    invalid_input, operation_failed,
+};
 use crate::workspace::Workspace;
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,7 +44,9 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a text file from the local filesystem. Returns the requested lines as raw text.".to_string(),
+            description: format!(
+                "Read a text file from the local filesystem. Returns the requested lines as raw text. Files larger than {MAX_FILE_SIZE_MIB} MiB cannot be read."
+            ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -63,7 +68,7 @@ impl Tool for ReadFileTool {
                 },
                 "required": ["path"],
                 "additionalProperties": false
-            })
+            }),
         }
     }
 
@@ -99,6 +104,13 @@ impl Tool for ReadFileTool {
 
 /// `offset` and `limit` have already been validated by `ReadFileInput`.
 fn read_lines_from_file(path: &Path, offset: u64, limit: u64) -> std::io::Result<String> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_FILE_SIZE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "file is {size} bytes, which exceeds the {MAX_FILE_SIZE_BYTES} byte read limit"
+        )));
+    }
+
     let bytes = std::fs::read(path)?;
     let text = String::from_utf8_lossy(&bytes);
 
@@ -232,6 +244,29 @@ mod tests {
 
         // Assert
         assert_eq!(result, Ok("ok \u{FFFD}\u{FFFD} bytes".to_string()));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_a_file_over_the_size_cap() {
+        // Arrange
+        let file = temp_file_with(b"");
+        file.as_file().set_len(MAX_FILE_SIZE_BYTES + 1).unwrap();
+
+        // Act
+        let error = read_file_tool()
+            .execute(json!({ "path": path_of(&file) }))
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(
+            error,
+            format!(
+                "failed to read `{}`: file is {} bytes, which exceeds the {MAX_FILE_SIZE_BYTES} byte read limit",
+                path_of(&file),
+                MAX_FILE_SIZE_BYTES + 1
+            )
+        );
     }
 
     #[tokio::test]

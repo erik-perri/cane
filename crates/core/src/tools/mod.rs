@@ -20,6 +20,10 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: Value) -> Result<String, String>;
 }
 
+/// Largest file the file tools will load into memory.
+const MAX_FILE_SIZE_MIB: u64 = 10;
+const MAX_FILE_SIZE_BYTES: u64 = MAX_FILE_SIZE_MIB * 1024 * 1024;
+
 fn invalid_input(tool: &str, reason: impl std::fmt::Display) -> String {
     format!("invalid {tool} input: {reason}")
 }
