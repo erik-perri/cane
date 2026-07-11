@@ -1,12 +1,51 @@
 use serde_json::Value;
+use std::sync::Arc;
 
 mod edit_file;
 mod read_file;
 mod write_file;
 
+use crate::Workspace;
 pub use edit_file::EditFileTool;
 pub use read_file::ReadFileTool;
 pub use write_file::WriteFileTool;
+
+pub struct ToolSet {
+    tool_definitions: Vec<ToolDefinition>,
+    tools: Vec<Box<dyn Tool>>,
+}
+
+impl ToolSet {
+    pub fn new(workspace: Arc<Workspace>) -> Self {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(EditFileTool::new(Arc::clone(&workspace))),
+            Box::new(ReadFileTool::new(Arc::clone(&workspace))),
+            Box::new(WriteFileTool::new(Arc::clone(&workspace))),
+        ];
+
+        let tool_definitions = tools
+            .iter()
+            .map(|tool| tool.definition())
+            .collect::<Vec<ToolDefinition>>();
+
+        Self {
+            tool_definitions,
+            tools,
+        }
+    }
+
+    pub fn definitions(&self) -> &[ToolDefinition] {
+        &self.tool_definitions
+    }
+
+    pub fn locate(&self, name: &str) -> Result<&dyn Tool, String> {
+        self.tools
+            .iter()
+            .map(Box::as_ref)
+            .find(|tool| tool.definition().name == name)
+            .ok_or_else(|| format!("unknown tool: `{name}`"))
+    }
+}
 
 /// A tool the model can call.
 #[derive(Clone, Debug)]
@@ -19,7 +58,12 @@ pub struct ToolDefinition {
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+
     async fn execute(&self, input: Value) -> Result<String, String>;
+
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 /// Largest file the file tools will load into memory.

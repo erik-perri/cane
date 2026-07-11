@@ -100,6 +100,10 @@ impl Tool for ReadFileTool {
         .map_err(|error| background_task_failed("read", &requested_path, error))?
         .map_err(|error| operation_failed("read", &requested_path, error))
     }
+
+    fn read_only(&self) -> bool {
+        true
+    }
 }
 
 /// `offset` and `limit` have already been validated by `ReadFileInput`.

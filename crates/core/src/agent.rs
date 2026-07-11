@@ -1,14 +1,17 @@
 use crate::Workspace;
-use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason, TurnOutcome};
+use crate::approval::{ApprovalAuthorization, ApprovalGate};
+use crate::message::{ContentBlock, Message, Role, StopReason, ToolResultData};
+use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
-use crate::tools::{EditFileTool, ReadFileTool, Tool, ToolDefinition, WriteFileTool, dispatch};
+use crate::tools::ToolSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, PartialEq)]
-pub enum AgentCommand {
-    UserInput(String),
+pub struct AgentSession {
+    client: OpenAiClient,
+    host_handle: HostHandle,
+    tool_set: ToolSet,
 }
 
 pub struct AgentHandle {
@@ -23,17 +26,31 @@ pub fn spawn_agent(provider: ProviderConfig, workspace: Workspace) -> AgentHandl
     let cancel = CancellationToken::new();
 
     let task_cancel = cancel.clone();
+
     tokio::spawn(async move {
-        if let Err(e) = agent_loop(
-            provider,
-            workspace,
-            events_tx.clone(),
-            task_cancel,
-            commands_rx,
-        )
-        .await
-        {
-            let _ = events_tx.send(AgentEvent::Error(e.to_string())).await;
+        let events = EventSink::new(events_tx.clone());
+
+        let host_handle = HostHandle {
+            cancel: task_cancel,
+            commands: commands_rx,
+            events: events.clone(),
+        };
+
+        let session = match AgentSession::new(host_handle, provider, workspace) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = events.emit(AgentEvent::Error(e.to_string())).await;
+                return;
+            }
+        };
+
+        match session.run().await {
+            Ok(()) | Err(AgentExit::Disconnected) => {
+                // Clean shutdown: nothing to say, no one to say it to.
+            }
+            Err(AgentExit::Cancelled) => {
+                // Already surfaced as Error + TurnComplete inside the loop.
+            }
         }
     });
 
@@ -44,64 +61,104 @@ pub fn spawn_agent(provider: ProviderConfig, workspace: Workspace) -> AgentHandl
     }
 }
 
-async fn agent_loop(
-    provider: ProviderConfig,
-    workspace: Workspace,
-    events: mpsc::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    mut commands: mpsc::Receiver<AgentCommand>,
-) -> Result<(), ProviderError> {
-    let workspace = Arc::new(workspace);
-    let client = OpenAiClient::new(
-        provider.base_url,
-        provider.api_key,
-        provider.model,
-        provider.max_tokens,
-    )?;
+impl AgentSession {
+    fn new(
+        host_handle: HostHandle,
+        provider: ProviderConfig,
+        workspace: Workspace,
+    ) -> Result<AgentSession, ProviderError> {
+        let workspace = Arc::new(workspace);
+        let client = OpenAiClient::new(
+            provider.base_url,
+            provider.api_key,
+            provider.model,
+            provider.max_tokens,
+        )?;
 
-    let mut history = Vec::new();
+        Ok(AgentSession {
+            host_handle,
+            client,
+            tool_set: ToolSet::new(workspace),
+        })
+    }
 
-    let tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(EditFileTool::new(Arc::clone(&workspace))),
-        Box::new(ReadFileTool::new(Arc::clone(&workspace))),
-        Box::new(WriteFileTool::new(Arc::clone(&workspace))),
-    ];
-    let tool_definitions = tools
-        .iter()
-        .map(|tool| tool.definition())
-        .collect::<Vec<ToolDefinition>>();
-
-    loop {
-        let command = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(ProviderError::Cancelled);
-            }
-            _ = events.closed() => {
-                return Ok(());
-            }
-            command = commands.recv() => {
-                match command {
-                    Some(command) => command,
-                    None => return Ok(()),
-                }
-            }
-        };
-
-        let turn_start = history.len();
-
-        match command {
-            AgentCommand::UserInput(prompt) => {
-                history.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: prompt }],
-                });
-            }
-        }
+    async fn run(mut self) -> Result<(), AgentExit> {
+        let mut history = Vec::new();
+        let mut approval_gate = ApprovalGate::new();
 
         loop {
+            let command = tokio::select! {
+                _ = self.host_handle.cancel.cancelled() => return Err(AgentExit::Cancelled),
+                _ = self.host_handle.events.closed() => return Ok(()),
+                command = self.host_handle.commands.recv() => {
+                    match command {
+                        Some(command) => command,
+                        None => return Ok(()),
+                    }
+                }
+            };
+
+            let turn_start = history.len();
+
+            match command {
+                AgentCommand::Approval { id, decision } => {
+                    tracing::debug!(approval_id = %id, decision = ?decision, "unexpected approval received");
+                }
+                AgentCommand::UserInput(prompt) => {
+                    history.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text { text: prompt }],
+                    });
+                }
+            }
+
+            match self.run_turn(&mut history, &mut approval_gate).await {
+                Ok(outcome) => {
+                    let session_over = matches!(outcome, TurnOutcome::Cancelled);
+                    let needs_rollback = session_over || matches!(outcome, TurnOutcome::Failed);
+
+                    if needs_rollback {
+                        // Truncate the history on failure so we don't leave an incomplete
+                        // turn in the next request.
+                        history.truncate(turn_start);
+                    }
+
+                    self.host_handle
+                        .events
+                        .emit(AgentEvent::TurnComplete { outcome })
+                        .await?;
+
+                    if session_over {
+                        return Err(AgentExit::Cancelled);
+                    }
+                }
+                Err(AgentExit::Cancelled) => {
+                    // cancel tripped mid-approval (or anywhere the gate propagates it):
+                    // the turn still gets its one marker before the session ends.
+                    let _ = self
+                        .host_handle
+                        .events
+                        .emit(AgentEvent::TurnComplete {
+                            outcome: TurnOutcome::Cancelled,
+                        })
+                        .await;
+
+                    return Err(AgentExit::Cancelled);
+                }
+                Err(exit) => return Err(exit),
+            }
+        }
+    }
+
+    async fn run_turn(
+        &mut self,
+        history: &mut Vec<Message>,
+        gate: &mut ApprovalGate,
+    ) -> Result<TurnOutcome, AgentExit> {
+        loop {
             let stream_result = tokio::select! {
-                _ = events.closed() => return Ok(()),
-                result = client.stream_message(&history, &tool_definitions, &events, &cancel) => {
+                _ = self.host_handle.events.closed() => return Err(AgentExit::Disconnected),
+                result = self.client.stream_message(history, self.tool_set.definitions(), self.host_handle.events.sender(), &self.host_handle.cancel) => {
                     result
                 }
             };
@@ -111,32 +168,16 @@ async fn agent_loop(
                 Err(error) => {
                     let cancelled = matches!(&error, ProviderError::Cancelled);
 
-                    // History is committed only when the turn completes. A
-                    // failed stream may have already appended messages, and
-                    // retaining them would leave an incomplete turn in the
-                    // next request.
-                    history.truncate(turn_start);
+                    self.host_handle
+                        .events
+                        .emit(AgentEvent::Error(error.to_string()))
+                        .await?;
 
-                    let _ = events.send(AgentEvent::Error(error.to_string())).await;
-                    let _ = events
-                        .send(AgentEvent::TurnComplete {
-                            outcome: if cancelled {
-                                TurnOutcome::Cancelled
-                            } else {
-                                TurnOutcome::Failed
-                            },
-                        })
-                        .await;
-
-                    // A cancellation token cannot be reset, so this session
-                    // cannot accept another turn after its active turn ends.
-                    // End cleanly after delivering the terminal event rather
-                    // than returning an error to the task wrapper, which only
-                    // emits Error and would leave frontends waiting.
-                    if cancelled {
-                        return Ok(());
-                    }
-                    break;
+                    return if cancelled {
+                        Ok(TurnOutcome::Cancelled)
+                    } else {
+                        Ok(TurnOutcome::Failed)
+                    };
                 }
             };
 
@@ -145,12 +186,7 @@ async fn agent_loop(
             history.push(assistant_msg);
 
             if stop_reason != StopReason::ToolUse {
-                let _ = events
-                    .send(AgentEvent::TurnComplete {
-                        outcome: TurnOutcome::Completed { stop_reason },
-                    })
-                    .await;
-                break;
+                return Ok(TurnOutcome::Completed { stop_reason });
             }
 
             let mut results = Vec::new();
@@ -160,42 +196,13 @@ async fn agent_loop(
                     ContentBlock::ToolUse {
                         id, input, name, ..
                     } => {
-                        if events
-                            .send(AgentEvent::ToolStarted {
-                                input: input.clone(),
-                                name: name.clone(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
+                        let tool_result = self.execute_tool_call(id, name, input, gate).await?;
 
-                        let (content, is_error) = match dispatch(&tools, name, input.clone()).await
-                        {
-                            Ok(output) => (output, false),
-                            Err(err) => (err, true),
-                        };
-
-                        if events
-                            .send(AgentEvent::ToolFinished {
-                                name: name.clone(),
-                                output: content.clone(),
-                                is_error,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
-
-                        results.push(ContentBlock::ToolResult {
-                            content,
-                            is_error,
-                            tool_use_id: id.clone(),
-                        });
+                        results.push(ContentBlock::ToolResult(tool_result));
                     }
-                    ContentBlock::Text { .. } => {}
+                    ContentBlock::Text { .. } => {
+                        //
+                    }
                     ContentBlock::ToolResult { .. } => {
                         tracing::warn!("unexpected tool result content block")
                     }
@@ -203,19 +210,14 @@ async fn agent_loop(
             }
 
             if results.is_empty() {
-                history.truncate(turn_start);
-
-                let _ = events
-                    .send(AgentEvent::Error(
+                self.host_handle
+                    .events
+                    .emit(AgentEvent::Error(
                         "no tool results were generated".to_string(),
                     ))
-                    .await;
-                let _ = events
-                    .send(AgentEvent::TurnComplete {
-                        outcome: TurnOutcome::Failed,
-                    })
-                    .await;
-                break;
+                    .await?;
+
+                return Ok(TurnOutcome::Failed);
             }
 
             history.push(Message {
@@ -224,6 +226,94 @@ async fn agent_loop(
             });
         }
     }
+
+    async fn execute_tool_call(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        gate: &mut ApprovalGate,
+    ) -> Result<ToolResultData, AgentExit> {
+        self.host_handle
+            .events
+            .emit(AgentEvent::ToolStarted {
+                input: input.clone(),
+                name: name.to_string(),
+            })
+            .await?;
+
+        let result =
+            resolve_tool_call(&self.tool_set, gate, &mut self.host_handle, id, name, input).await?;
+
+        self.host_handle
+            .events
+            .emit(AgentEvent::ToolFinished {
+                is_error: result.is_error,
+                name: name.to_string(),
+                output: result.content.clone(),
+            })
+            .await?;
+
+        Ok(result)
+    }
+}
+
+async fn resolve_tool_call(
+    tool_set: &ToolSet,
+    gate: &mut ApprovalGate,
+    host_handle: &mut HostHandle,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+) -> Result<ToolResultData, AgentExit> {
+    let tool = match tool_set.locate(name) {
+        Ok(tool) => tool,
+        Err(error) => {
+            return Ok(ToolResultData {
+                content: error.to_string(),
+                is_error: true,
+                tool_use_id: id.to_string(),
+            });
+        }
+    };
+
+    let result = gate
+        .authorize(
+            tool,
+            id,
+            input,
+            &host_handle.events,
+            &mut host_handle.commands,
+            &host_handle.cancel,
+        )
+        .await?;
+
+    match result {
+        ApprovalAuthorization::Approved => {
+            //
+        }
+        ApprovalAuthorization::Denied { reason } => {
+            return Ok(ToolResultData {
+                content: format!(
+                    "The user declined this tool call and said: \"{}\". Do not assume the tool ran. Address their feedback, then retry if appropriate.",
+                    reason
+                ),
+                is_error: false,
+                tool_use_id: id.to_string(),
+            });
+        }
+    }
+
+    let (content, is_error) = match tool.execute(input.clone()).await {
+        Ok(content) => (content, false),
+        Err(err) => (err, true),
+    };
+
+    Ok(ToolResultData {
+        content,
+        is_error,
+        tool_use_id: id.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -838,6 +928,7 @@ mod tests {
         let names: Vec<_> = events
             .iter()
             .map(|event| match event {
+                AgentEvent::ApprovalRequest { .. } => "approval",
                 AgentEvent::ToolStarted { .. } => "started",
                 AgentEvent::ToolFinished { .. } => "finished",
                 AgentEvent::TextDelta(_) => "text",

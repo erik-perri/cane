@@ -1,5 +1,5 @@
 use anyhow::Context;
-use cane_core::{AgentCommand, AgentEvent, AgentHandle, TurnOutcome};
+use cane_core::{AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, TurnOutcome};
 use std::io::{BufRead, Write};
 
 pub(crate) async fn run(
@@ -64,11 +64,66 @@ pub(crate) async fn run(
                 }
 
                 AgentEvent::Error(e) => eprintln!("\nerror: {e}"),
+
+                AgentEvent::ApprovalRequest {
+                    id,
+                    input: command_input,
+                    name,
+                } => {
+                    writeln!(
+                        output,
+                        "\n[approval request: {name} {command_input}] [y,n,a]"
+                    )?;
+                    output.flush()?;
+
+                    let decision = read_decision(&mut input, &mut output)?;
+
+                    if agent
+                        .commands
+                        .send(AgentCommand::Approval {
+                            id: id.clone(),
+                            decision,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        // Exit if the agent task disappears.
+                        break;
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+fn read_decision(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> anyhow::Result<ApprovalDecision> {
+    loop {
+        let Some(line) = read_input(input, output)? else {
+            return Err(anyhow::anyhow!("eof"));
+        };
+
+        let allow_input = line.trim().to_lowercase();
+
+        if allow_input.is_empty() || allow_input == "n" {
+            writeln!(output, "\nreason:")?;
+            output.flush()?;
+
+            let Some(reason) = read_input(input, output)? else {
+                return Err(anyhow::anyhow!("eof"));
+            };
+
+            return Ok(ApprovalDecision::Deny { reason });
+        } else if allow_input == "a" {
+            return Ok(ApprovalDecision::AlwaysAllowSession);
+        } else if allow_input == "y" {
+            return Ok(ApprovalDecision::Allow);
+        }
+    }
 }
 
 fn read_input(input: &mut impl BufRead, output: &mut impl Write) -> anyhow::Result<Option<String>> {

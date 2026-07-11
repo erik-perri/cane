@@ -14,6 +14,14 @@ pub struct Message {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolResultData {
+    pub tool_use_id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -26,37 +34,13 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         raw_input: Option<String>,
     },
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        is_error: bool,
-    },
+    ToolResult(ToolResultData),
 }
 
-#[derive(Debug, PartialEq)]
-pub enum AgentEvent {
-    TextDelta(String),
-    ToolStarted {
-        name: String,
-        input: serde_json::Value,
-    },
-    ToolFinished {
-        name: String,
-        output: String,
-        is_error: bool,
-    },
-    TurnComplete {
-        outcome: TurnOutcome,
-    },
-    Error(String),
-}
-
-#[derive(Debug, PartialEq)]
-pub enum TurnOutcome {
-    Completed { stop_reason: StopReason },
-    Failed,
-    Cancelled,
+impl From<ToolResultData> for ContentBlock {
+    fn from(result: ToolResultData) -> Self {
+        ContentBlock::ToolResult(result)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,11 +72,11 @@ mod tests {
                     input: serde_json::Value::String("Mock Input".to_string()),
                     raw_input: None,
                 },
-                ToolResult {
+                ToolResult(ToolResultData {
                     tool_use_id: "Mock ID".to_string(),
                     content: "Mock Content".to_string(),
                     is_error: true,
-                },
+                }),
             ],
         };
 
@@ -120,11 +104,11 @@ mod tests {
         // Arrange
         let message = Message {
             role: Role::Assistant,
-            content: vec![ToolResult {
+            content: vec![ToolResult(ToolResultData {
                 tool_use_id: "Mock ID".to_string(),
                 content: "Mock Content".to_string(),
                 is_error: false,
-            }],
+            })],
         };
 
         // Act

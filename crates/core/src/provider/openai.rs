@@ -1,4 +1,5 @@
-use crate::message::{AgentEvent, ContentBlock, Message, Role, StopReason};
+use crate::message::{ContentBlock, Message, Role, StopReason, ToolResultData};
+use crate::protocol::AgentEvent;
 use crate::provider::ProviderError;
 use crate::provider::sse::SseParser;
 use crate::tools::ToolDefinition;
@@ -356,11 +357,11 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
                                 content: text.clone(),
                             });
                         }
-                        ContentBlock::ToolResult {
+                        ContentBlock::ToolResult(ToolResultData {
                             content,
                             is_error,
                             tool_use_id,
-                        } => {
+                        }) => {
                             let content = if *is_error {
                                 format!("Error: {}", content)
                             } else {
@@ -541,16 +542,16 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![
-                    ToolResult {
+                    ToolResult(ToolResultData {
                         tool_use_id: "call_abc".to_string(),
                         content: "[package]\nname = \"cane\"".to_string(),
                         is_error: false,
-                    },
-                    ToolResult {
+                    }),
+                    ToolResult(ToolResultData {
                         tool_use_id: "call_def".to_string(),
                         content: "file not found: Cargo.lock".to_string(),
                         is_error: true,
-                    },
+                    }),
                 ],
             },
             Message {
@@ -604,11 +605,11 @@ mod tests {
                 Text {
                     text: "and also, what about this?".to_string(),
                 },
-                ToolResult {
+                ToolResult(ToolResultData {
                     tool_use_id: "call_abc".to_string(),
                     content: "ok".to_string(),
                     is_error: false,
-                },
+                }),
             ],
         }];
 
