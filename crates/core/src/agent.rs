@@ -103,6 +103,8 @@ impl AgentSession {
             match command {
                 AgentCommand::Approval { id, decision } => {
                     tracing::debug!(approval_id = %id, decision = ?decision, "unexpected approval received");
+
+                    continue;
                 }
                 AgentCommand::UserInput(prompt) => {
                     history.push(Message {
@@ -319,6 +321,7 @@ async fn resolve_tool_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ApprovalDecision;
     use serde_json::json;
     use std::io::Write;
     use std::time::Duration;
@@ -500,6 +503,28 @@ mod tests {
             body["messages"],
             json!([{ "role": "user", "content": "Say hi" }])
         );
+    }
+
+    #[tokio::test]
+    async fn an_approval_only_turn_does_nothing() {
+        // Arrange
+        let server = MockServer::start().await;
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+
+        // Act
+        handle
+            .commands
+            .send(AgentCommand::Approval {
+                id: "tool-1".to_string(),
+                decision: ApprovalDecision::Allow,
+            })
+            .await
+            .unwrap();
+        drop(handle.commands);
+        let events = collect_until_events_close(&mut handle.events).await;
+
+        // Assert
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
