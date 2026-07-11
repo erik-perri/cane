@@ -412,7 +412,7 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
                     }
                 }
 
-                let content = if combined_text.is_empty() {
+                let mut content = if combined_text.is_empty() {
                     None
                 } else {
                     Some(combined_text)
@@ -423,6 +423,10 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
                 } else {
                     Some(tool_calls)
                 };
+
+                if content.is_none() && tool_calls.is_none() {
+                    content = Some(String::new());
+                }
 
                 wire_messages.push(OpenAiRequestMessage::Assistant {
                     content,
@@ -619,6 +623,21 @@ mod tests {
                 { "role": "user", "content": "and also, what about this?" }
             ])
         );
+    }
+
+    #[test]
+    fn to_wire_serializes_an_empty_assistant_message_as_empty_string_content() {
+        // Arrange
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: vec![],
+        }];
+
+        // Act
+        let wire = serde_json::to_value(to_wire(&history)).unwrap();
+
+        // Assert
+        assert_eq!(wire, json!([{ "role": "assistant", "content": "" }]));
     }
 
     #[test]
