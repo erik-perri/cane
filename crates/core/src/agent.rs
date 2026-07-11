@@ -101,11 +101,6 @@ impl AgentSession {
             let turn_start = history.len();
 
             match command {
-                AgentCommand::Approval { id, decision } => {
-                    tracing::debug!(approval_id = %id, decision = ?decision, "unexpected approval received");
-
-                    continue;
-                }
                 AgentCommand::UserInput(prompt) => {
                     history.push(Message {
                         role: Role::User,
@@ -280,14 +275,7 @@ async fn resolve_tool_call(
     };
 
     let result = gate
-        .authorize(
-            tool,
-            id,
-            input,
-            &host_handle.events,
-            &mut host_handle.commands,
-            &host_handle.cancel,
-        )
+        .authorize(tool, id, input, &host_handle.events, &host_handle.cancel)
         .await?;
 
     match result {
@@ -485,17 +473,23 @@ mod tests {
         let events = run_agent("Say hi", &server).await;
 
         // Assert
+        assert_eq!(2, events.len());
+
+        let Some(AgentEvent::TextDelta(text)) = events.first() else {
+            panic!("expected the first event to be TextDelta");
+        };
+        assert_eq!(text, "Hello world");
+
+        let Some(AgentEvent::TurnComplete { outcome }) = events.get(1) else {
+            panic!("expected the second event to be TurnComplete");
+        };
         assert_eq!(
-            events,
-            vec![
-                AgentEvent::TextDelta("Hello world".to_string()),
-                AgentEvent::TurnComplete {
-                    outcome: TurnOutcome::Completed {
-                        stop_reason: StopReason::EndTurn
-                    }
-                },
-            ]
+            outcome,
+            &TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            }
         );
+
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = requests[0].body_json().unwrap();
@@ -503,28 +497,6 @@ mod tests {
             body["messages"],
             json!([{ "role": "user", "content": "Say hi" }])
         );
-    }
-
-    #[tokio::test]
-    async fn an_approval_only_turn_does_nothing() {
-        // Arrange
-        let server = MockServer::start().await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
-
-        // Act
-        handle
-            .commands
-            .send(AgentCommand::Approval {
-                id: "tool-1".to_string(),
-                decision: ApprovalDecision::Allow,
-            })
-            .await
-            .unwrap();
-        drop(handle.commands);
-        let events = collect_until_events_close(&mut handle.events).await;
-
-        // Assert
-        assert!(events.is_empty());
     }
 
     #[tokio::test]
@@ -630,28 +602,40 @@ mod tests {
         let shutdown_events = collect_until_events_close(&mut handle.events).await;
 
         // Assert
+        assert_eq!(2, first_turn.len());
+
+        let Some(AgentEvent::TextDelta(text)) = first_turn.get(0) else {
+            panic!("Expected first turn to contain a TextDelta event");
+        };
+        assert_eq!("Hello!", text);
+
+        let Some(AgentEvent::TurnComplete { outcome }) = first_turn.get(1) else {
+            panic!("Expected first turn to contain a TurnComplete event");
+        };
         assert_eq!(
-            first_turn,
-            vec![
-                AgentEvent::TextDelta("Hello!".to_string()),
-                AgentEvent::TurnComplete {
-                    outcome: TurnOutcome::Completed {
-                        stop_reason: StopReason::EndTurn
-                    }
-                },
-            ]
+            outcome,
+            &TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            }
         );
+
+        assert_eq!(2, second_turn.len());
+
+        let Some(AgentEvent::TextDelta(text)) = second_turn.get(0) else {
+            panic!("Expected second turn to contain a TextDelta event");
+        };
+        assert_eq!("Yes, I remember.", text);
+
+        let Some(AgentEvent::TurnComplete { outcome }) = second_turn.get(1) else {
+            panic!("Expected second turn to contain a TurnComplete event");
+        };
         assert_eq!(
-            second_turn,
-            vec![
-                AgentEvent::TextDelta("Yes, I remember.".to_string()),
-                AgentEvent::TurnComplete {
-                    outcome: TurnOutcome::Completed {
-                        stop_reason: StopReason::EndTurn
-                    }
-                },
-            ]
+            outcome,
+            &TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            }
         );
+
         assert!(
             shutdown_events.is_empty(),
             "clean shutdown emitted unexpected events: {shutdown_events:?}"
@@ -751,6 +735,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_input_queued_while_approval_is_pending_becomes_the_next_turn() {
+        // Arrange
+        let file = temp_file_with(b"alpha");
+        let file_path = file.path().to_str().unwrap();
+
+        let server = MockServer::start().await;
+
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "write-1",
+                    "write_file",
+                    json!({ "path": file_path, "content": "what" }),
+                )]),
+                text_turn("what1"),
+                text_turn("what2"),
+            ],
+        )
+        .await;
+
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+
+        // Act
+        handle
+            .commands
+            .send(AgentCommand::UserInput("what".to_string()))
+            .await
+            .unwrap();
+
+        let respond_to = loop {
+            let event = handle.events.recv().await.unwrap();
+
+            if let AgentEvent::ApprovalRequest {
+                respond_to: new_respond_to,
+                ..
+            } = event
+            {
+                break new_respond_to;
+            }
+        };
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("what3".to_string()))
+            .await
+            .unwrap();
+
+        respond_to.send(ApprovalDecision::Allow).unwrap();
+
+        let first_turn = collect_turn(&mut handle.events).await;
+        let second_turn = collect_turn(&mut handle.events).await;
+
+        drop(handle.commands);
+        let shutdown_events = collect_until_events_close(&mut handle.events).await;
+
+        let queued_message = nth_request_messages(&server, 2).await;
+
+        // Assert
+        assert_eq!(3, first_turn.len());
+        assert_eq!(2, second_turn.len());
+        assert_eq!(0, shutdown_events.len());
+
+        let Some(AgentEvent::ToolFinished { name, .. }) = first_turn.first() else {
+            panic!("Expected first event to be a ToolFinished event");
+        };
+        assert_eq!("write_file", name);
+
+        let Some(AgentEvent::TextDelta(text)) = first_turn.get(1) else {
+            panic!("Expected second event to be a TextDelta event");
+        };
+        assert_eq!("what1", text);
+
+        let Some(AgentEvent::TurnComplete { outcome }) = first_turn.get(2) else {
+            panic!("Expected third event to be a TurnComplete event");
+        };
+        assert_eq!(
+            TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            },
+            *outcome,
+        );
+
+        let Some(AgentEvent::TextDelta(text)) = second_turn.first() else {
+            panic!("Expected first event to be a TextDelta event");
+        };
+        assert_eq!("what2", text);
+
+        let Some(AgentEvent::TurnComplete { outcome }) = second_turn.get(1) else {
+            panic!("Expected second event to be a TurnComplete event");
+        };
+        assert_eq!(
+            TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            },
+            *outcome,
+        );
+
+        let Some(last_message) = queued_message
+            .as_array()
+            .and_then(|messages| messages.last())
+        else {
+            panic!("expected provider messages to be a non-empty array");
+        };
+
+        assert_eq!(
+            last_message,
+            &json!({
+                "role": "user",
+                "content": "what3"
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn a_tool_turn_executes_the_tool_and_round_trips_the_result() {
         // Success criteria 2 & 3: the model calls read_file, the harness
         // executes it, and the follow-up request carries the assistant echo
@@ -773,25 +872,39 @@ mod tests {
         let events = run_agent("What's in Cargo.toml?", &server).await;
 
         // Assert
+        assert_eq!(4, events.len());
+
+        let Some(AgentEvent::ToolStarted { name, input }) = events.get(0) else {
+            panic!("Expected first event to be a ToolStarted event");
+        };
+        assert_eq!("read_file", name);
+        assert_eq!(json!({ "path": file_path }), *input);
+
+        let Some(AgentEvent::ToolFinished {
+            name,
+            output,
+            is_error,
+        }) = events.get(1)
+        else {
+            panic!("Expected second event to be a ToolFinished event");
+        };
+        assert_eq!("read_file", name);
+        assert!(!is_error);
+        assert_eq!("[workspace]\nmembers = [\"crates/core\"]", output);
+
+        let Some(AgentEvent::TextDelta(text)) = events.get(2) else {
+            panic!("Expected third event to be a TextDelta event");
+        };
+        assert_eq!("It has one member.", text);
+
+        let Some(AgentEvent::TurnComplete { outcome }) = events.get(3) else {
+            panic!("Expected fourth event to be a TurnComplete event");
+        };
         assert_eq!(
-            events,
-            vec![
-                AgentEvent::ToolStarted {
-                    name: "read_file".to_string(),
-                    input: json!({ "path": file_path }),
-                },
-                AgentEvent::ToolFinished {
-                    name: "read_file".to_string(),
-                    output: "[workspace]\nmembers = [\"crates/core\"]".to_string(),
-                    is_error: false,
-                },
-                AgentEvent::TextDelta("It has one member.".to_string()),
-                AgentEvent::TurnComplete {
-                    outcome: TurnOutcome::Completed {
-                        stop_reason: StopReason::EndTurn
-                    }
-                },
-            ]
+            outcome,
+            &TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            }
         );
 
         // Assert
@@ -1059,17 +1172,24 @@ mod tests {
             ),
             "expected an Error followed by a failed TurnComplete, got {failed_turn:?}"
         );
+
+        assert_eq!(2, recovery_turn.len());
+
+        let Some(AgentEvent::TextDelta(text)) = recovery_turn.first() else {
+            panic!("expected the first event to be TextDelta");
+        };
+        assert_eq!("This turn succeeded.", text);
+
+        let Some(AgentEvent::TurnComplete { outcome }) = recovery_turn.get(1) else {
+            panic!("expected the second event to be TurnComplete");
+        };
         assert_eq!(
-            recovery_turn,
-            vec![
-                AgentEvent::TextDelta("This turn succeeded.".to_string()),
-                AgentEvent::TurnComplete {
-                    outcome: TurnOutcome::Completed {
-                        stop_reason: StopReason::EndTurn
-                    }
-                },
-            ]
+            outcome,
+            &TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            }
         );
+
         assert!(
             shutdown_events.is_empty(),
             "clean shutdown emitted unexpected events: {shutdown_events:?}"

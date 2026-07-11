@@ -27,13 +27,13 @@ pub(crate) async fn run(
         }
 
         loop {
-            let ev = agent
+            let event = agent
                 .events
                 .recv()
                 .await
                 .context("agent stopped before completing the turn")?;
 
-            match ev {
+            match event {
                 AgentEvent::TextDelta(text) => {
                     write!(output, "{text}")?;
                     output.flush()?;
@@ -66,9 +66,10 @@ pub(crate) async fn run(
                 AgentEvent::Error(e) => eprintln!("\nerror: {e}"),
 
                 AgentEvent::ApprovalRequest {
-                    id,
                     input: command_input,
                     name,
+                    respond_to,
+                    ..
                 } => {
                     writeln!(
                         output,
@@ -78,15 +79,7 @@ pub(crate) async fn run(
 
                     let decision = read_decision(&mut input, &mut output)?;
 
-                    if agent
-                        .commands
-                        .send(AgentCommand::Approval {
-                            id: id.clone(),
-                            decision,
-                        })
-                        .await
-                        .is_err()
-                    {
+                    if respond_to.send(decision).is_err() {
                         // Exit if the agent task disappears.
                         break;
                     }

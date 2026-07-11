@@ -1,14 +1,16 @@
 use crate::StopReason;
 use std::fmt::Display;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum AgentEvent {
     ApprovalRequest {
         id: String,
         input: serde_json::Value,
         name: String,
+        respond_to: oneshot::Sender<ApprovalDecision>,
     },
     TextDelta(String),
     ToolStarted {
@@ -87,10 +89,6 @@ impl From<FrontendGone> for AgentExit {
 
 #[derive(Debug, PartialEq)]
 pub enum AgentCommand {
-    Approval {
-        id: String,
-        decision: ApprovalDecision,
-    },
     UserInput(String),
 }
 

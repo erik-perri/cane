@@ -1,7 +1,8 @@
-use crate::protocol::{AgentCommand, AgentExit, EventSink};
+use crate::protocol::{AgentExit, EventSink};
 use crate::tools::Tool;
 use crate::{AgentEvent, ApprovalDecision};
 use std::collections::HashSet;
+use tokio::sync::oneshot;
 
 pub struct ApprovalGate {
     always_allowed: HashSet<String>,
@@ -25,7 +26,6 @@ impl ApprovalGate {
         call_id: &str,
         input: &serde_json::Value,
         events: &EventSink,
-        commands: &mut tokio::sync::mpsc::Receiver<AgentCommand>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<ApprovalAuthorization, AgentExit> {
         let definition = tool.definition();
@@ -34,15 +34,18 @@ impl ApprovalGate {
             return Ok(ApprovalAuthorization::Approved);
         }
 
+        let (decision_tx, decision_rx) = oneshot::channel();
+
         events
             .emit(AgentEvent::ApprovalRequest {
                 id: call_id.to_string(),
                 input: input.clone(),
                 name: definition.name.clone(),
+                respond_to: decision_tx,
             })
             .await?;
 
-        match wait_for_response(call_id, events, commands, cancel).await? {
+        match wait_for_response(decision_rx, events, cancel).await? {
             ApprovalDecision::Allow => Ok(ApprovalAuthorization::Approved),
             ApprovalDecision::AlwaysAllowSession => {
                 self.always_allowed.insert(definition.name);
@@ -55,40 +58,13 @@ impl ApprovalGate {
 }
 
 async fn wait_for_response(
-    call_id: &str,
+    receiver: oneshot::Receiver<ApprovalDecision>,
     events: &EventSink,
-    commands: &mut tokio::sync::mpsc::Receiver<AgentCommand>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<ApprovalDecision, AgentExit> {
-    loop {
-        let response = tokio::select! {
-            _ = cancel.cancelled() => return Err(AgentExit::Cancelled),
-            _ = events.closed() => return Err(AgentExit::Disconnected),
-            command = commands.recv() => {
-                command.ok_or(AgentExit::Disconnected)?
-            }
-        };
-
-        match response {
-            AgentCommand::Approval {
-                decision,
-                id: approved_id,
-            } => {
-                if approved_id.eq(call_id) {
-                    return Ok(decision);
-                }
-
-                tracing::warn!(
-                    approval_id = %call_id,
-                    "ignoring unexpected command approval"
-                );
-            }
-            AgentCommand::UserInput(..) => {
-                tracing::warn!(
-                    approval_id = %call_id,
-                    "ignoring user input while approval is pending"
-                );
-            }
-        }
+    tokio::select! {
+        _ = cancel.cancelled() => Err(AgentExit::Cancelled),
+        _ = events.closed() => Err(AgentExit::Disconnected),
+        result = receiver => result.map_err(|_| AgentExit::Disconnected),
     }
 }
