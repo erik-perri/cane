@@ -58,7 +58,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn message_round_trips_through_json() {
+    fn message_serializes_to_expected_json_and_round_trips() {
         // Arrange
         let message = Message {
             role: Role::Assistant,

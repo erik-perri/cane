@@ -362,7 +362,6 @@ mod tests {
             .set_body_string(body)
     }
 
-    /// An assistant turn that streams `text` and stops.
     fn text_turn(text: &str) -> ResponseTemplate {
         sse_response(&[
             stream_chunk(json!({ "role": "assistant", "content": text }), None),
@@ -370,7 +369,6 @@ mod tests {
         ])
     }
 
-    /// An assistant turn of tool calls, one per `(id, name, arguments)`.
     fn tool_call_turn(calls: &[(&str, &str, serde_json::Value)]) -> ResponseTemplate {
         let chunks: Vec<_> = calls
             .iter()
@@ -393,9 +391,6 @@ mod tests {
         sse_response(&chunks)
     }
 
-    /// Script the conversation: the nth request receives the nth response.
-    /// Each turn must be consumed exactly once or the mock server panics when
-    /// dropped. A run that loops forever dies on `expect(1)`, not silently.
     async fn mount_turns(server: &MockServer, turns: Vec<ResponseTemplate>) {
         for (i, turn) in turns.into_iter().enumerate() {
             Mock::given(method("POST"))
@@ -422,9 +417,6 @@ mod tests {
         Workspace::new(std::env::temp_dir()).unwrap()
     }
 
-    /// Send one input, close the command channel, and collect every event
-    /// until the agent exits. This keeps the old one-shot tests focused on a
-    /// single turn while exercising the session-shaped public API.
     async fn run_agent(prompt: &str, server: &MockServer) -> Vec<AgentEvent> {
         let mut handle = spawn_agent(test_provider(server), test_workspace());
         handle
@@ -437,8 +429,6 @@ mod tests {
         collect_until_events_close(&mut handle.events).await
     }
 
-    /// The timeout turns a non-terminating loop into a test failure instead
-    /// of a hung suite.
     async fn collect_until_events_close(
         events_rx: &mut mpsc::Receiver<AgentEvent>,
     ) -> Vec<AgentEvent> {
@@ -453,8 +443,6 @@ mod tests {
         events
     }
 
-    /// Collect precisely one completed turn, leaving the session alive for a
-    /// follow-up command.
     async fn collect_turn(events_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
         timeout(Duration::from_secs(5), async {
             let mut events = Vec::new();
@@ -548,9 +536,6 @@ mod tests {
 
     #[tokio::test]
     async fn agent_waits_for_input_and_exits_when_command_channel_closes() {
-        // A session must not contact the provider until its frontend supplies
-        // input. Closing that frontend command channel is clean shutdown.
-
         // Arrange
         let server = MockServer::start().await;
         let mut handle = spawn_agent(test_provider(&server), test_workspace());
@@ -675,9 +660,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_completed_tool_turn_is_preserved_for_the_next_user_input() {
-        // Tool-use history needs to outlive its turn too: the assistant echo
-        // and tool result must remain paired when the next turn is sent.
-
         // Arrange
         let file = temp_file_with(b"alpha");
         let file_path = file.path().to_str().unwrap();
@@ -878,7 +860,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_tool_is_never_reported_as_started() {
+    async fn denied_tool_is_not_started_or_executed() {
+        // Arrange
         let file = temp_file_with(b"original");
         let file_path = file.path().to_str().unwrap();
         let server = MockServer::start().await;
@@ -901,6 +884,7 @@ mod tests {
             .await
             .unwrap();
 
+        // Act
         let respond_to = loop {
             let event = handle.events.recv().await.unwrap();
             match event {
@@ -919,6 +903,7 @@ mod tests {
 
         let events = collect_turn(&mut handle.events).await;
 
+        // Assert
         assert!(matches!(
             events.as_slice(),
             [
@@ -934,10 +919,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_turn_executes_the_tool_and_round_trips_the_result() {
-        // Success criteria 2 & 3: the model calls read_file, the harness
-        // executes it, and the follow-up request carries the assistant echo
-        // (tool_calls intact) plus a role:"tool" result with the file content.
-
         // Arrange
         let file = temp_file_with(b"[workspace]\nmembers = [\"crates/core\"]");
         let file_path = file.path().to_str().unwrap();
@@ -990,7 +971,6 @@ mod tests {
             }
         );
 
-        // Assert
         let messages = nth_request_messages(&server, 1).await;
         assert_eq!(
             messages[1],
@@ -1020,10 +1000,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_error_is_fed_back_to_the_model_not_raised() {
-        // Tool errors are model feedback, not failures. A missing file
-        // must become an error tool result the model can see; the turn
-        // continues and no Error event is emitted.
-
         // Arrange
         let server = MockServer::start().await;
         mount_turns(
@@ -1078,10 +1054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hallucinated_tool_name_gets_an_error_result() {
-        // An unknown tool name is an error tool result on the same plane
-        // as a failed execution. The model is told and the harness lives.
-
+    async fn an_unknown_tool_name_gets_an_error_result() {
         // Arrange
         let server = MockServer::start().await;
         mount_turns(
@@ -1174,7 +1147,6 @@ mod tests {
             vec!["started", "finished", "rejected", "text", "complete"]
         );
 
-        // Assert
         let messages = nth_request_messages(&server, 1).await;
         assert_eq!(messages[2]["tool_call_id"], "call_a");
         assert_eq!(messages[2]["content"], "alpha");
@@ -1189,10 +1161,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_provider_error_becomes_an_error_event() {
-        // Provider errors are the *other* plane: they abort the current turn
-        // and surface as an Error event. This helper closes the command
-        // channel after that one input, so the session then exits cleanly.
-
         // Arrange
         let server = MockServer::start().await;
         mount_turns(
@@ -1221,8 +1189,6 @@ mod tests {
 
     #[tokio::test]
     async fn provider_error_does_not_prevent_a_later_user_input() {
-        // Provider errors end the affected turn, not the long-lived session.
-
         // Arrange
         let server = MockServer::start().await;
         mount_turns(
@@ -1295,9 +1261,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_aborts_the_turn_promptly() {
-        // Cancellation is non-negotiable. Tripping the token must abort
-        // the in-flight stream without waiting for the server.
-
         // Arrange
         let server = MockServer::start().await;
         let request = Mock::given(method("POST"))

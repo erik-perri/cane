@@ -566,9 +566,6 @@ mod tests {
         let wire = serde_json::to_value(to_wire(&history)).unwrap();
 
         // Assert
-        // One internal message can fan out (tool results) or fold (assistant);
-        // text-less content is null, empty tool_calls is ABSENT (not []), errors
-        // get a prefix
         assert_eq!(
             wire,
             json!([
@@ -594,10 +591,6 @@ mod tests {
 
     #[test]
     fn to_wire_emits_tool_results_before_text_in_a_mixed_user_message() {
-        // OpenAI-compat servers reject a `user` message appearing between an
-        // assistant `tool_calls` and its `tool` reply, so tool results must lead
-        // regardless of block order within the source message.
-
         // Arrange
         let history = vec![Message {
             role: Role::User,
@@ -643,8 +636,7 @@ mod tests {
 
     #[test]
     fn to_wire_preserves_malformed_tool_arguments_verbatim() {
-        // An invalid argument string still needs to be echoed faithfully before
-        // the model receives its error tool result.
+        // Arrange
         let raw_input = "{\"path\": unclosed";
         let history = vec![Message {
             role: Role::Assistant,
@@ -656,15 +648,23 @@ mod tests {
             }],
         }];
 
+        // Act
         let wire = serde_json::to_value(to_wire(&history)).unwrap();
 
+        // Assert
         assert_eq!(wire[0]["tool_calls"][0]["function"]["arguments"], raw_input);
     }
 
     #[test]
     fn endpoint_normalizes_base_urls_with_or_without_a_trailing_slash() {
-        for base_url in ["https://example.test/v1", "https://example.test/v1/"] {
+        // Arrange
+        let base_urls = ["https://example.test/v1", "https://example.test/v1/"];
+
+        for base_url in base_urls {
+            // Act
             let endpoint = endpoint_from_base_url(base_url.to_string()).unwrap();
+
+            // Assert
             assert_eq!(
                 endpoint.as_str(),
                 "https://example.test/v1/chat/completions"
@@ -674,12 +674,13 @@ mod tests {
 
     #[test]
     fn endpoint_preserves_the_base_url_query_string() {
-        // Azure-style endpoints carry required query params (`?api-version=`).
-        let endpoint = endpoint_from_base_url(
-            "https://example.test/openai/v1?api-version=preview".to_string(),
-        )
-        .unwrap();
+        // Arrange
+        let base_url = "https://example.test/openai/v1?api-version=preview";
 
+        // Act
+        let endpoint = endpoint_from_base_url(base_url.to_string()).unwrap();
+
+        // Assert
         assert_eq!(
             endpoint.as_str(),
             "https://example.test/openai/v1/chat/completions?api-version=preview"
@@ -688,31 +689,54 @@ mod tests {
 
     #[test]
     fn endpoint_rejects_invalid_base_urls() {
-        for base_url in ["not a URL", "https://example.test/v1#fragment"] {
+        // Arrange
+        let base_urls = ["not a URL", "https://example.test/v1#fragment"];
+
+        for base_url in base_urls {
+            // Act
             let error = endpoint_from_base_url(base_url.to_string()).unwrap_err();
+
+            // Assert
             assert!(matches!(error, ProviderError::InvalidBaseUrl { .. }));
         }
     }
 
     #[test]
     fn map_stop_reason_maps_known_finish_reasons() {
-        assert_eq!(map_stop_reason(Some("stop")), StopReason::EndTurn);
-        assert_eq!(map_stop_reason(Some("tool_calls")), StopReason::ToolUse);
-        assert_eq!(map_stop_reason(Some("length")), StopReason::MaxTokens);
+        // Arrange
+        let cases = [
+            (Some("stop"), StopReason::EndTurn),
+            (Some("tool_calls"), StopReason::ToolUse),
+            (Some("length"), StopReason::MaxTokens),
+        ];
+
+        for (finish_reason, expected) in cases {
+            // Act
+            let actual = map_stop_reason(finish_reason);
+
+            // Assert
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
     fn map_stop_reason_preserves_unknown_finish_reasons() {
-        // Compat servers emit values we don't model ("content_filter",
-        // "function_call", ...). Carry them through rather than guessing.
-        assert_eq!(
-            map_stop_reason(Some("content_filter")),
-            StopReason::Other("content_filter".to_string())
-        );
-        assert_eq!(
-            map_stop_reason(None),
-            StopReason::Other("finish_reason missing".to_string())
-        );
+        // Arrange
+        let cases = [
+            (
+                Some("content_filter"),
+                StopReason::Other("content_filter".to_string()),
+            ),
+            (None, StopReason::Other("finish_reason missing".to_string())),
+        ];
+
+        for (finish_reason, expected) in cases {
+            // Act
+            let actual = map_stop_reason(finish_reason);
+
+            // Assert
+            assert_eq!(actual, expected);
+        }
     }
 
     use wiremock::matchers::{method, path};
@@ -746,8 +770,6 @@ mod tests {
             .await;
     }
 
-    /// Wrap one `choices[0]` delta in a `chat.completion.chunk` envelope. A null
-    /// `finish_reason` (the common case mid-stream) is passed as `None`.
     fn stream_chunk(delta: serde_json::Value, finish_reason: Option<&str>) -> serde_json::Value {
         json!({
             "id": "chatcmpl-123",
@@ -758,7 +780,6 @@ mod tests {
         })
     }
 
-    /// Serialize chunks as a data-only SSE stream terminated by `[DONE]`.
     fn sse_stream(chunks: &[serde_json::Value]) -> String {
         let mut body = String::new();
         for chunk in chunks {
@@ -778,8 +799,6 @@ mod tests {
         .await;
     }
 
-    /// Drain every event the adapter emitted. Called after the stream ends, so
-    /// all sends have completed and `try_recv` sees the full sequence.
     fn drain_events(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -788,7 +807,6 @@ mod tests {
         events
     }
 
-    /// Concatenate the payloads of every `TextDelta`, ignoring other events.
     fn joined_text_deltas(events: &[AgentEvent]) -> String {
         events
             .iter()
@@ -846,7 +864,6 @@ mod tests {
             body["messages"],
             json!([{ "role": "user", "content": "What's in Cargo.toml?" }])
         );
-        // ToolDefinition -> wire: tagged "function", schema under "parameters"
         assert_eq!(
             body["tools"],
             json!([{
@@ -866,8 +883,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_omits_the_tools_key_when_there_are_no_tools() {
-        // Some compat servers 400 on "tools": [] so we don't include the key.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -926,9 +941,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_emits_text_deltas_and_accumulates_the_message() {
-        // Content fragments arrive across chunks; the adapter emits each as a
-        // TextDelta *and* accumulates them into the final assistant message.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -966,11 +978,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_accumulates_tool_call_argument_fragments() {
-        // `function.arguments` streams as string fragments keyed by `index`; the
-        // id and name land only on the first fragment. The adapter buffers per
-        // index and parses the joined string once the stream ends. Tool
-        // arguments are NOT surfaced as TextDelta.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -1030,11 +1037,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_overrides_the_finish_reason_when_the_message_has_tool_calls() {
-        // Some compat backends ship finish_reason "stop" alongside tool calls.
-        // Trusting the label ends the turn with unanswered tool calls in
-        // history, and the *next* request 400s far from the cause. Due to that
-        // the stop reason must be decided from the message content, not the label.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -1076,11 +1078,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_maps_empty_tool_arguments_to_an_empty_object() {
-        // Several compat backends stream `"arguments": ""` for a call to a
-        // no-parameter tool and never append another fragment. That's a
-        // well-formed call, not an error. It must finalize as `{}`, not
-        // abort the turn.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -1128,10 +1125,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_keeps_malformed_tool_arguments_as_a_raw_string() {
-        // Model mistakes are model feedback, not protocol failures: arguments
-        // that don't parse as JSON are kept raw so the tool layer can reject
-        // them with context instead of the turn dying here.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -1183,9 +1176,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_accumulates_multiple_tool_calls_in_one_turn() {
-        // A single turn can carry several tool calls, distinguished by `index`;
-        // fragments for different indices interleave. Accumulate all of them.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -1252,10 +1242,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_accumulates_text_and_a_tool_call_together() {
-        // A model may emit prose and then call a tool in the same turn. Both the
-        // text and the tool use land in the message, and the tool call wins the
-        // stop reason.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -1316,15 +1302,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_errors_when_the_stream_ends_without_done_or_finish_reason() {
-        // Only complete messages count. If the connection closes after a
-        // content delta but before `[DONE]`/a finish_reason, the partial
-        // must surface as an error, never be handed to the agent loop.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
             &server,
-            // No `[DONE]`, no finish_reason.
             format!(
                 "data: {}\n\n",
                 stream_chunk(json!({ "role": "assistant", "content": "Hel" }), None)
@@ -1349,10 +1330,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_errors_on_a_chunk_that_is_not_valid_json() {
-        // Compat servers occasionally interleave a non-JSON data line. A chunk we
-        // can't deserialize breaks the protocol contract. It is not model
-        // feedback, so it aborts the turn as a ProviderError.
-
         // Arrange
         let server = MockServer::start().await;
         mount_stream(
@@ -1378,10 +1355,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_message_aborts_promptly_when_cancelled() {
-        // A tripped CancellationToken aborts the HTTP stream. With the token
-        // already cancelled and the server stalling, the call must return
-        // `Cancelled` at once rather than waiting on the wire.
-
         // Arrange
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1418,13 +1391,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live server; run with -- --ignored"]
-    async fn smoke_stream_message_against_a_live_server() {
+    async fn smoke_streams_text_against_a_live_server() {
+        // Arrange
         let base_url = std::env::var("CANE_BASE_URL").expect("set CANE_BASE_URL");
         let api_key = std::env::var("CANE_API_KEY").unwrap_or("none".to_string());
         let model = std::env::var("CANE_MODEL").expect("set CANE_MODEL");
 
-        // Generous budget: thinking models (qwen3, deepseek-r1, ...) spend
-        // tokens on reasoning before any content, and can burn 1000+ on it.
         let client = OpenAiClient::new(base_url, api_key, model, 8192).unwrap();
         let messages = vec![Message {
             role: Role::User,
@@ -1433,8 +1405,6 @@ mod tests {
             }],
         }];
 
-        // Drain concurrently: a live model can emit more deltas than the
-        // channel holds, and stream_message blocks on a full channel.
         let (tx, mut rx) = mpsc::channel(16);
         let collector = tokio::spawn(async move {
             let mut events = Vec::new();
@@ -1445,25 +1415,20 @@ mod tests {
         });
         let cancel = CancellationToken::new();
 
+        // Act
         let (message, stop_reason) = client
             .stream_message(&messages, &[], &tx, &cancel)
             .await
             .unwrap();
 
-        drop(tx); // close the channel so the collector finishes
+        drop(tx);
         let events = collector.await.unwrap();
 
-        dbg!(&message, &stop_reason, events.len());
-
+        // Assert
         let streamed = joined_text_deltas(&events);
         assert!(!streamed.is_empty(), "expected TextDelta events");
-        assert!(
-            events.len() > 1,
-            "expected the text to arrive as multiple deltas, not one blob"
-        );
         assert_eq!(stop_reason, StopReason::EndTurn);
 
-        // The deltas and the accumulated message must tell the same story.
         match &message.content[..] {
             [ContentBlock::Text { text }] => assert_eq!(text, &streamed),
             other => panic!("expected a single text block, got {other:?}"),

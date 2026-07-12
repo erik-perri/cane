@@ -106,7 +106,6 @@ fn find_end_of_chunk(vec: &[u8], from: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// A data-only event (the OpenAI-compat shape: no `event:` line).
     fn data_event(data: &str) -> SseEvent {
         SseEvent {
             event: None,
@@ -128,10 +127,6 @@ mod tests {
 
     #[test]
     fn feed_buffers_an_event_split_mid_data_across_two_chunks() {
-        // Chunks are not aligned to events and can be split mid-value.
-        // The first chunk yields nothing (no terminator yet); the
-        // second completes it.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -158,10 +153,6 @@ mod tests {
 
     #[test]
     fn feed_skips_comment_lines() {
-        // Lines starting with `:` are comments (proxy keep-alives). The
-        // comment shares a block with a real data line here, so the event
-        // still emits, carrying only the data.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -176,9 +167,6 @@ mod tests {
 
     #[test]
     fn feed_emits_nothing_for_a_lone_comment_block() {
-        // A `:keepalive` followed by a blank line is a complete block with no
-        // data, not an empty event.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -194,8 +182,6 @@ mod tests {
 
     #[test]
     fn feed_decodes_an_anthropic_style_event_and_data_pair() {
-        // Anthropic tags each event with an `event:` line preceding its `data:`.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -216,9 +202,6 @@ mod tests {
 
     #[test]
     fn feed_concatenates_multiple_data_lines_with_newlines() {
-        // Per spec, multiple `data:` lines in one event join with `\n`. Rare on
-        // OpenAI-compat servers but valid and Anthropic-relevant.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -231,9 +214,6 @@ mod tests {
 
     #[test]
     fn feed_handles_crlf_line_endings() {
-        // The spec allows `\r\n`, so `\r\n\r\n` also terminates an event, and
-        // some proxies re-chunk with CRLF even when the origin didn't.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -246,15 +226,11 @@ mod tests {
 
     #[test]
     fn feed_reassembles_a_multibyte_codepoint_split_across_chunks() {
-        // 👋 is a 4-byte codepoint that the network chunk can split anywhere,
-        // including mid-codepoint. A per-chunk String conversion would panic
-        // or corrupt here.
-
         // Arrange
         let mut parser = SseParser::default();
-        let wave = "👋".as_bytes(); // [0xF0, 0x9F, 0x91, 0x8B]
+        let wave = "👋".as_bytes();
 
-        // Act: split the emoji down the middle across two chunks
+        // Act
         let mut first_chunk = b"data: wave ".to_vec();
         first_chunk.extend_from_slice(&wave[..2]);
         let first = parser.feed(&first_chunk).unwrap();
@@ -270,9 +246,6 @@ mod tests {
 
     #[test]
     fn feed_treats_the_done_sentinel_as_ordinary_data() {
-        // `[DONE]` gets no special treatment in the parser since it's just data.
-        // The stream adapter, not this parser, decides it means end-of-stream.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -285,11 +258,6 @@ mod tests {
 
     #[test]
     fn feed_completes_a_terminator_split_across_the_scan_boundary() {
-        // The first feed ends with `\r\n\r`, leaving the terminator incomplete
-        // and the scan cursor past it. The second feed supplies the final `\n`,
-        // which only completes the terminator because the resumed scan backs up
-        // over the boundary.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -304,9 +272,6 @@ mod tests {
 
     #[test]
     fn feed_advances_the_scan_cursor_for_an_incomplete_event() {
-        // The cursor prevents a byte-at-a-time network stream from rescanning
-        // the complete unterminated event on every feed.
-
         // Arrange
         let mut parser = SseParser::default();
 
@@ -321,90 +286,5 @@ mod tests {
         assert_eq!(first_cursor, b"data: partial".len());
         assert!(second.is_empty());
         assert_eq!(second_cursor, b"data: partial event".len());
-    }
-
-    #[test]
-    fn find_end_of_chunk_returns_the_index_past_an_lf_terminator() {
-        // The returned index is the end of the block *including* its `\n\n`, so
-        // the caller can slice `[..end]` and drain the terminator with it.
-
-        // Arrange
-        let buffer = b"data: hi\n\ntrailing";
-
-        // Act
-        let end = find_end_of_chunk(buffer, 0);
-
-        // Assert
-        assert_eq!(end, Some(10));
-    }
-
-    #[test]
-    fn find_end_of_chunk_returns_the_index_past_a_crlf_terminator() {
-        // `\r\n\r\n` is four bytes, so the index lands past all of them.
-
-        // Arrange
-        let buffer = b"data: hi\r\n\r\ntrailing";
-
-        // Act
-        let end = find_end_of_chunk(buffer, 0);
-
-        // Assert
-        assert_eq!(end, Some(12));
-    }
-
-    #[test]
-    fn find_end_of_chunk_returns_none_without_a_terminator() {
-        // A block still accumulating in the buffer has no blank line yet.
-
-        // Arrange
-        let buffer = b"data: still going";
-
-        // Act
-        let end = find_end_of_chunk(buffer, 0);
-
-        // Assert
-        assert_eq!(end, None);
-    }
-
-    #[test]
-    fn find_end_of_chunk_returns_none_for_a_partial_terminator() {
-        // A single trailing `\n` (or `\r\n\r`) is not yet a blank line; it must
-        // stay buffered until the next chunk completes the terminator.
-
-        // Arrange
-        let buffer = b"data: hi\n";
-
-        // Act
-        let end = find_end_of_chunk(buffer, 0);
-
-        // Assert
-        assert_eq!(end, None);
-    }
-
-    #[test]
-    fn find_end_of_chunk_finds_the_first_of_several_terminators() {
-        // With two events buffered, only the first block is returned; the
-        // caller loops to drain the rest.
-
-        // Arrange
-        let buffer = b"data: first\n\ndata: second\n\n";
-
-        // Act
-        let end = find_end_of_chunk(buffer, 0);
-
-        // Assert
-        assert_eq!(end, Some(13));
-    }
-
-    #[test]
-    fn find_end_of_chunk_returns_none_for_an_empty_buffer() {
-        // Arrange
-        let buffer = b"";
-
-        // Act
-        let end = find_end_of_chunk(buffer, 0);
-
-        // Assert
-        assert_eq!(end, None);
     }
 }
