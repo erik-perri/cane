@@ -1260,6 +1260,327 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_allowed_mutating_tool_executes_and_round_trips_its_result() {
+        // Arrange
+        let file = temp_file_with(b"original");
+        let file_path = file.path().to_str().unwrap();
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "write-1",
+                    "write_file",
+                    json!({ "path": file_path, "content": "changed" }),
+                )]),
+                text_turn("I changed it."),
+            ],
+        )
+        .await;
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Change the file.".to_string()))
+            .await
+            .unwrap();
+
+        // Act
+        let respond_to = loop {
+            let event = handle.events.recv().await.unwrap();
+            match event {
+                AgentEvent::ApprovalRequest { respond_to, .. } => break respond_to,
+                AgentEvent::ToolStarted { .. } => {
+                    panic!("tool was reported as started before approval")
+                }
+                _ => {}
+            }
+        };
+        respond_to.send(ApprovalDecision::Allow).unwrap();
+
+        let events = collect_turn(&mut handle.events).await;
+
+        // Assert
+        assert_eq!(4, events.len());
+
+        let Some(AgentEvent::ToolStarted { name, input }) = events.first() else {
+            panic!("Expected first event to be a ToolStarted event");
+        };
+        assert_eq!("write_file", name);
+        assert_eq!(json!({ "content": "changed", "path": file_path }), *input);
+
+        let Some(AgentEvent::ToolFinished {
+            name,
+            output,
+            is_error,
+        }) = events.get(1)
+        else {
+            panic!("Expected second event to be a ToolFinished event");
+        };
+        assert_eq!("write_file", name);
+        assert!(!is_error);
+        assert_eq!(format!("updated `{file_path}`; 7 bytes written"), *output);
+
+        let Some(AgentEvent::TextDelta(text)) = events.get(2) else {
+            panic!("Expected third event to be a TextDelta event");
+        };
+        assert_eq!("I changed it.", text);
+
+        let Some(AgentEvent::TurnComplete { outcome }) = events.get(3) else {
+            panic!("Expected fourth event to be a TurnComplete event");
+        };
+        assert_eq!(
+            outcome,
+            &TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            }
+        );
+
+        let messages = nth_request_messages(&server, 1).await;
+        assert_eq!(
+            messages[1],
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "write-1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json!({ "content": "changed", "path": file_path }).to_string()
+                    }
+                }]
+            }),
+            "assistant echo must keep its tool_calls intact"
+        );
+        assert_eq!(
+            messages[2],
+            json!({
+                "role": "tool",
+                "tool_call_id": "write-1",
+                "content": format!("updated `{file_path}`; 7 bytes written")
+            })
+        );
+
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "changed");
+    }
+
+    #[tokio::test]
+    async fn a_denied_tool_round_trips_the_reason_as_a_non_error_result() {
+        // Arrange
+        let file = temp_file_with(b"initial");
+        let file_path = file.path().to_str().unwrap();
+        let server = MockServer::start().await;
+
+        let deny_reason = "I changed my mind".to_string();
+
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "write-1",
+                    "write_file",
+                    json!({ "path": file_path, "content": "updated" }),
+                )]),
+                text_turn(&deny_reason),
+            ],
+        )
+        .await;
+
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Change the file.".to_string()))
+            .await
+            .unwrap();
+
+        // Act
+        let respond_to = loop {
+            let event = handle.events.recv().await.unwrap();
+            match event {
+                AgentEvent::ApprovalRequest { respond_to, .. } => break respond_to,
+                AgentEvent::ToolStarted { .. } => {
+                    panic!("tool was reported as started before approval")
+                }
+                _ => {}
+            }
+        };
+        respond_to
+            .send(ApprovalDecision::Deny {
+                reason: deny_reason.clone(),
+            })
+            .unwrap();
+
+        let _ = collect_turn(&mut handle.events).await;
+        let provider_request = nth_request_messages(&server, 1).await;
+
+        // Assert
+        assert_eq!(
+            provider_request[2],
+            json!({
+                "content": format!("The user declined this tool call and said: \"{deny_reason}\". Do not assume the tool ran. Address their feedback, then retry if appropriate."),
+                "role": "tool",
+                "tool_call_id": "write-1",
+            })
+        );
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "initial");
+    }
+
+    #[tokio::test]
+    async fn denied_and_allowed_sibling_tool_calls_both_produce_results() {
+        // Arrange
+        let file_one = temp_file_with(b"one");
+        let file_two = temp_file_with(b"two");
+
+        let file_one_path = file_one.path().to_str().unwrap();
+        let file_two_path = file_two.path().to_str().unwrap();
+
+        let server = MockServer::start().await;
+
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[
+                    (
+                        "write-1",
+                        "write_file",
+                        json!({ "path": file_one_path, "content": "eno" }),
+                    ),
+                    (
+                        "write-2",
+                        "write_file",
+                        json!({ "path": file_two_path, "content": "owt" }),
+                    ),
+                ]),
+                text_turn("Finished"),
+            ],
+        )
+        .await;
+
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Make the change".to_string()))
+            .await
+            .unwrap();
+
+        // Act & Assert
+        let write_one_event = handle.events.recv().await.unwrap();
+        let AgentEvent::ApprovalRequest {
+            id: write_one_id,
+            respond_to,
+            ..
+        } = write_one_event
+        else {
+            panic!("expected first approval request");
+        };
+        assert_eq!("write-1", write_one_id);
+
+        respond_to
+            .send(ApprovalDecision::Deny {
+                reason: "Changed my mind".to_string(),
+            })
+            .unwrap();
+        let write_one_response = handle.events.recv().await.unwrap();
+
+        let write_two_event = handle.events.recv().await.unwrap();
+        let AgentEvent::ApprovalRequest {
+            id: write_two_id,
+            respond_to,
+            ..
+        } = write_two_event
+        else {
+            panic!("expected second approval request");
+        };
+        assert_eq!("write-2", write_two_id);
+
+        respond_to.send(ApprovalDecision::Allow).unwrap();
+
+        let events = collect_turn(&mut handle.events).await;
+
+        assert_eq!(4, events.len());
+
+        let AgentEvent::ToolDenied { reason, .. } = write_one_response else {
+            panic!("expected write_one_response to contain ToolDenied");
+        };
+        assert_eq!("Changed my mind", reason);
+
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    AgentEvent::ToolStarted{ name: start_name, .. },
+                    AgentEvent::ToolFinished{ name: finished_name, .. },
+                    AgentEvent::TextDelta(text),
+                    AgentEvent::TurnComplete {
+                        outcome: TurnOutcome::Completed { stop_reason },
+                    }
+                ] if start_name == "write_file"
+                  && finished_name == "write_file"
+                  && text == "Finished"
+                  && *stop_reason == StopReason::EndTurn
+            ),
+            "expected a ToolStarted->ToolFinished->TextDelta->TurnComplete, got {events:?}"
+        );
+
+        assert_eq!(std::fs::read_to_string(file_one_path).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(file_two_path).unwrap(), "owt");
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_approval_completes_the_turn_as_cancelled_without_executing() {
+        // Arrange
+        let file = temp_file_with(b"contents");
+        let file_path = file.path().to_str().unwrap();
+        let server = MockServer::start().await;
+
+        mount_turns(
+            &server,
+            vec![tool_call_turn(&[(
+                "write-1",
+                "write_file",
+                json!({ "path": file_path, "content": "changed" }),
+            )])],
+        )
+        .await;
+
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Make the change".to_string()))
+            .await
+            .unwrap();
+
+        // Act
+        let event = handle.events.recv().await.unwrap();
+        let _respond_to = match event {
+            AgentEvent::ApprovalRequest { respond_to, .. } => respond_to,
+            _ => {
+                panic!("unexpected event")
+            }
+        };
+
+        handle.cancel.cancel();
+
+        let events = collect_until_events_close(&mut handle.events).await;
+
+        // Assert
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Cancelled
+                }]
+            ),
+            "expected TurnComplete, got {events:?}"
+        );
+
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "contents");
+    }
+
+    #[tokio::test]
     async fn cancelling_aborts_the_turn_promptly() {
         // Arrange
         let server = MockServer::start().await;
