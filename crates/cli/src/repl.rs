@@ -73,7 +73,7 @@ pub(crate) async fn run(
                     break;
                 }
 
-                AgentEvent::Error(e) => eprintln!("\nerror: {e}"),
+                AgentEvent::Error(e) => writeln!(output, "\nerror: {e}")?,
 
                 AgentEvent::ApprovalRequest {
                     input: command_input,
