@@ -577,6 +577,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_reports_a_mismatch_for_an_explicit_count_of_one() {
+        // Arrange
+        let (root, tool) = edit_file_tool();
+        let target = root.path().join("target.txt");
+        fs::write(&target, "old and old").unwrap();
+
+        // Act
+        let error = tool
+            .execute(json!({
+                "path": "target.txt",
+                "old_str": "old",
+                "new_str": "new",
+                "expected_occurrences": 1
+            }))
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(error, "old_str matches 2 times in `target.txt`; expected 1");
+        assert_eq!(fs::read_to_string(target).unwrap(), "old and old");
+    }
+
+    #[tokio::test]
     async fn execute_rejects_zero_expected_occurrences_without_writing() {
         // Arrange
         let (root, tool) = edit_file_tool();
@@ -958,10 +981,7 @@ mod tests {
             .unwrap_err();
 
         // Assert
-        assert!(
-            error.starts_with("failed to read `directory`: "),
-            "unexpected error: {error}"
-        );
+        assert_eq!("failed to read `directory`: path is not a file", error,);
         assert!(target.is_dir());
     }
 

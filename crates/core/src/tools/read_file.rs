@@ -162,6 +162,7 @@ mod tests {
     use super::*;
     use crate::tools::Tool;
     use serde_json::json;
+    use std::fs;
     use std::io::Write;
     use tempfile::{NamedTempFile, tempdir};
 
@@ -399,6 +400,83 @@ mod tests {
             // Assert
             assert_eq!(error, expected);
         }
+    }
+
+    #[test]
+    fn definition_describes_strict_read_file_input() {
+        // Arrange
+        let tool = read_file_tool();
+
+        // Act
+        let definition = tool.definition();
+
+        // Assert
+        assert_eq!(definition.name, "read_file");
+        assert_eq!(definition.input_schema["type"], "object");
+        assert_eq!(definition.input_schema["required"], json!(["path"]));
+        assert_eq!(definition.input_schema["additionalProperties"], false);
+        assert_eq!(
+            definition.input_schema["properties"]["path"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["offset"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["offset"]["minimum"],
+            1
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert_eq!(definition.input_schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(
+            definition.input_schema["properties"]["limit"]["maximum"],
+            MAX_READ_FILE_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_reads_a_file_exactly_at_the_size_cap() {
+        // Arrange
+        let tool = read_file_tool();
+        let target = temp_file_with(b"");
+        let file = fs::File::create(&target).unwrap();
+        file.set_len(MAX_FILE_SIZE_BYTES).unwrap();
+        drop(file);
+
+        // Act
+        let result = tool
+            .execute(json!({ "path": target.path() }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(MAX_FILE_SIZE_BYTES as usize, result.len());
+    }
+
+    #[tokio::test]
+    async fn execute_errors_when_the_target_is_a_directory() {
+        // Arrange
+        let tool = read_file_tool();
+        let dir = tempdir().unwrap();
+
+        // Act
+        let error = tool
+            .execute(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(
+            format!(
+                "failed to read `{}`: path is not a file",
+                dir.path().display().to_string(),
+            ),
+            error,
+        );
     }
 
     #[tokio::test]
