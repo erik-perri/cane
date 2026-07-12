@@ -91,72 +91,37 @@ fn background_task_failed(operation: &str, path: &str, error: impl std::fmt::Dis
     )
 }
 
-/// Look up a tool by name and run it. An unknown name is an error tool
-/// result, not a panic.
-pub async fn dispatch(tools: &[Box<dyn Tool>], name: &str, input: Value) -> Result<String, String> {
-    match tools.iter().find(|t| t.definition().name == name) {
-        Some(tool) => tool.prepare(input).await?.execute().await,
-        None => Err(format!("unknown tool: `{name}`")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use tempfile::tempdir;
 
-    struct StubTool;
-
-    #[async_trait::async_trait]
-    impl Tool for StubTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: "stub".to_string(),
-                description: "A stub tool for dispatch tests.".to_string(),
-                input_schema: json!({ "type": "object" }),
-            }
-        }
-
-        async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
-            Ok(Box::new(StubInvocation(input)))
-        }
-    }
-
-    struct StubInvocation(Value);
-
-    #[async_trait::async_trait]
-    impl PreparedInvocation for StubInvocation {
-        fn approval_requirement(&self) -> ApprovalRequirement {
-            ApprovalRequirement::None
-        }
-
-        async fn execute(self: Box<Self>) -> Result<String, String> {
-            Ok(format!("stub ran with {}", self.0))
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_runs_the_tool_matching_the_name() {
+    #[test]
+    fn locate_finds_a_registered_tool_by_name() {
         // Arrange
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(StubTool)];
+        let dir = tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().into()).unwrap();
+        let tool_set = ToolSet::new(Arc::new(workspace));
 
         // Act
-        let result = dispatch(&tools, "stub", json!({ "key": "value" })).await;
+        let tool = tool_set.locate("read_file").unwrap();
 
         // Assert
-        assert_eq!(result, Ok(r#"stub ran with {"key":"value"}"#.to_string()));
+        assert_eq!(tool.definition().name, "read_file");
     }
 
-    #[tokio::test]
-    async fn dispatch_returns_an_error_for_an_unknown_tool_name() {
+    #[test]
+    fn locate_returns_an_error_for_an_unknown_name() {
         // Arrange
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(StubTool)];
+        let dir = tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().into()).unwrap();
+        let tool_set = ToolSet::new(Arc::new(workspace));
 
         // Act
-        let result = dispatch(&tools, "write_file", json!({})).await;
+        let tool = tool_set.locate("what_tool").err().unwrap();
 
         // Assert
-        assert_eq!(result, Err("unknown tool: `write_file`".to_string()));
+        assert_eq!("unknown tool: `what_tool`", tool);
     }
 
     #[test]
