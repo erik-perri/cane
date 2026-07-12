@@ -48,6 +48,34 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-07
+        with:
+          toolchain: stable
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@13608cbb45b01feb47ef444ab1a42dc41ad56f1a # v2.79.11
+        with:
+          tool: cargo-llvm-cov
+          fallback: none
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --all-features --no-report
+          cargo llvm-cov report --color never > coverage.txt
+      - name: Add coverage to job summary
+        run: |
+          {
+            echo "## Workspace coverage"
+            echo
+            echo '```text'
+            awk 'NR <= 2 || /^TOTAL/' coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   test:
     name: test (${{ matrix.os }})
     strategy:
