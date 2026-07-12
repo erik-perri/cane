@@ -271,6 +271,44 @@ mod tests {
     }
 
     #[test]
+    fn feed_fails_on_invalid_utf8_and_repeats_the_error_on_the_next_feed() {
+        // Arrange
+        let mut parser = SseParser::default();
+
+        // Act
+        let first_error = parser
+            .feed(b"data: {\"content\":\"Hello\xff\"}\n\n")
+            .unwrap_err();
+
+        // Assert
+        let ProviderError::Parsing(first_utf8_error) = first_error else {
+            panic!("expected parsing error, got {first_error:?}")
+        };
+        matches!(first_utf8_error, std::str::Utf8Error { .. });
+
+        let events = parser.feed(&[]).unwrap_err();
+        let ProviderError::Parsing(second_utf8_error) = events else {
+            panic!("expected parsing error, got {events:?}")
+        };
+        assert_eq!(first_utf8_error, second_utf8_error);
+    }
+
+    #[test]
+    fn feed_emits_nothing_for_an_event_field_without_data() {
+        // Arrange
+        let mut parser = SseParser::default();
+
+        // Act
+        let events = parser.feed(b"event: ping\n\n").unwrap();
+
+        // Assert
+        assert!(
+            events.is_empty(),
+            "block with no data should emit no event: {events:?}"
+        );
+    }
+
+    #[test]
     fn feed_advances_the_scan_cursor_for_an_incomplete_event() {
         // Arrange
         let mut parser = SseParser::default();
