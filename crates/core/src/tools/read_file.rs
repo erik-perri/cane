@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(
             format!(
                 "failed to read `{}`: path is not a file",
-                dir.path().display().to_string(),
+                dir.path().display(),
             ),
             error,
         );

@@ -612,7 +612,7 @@ mod tests {
         // Assert
         assert_eq!(2, first_turn.len());
 
-        let Some(AgentEvent::TextDelta(text)) = first_turn.get(0) else {
+        let Some(AgentEvent::TextDelta(text)) = first_turn.first() else {
             panic!("Expected first turn to contain a TextDelta event");
         };
         assert_eq!("Hello!", text);
@@ -629,7 +629,7 @@ mod tests {
 
         assert_eq!(2, second_turn.len());
 
-        let Some(AgentEvent::TextDelta(text)) = second_turn.get(0) else {
+        let Some(AgentEvent::TextDelta(text)) = second_turn.first() else {
             panic!("Expected second turn to contain a TextDelta event");
         };
         assert_eq!("Yes, I remember.", text);
@@ -938,7 +938,7 @@ mod tests {
         // Assert
         assert_eq!(4, events.len());
 
-        let Some(AgentEvent::ToolStarted { name, input }) = events.get(0) else {
+        let Some(AgentEvent::ToolStarted { name, input }) = events.first() else {
             panic!("Expected first event to be a ToolStarted event");
         };
         assert_eq!("read_file", name);
