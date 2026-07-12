@@ -55,6 +55,16 @@ pub(crate) async fn run(
 
                 AgentEvent::ToolFinished { .. } => {}
 
+                AgentEvent::ToolDenied { reason, .. } => {
+                    writeln!(output, "[tool denied: {reason}]")?;
+                    output.flush()?;
+                }
+
+                AgentEvent::ToolRejected { error, .. } => {
+                    writeln!(output, "[tool error: {error}]")?;
+                    output.flush()?;
+                }
+
                 AgentEvent::TurnComplete { outcome } => {
                     writeln!(output)?;
                     if matches!(outcome, TurnOutcome::Cancelled) {

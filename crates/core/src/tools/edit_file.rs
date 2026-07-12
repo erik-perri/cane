@@ -1,13 +1,14 @@
 use crate::Workspace;
+use crate::protocol::ApprovalRequirement;
 use crate::tools::{
-    MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, Tool, ToolDefinition, background_task_failed,
-    invalid_input, operation_failed,
+    MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition,
+    background_task_failed, invalid_input, operation_failed,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::Permissions;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -26,6 +27,11 @@ pub struct EditFileTool {
 impl EditFileTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
+    }
+
+    #[cfg(test)]
+    async fn execute(&self, input: Value) -> Result<String, String> {
+        self.prepare(input).await?.execute().await
     }
 }
 
@@ -64,7 +70,7 @@ impl Tool for EditFileTool {
         }
     }
 
-    async fn execute(&self, input: Value) -> Result<String, String> {
+    async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
         let input: EditFileInput =
             serde_json::from_value(input).map_err(|error| invalid_input("edit_file", error))?;
 
@@ -96,15 +102,47 @@ impl Tool for EditFileTool {
             ));
         }
 
-        let requested_path = input.path;
-        let expected_occurrences = input.expected_occurrences.unwrap_or(1);
-        let explicit_occurrence_count = input.expected_occurrences.is_some();
+        Ok(Box::new(PreparedEditFile {
+            requested_path: input.path,
+            resolved_path,
+            old_str: input.old_str,
+            new_str: input.new_str,
+            expected_occurrences: input.expected_occurrences.unwrap_or(1),
+            explicit_occurrence_count: input.expected_occurrences.is_some(),
+        }))
+    }
+}
+
+struct PreparedEditFile {
+    requested_path: String,
+    resolved_path: PathBuf,
+    old_str: String,
+    new_str: String,
+    expected_occurrences: usize,
+    explicit_occurrence_count: bool,
+}
+
+#[async_trait::async_trait]
+impl PreparedInvocation for PreparedEditFile {
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Required
+    }
+
+    async fn execute(self: Box<Self>) -> Result<String, String> {
+        let Self {
+            requested_path,
+            resolved_path,
+            old_str,
+            new_str,
+            expected_occurrences,
+            explicit_occurrence_count,
+        } = *self;
 
         let result = tokio::task::spawn_blocking(move || {
             replace_in_file(
                 &resolved_path,
-                &input.old_str,
-                &input.new_str,
+                &old_str,
+                &new_str,
                 expected_occurrences,
                 explicit_occurrence_count,
             )
@@ -237,6 +275,31 @@ mod tests {
         let workspace = Arc::new(Workspace::new(root.path().to_path_buf()).unwrap());
         let tool = EditFileTool::new(workspace);
         (root, tool)
+    }
+
+    #[tokio::test]
+    async fn prepared_edits_require_approval_and_do_not_edit() {
+        // Arrange
+        let (root, tool) = edit_file_tool();
+        let target = root.path().join("target.txt");
+        fs::write(&target, "old").unwrap();
+
+        // Act
+        let prepared = tool
+            .prepare(json!({
+                "path": "target.txt",
+                "old_str": "old",
+                "new_str": "new"
+            }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            prepared.approval_requirement(),
+            ApprovalRequirement::Required
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "old");
     }
 
     fn path_str(path: &Path) -> &str {
@@ -415,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_returns_the_required_no_match_error_and_leaves_the_file_untouched() {
+    async fn execute_returns_a_no_match_error_and_leaves_the_file_untouched() {
         // Arrange
         let (root, tool) = edit_file_tool();
         let target = root.path().join("target.txt");
@@ -437,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_returns_the_required_multi_match_error_and_leaves_the_file_untouched() {
+    async fn execute_returns_a_multi_match_error_and_leaves_the_file_untouched() {
         // Arrange
         let (root, tool) = edit_file_tool();
         let target = root.path().join("target.txt");
@@ -598,14 +661,18 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_the_workspace_root_as_an_edit_target() {
+        // Arrange
         let (root, tool) = edit_file_tool();
+        let paths = [".".to_string(), path_str(root.path()).to_string()];
 
-        for path in [".".to_string(), path_str(root.path()).to_string()] {
+        for path in paths {
+            // Act
             let error = tool
                 .execute(json!({ "path": path, "old_str": "old", "new_str": "new" }))
                 .await
                 .unwrap_err();
 
+            // Assert
             assert_eq!(
                 error,
                 "invalid edit_file input: path must name a file inside the workspace"
@@ -816,10 +883,12 @@ mod tests {
 
     #[tokio::test]
     async fn execute_adds_path_context_when_path_resolution_fails() {
+        // Arrange
         let (root, tool) = edit_file_tool();
         let parent_file = root.path().join("Cargo.toml");
         fs::write(&parent_file, "original").unwrap();
 
+        // Act
         let error = tool
             .execute(json!({
                 "path": "Cargo.toml/nested.txt",
@@ -829,6 +898,7 @@ mod tests {
             .await
             .unwrap_err();
 
+        // Assert
         assert!(
             error.starts_with("failed to resolve `Cargo.toml/nested.txt`: "),
             "unexpected error: {error}"
@@ -891,20 +961,25 @@ mod tests {
 
     #[test]
     fn format_edit_error_covers_read_and_write_failures() {
-        assert_eq!(
-            format_edit_error(
-                "notes.txt",
-                EditFileError::Read(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        // Arrange
+        let cases = [
+            (
+                EditFileError::Read(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+                "failed to read `notes.txt`: denied",
             ),
-            "failed to read `notes.txt`: denied"
-        );
-        assert_eq!(
-            format_edit_error(
-                "notes.txt",
-                EditFileError::Write(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            (
+                EditFileError::Write(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+                "failed to write `notes.txt`: denied",
             ),
-            "failed to write `notes.txt`: denied"
-        );
+        ];
+
+        for (error, expected) in cases {
+            // Act
+            let actual = format_edit_error("notes.txt", error);
+
+            // Assert
+            assert_eq!(actual, expected);
+        }
     }
 
     #[cfg(unix)]

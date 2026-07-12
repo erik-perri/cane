@@ -1,8 +1,12 @@
 use crate::Workspace;
-use crate::tools::{Tool, ToolDefinition, background_task_failed, invalid_input, operation_failed};
+use crate::protocol::ApprovalRequirement;
+use crate::tools::{
+    PreparedInvocation, Tool, ToolDefinition, background_task_failed, invalid_input,
+    operation_failed,
+};
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -19,6 +23,11 @@ pub struct WriteFileTool {
 impl WriteFileTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
+    }
+
+    #[cfg(test)]
+    async fn execute(&self, input: Value) -> Result<String, String> {
+        self.prepare(input).await?.execute().await
     }
 }
 
@@ -48,7 +57,7 @@ impl Tool for WriteFileTool {
         }
     }
 
-    async fn execute(&self, input: Value) -> Result<String, String> {
+    async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
         let input: WriteFileInput =
             serde_json::from_value(input).map_err(|error| invalid_input("write_file", error))?;
 
@@ -65,14 +74,40 @@ impl Tool for WriteFileTool {
             ));
         }
 
-        let existed = resolved_path.exists();
-        let requested_path = input.path;
+        Ok(Box::new(PreparedWriteFile {
+            existed: resolved_path.exists(),
+            requested_path: input.path,
+            resolved_path,
+            content: input.content,
+        }))
+    }
+}
 
-        let written =
-            tokio::task::spawn_blocking(move || write_to_file(&resolved_path, input.content))
-                .await
-                .map_err(|error| background_task_failed("write", &requested_path, error))?
-                .map_err(|error| operation_failed("write", &requested_path, error))?;
+struct PreparedWriteFile {
+    existed: bool,
+    requested_path: String,
+    resolved_path: PathBuf,
+    content: String,
+}
+
+#[async_trait::async_trait]
+impl PreparedInvocation for PreparedWriteFile {
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Required
+    }
+
+    async fn execute(self: Box<Self>) -> Result<String, String> {
+        let Self {
+            existed,
+            requested_path,
+            resolved_path,
+            content,
+        } = *self;
+
+        let written = tokio::task::spawn_blocking(move || write_to_file(&resolved_path, content))
+            .await
+            .map_err(|error| background_task_failed("write", &requested_path, error))?
+            .map_err(|error| operation_failed("write", &requested_path, error))?;
 
         let message = if existed {
             format!("updated `{requested_path}`; {written} bytes written")
@@ -111,6 +146,26 @@ mod tests {
 
     fn path_str(path: &Path) -> &str {
         path.to_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn prepared_writes_require_approval_and_do_not_write() {
+        // Arrange
+        let (root, tool) = write_file_tool();
+        let target = root.path().join("notes.txt");
+
+        // Act
+        let prepared = tool
+            .prepare(json!({ "path": "notes.txt", "content": "hello" }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            prepared.approval_requirement(),
+            ApprovalRequirement::Required
+        );
+        assert!(!target.exists());
     }
 
     #[test]

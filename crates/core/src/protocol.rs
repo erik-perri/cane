@@ -22,6 +22,14 @@ pub enum AgentEvent {
         name: String,
         output: String,
     },
+    ToolDenied {
+        name: String,
+        reason: String,
+    },
+    ToolRejected {
+        name: String,
+        error: String,
+    },
     TurnComplete {
         outcome: TurnOutcome,
     },
@@ -97,4 +105,10 @@ pub enum ApprovalDecision {
     Allow,
     AlwaysAllowSession,
     Deny { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalRequirement {
+    None,
+    Required,
 }

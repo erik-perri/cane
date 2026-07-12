@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ mod read_file;
 mod write_file;
 
 use crate::Workspace;
+use crate::protocol::ApprovalRequirement;
 pub use edit_file::EditFileTool;
 pub use read_file::ReadFileTool;
 pub use write_file::WriteFileTool;
@@ -59,11 +61,14 @@ pub struct ToolDefinition {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 
-    async fn execute(&self, input: Value) -> Result<String, String>;
+    async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String>;
+}
 
-    fn read_only(&self) -> bool {
-        false
-    }
+#[async_trait]
+pub trait PreparedInvocation: Send {
+    fn approval_requirement(&self) -> ApprovalRequirement;
+
+    async fn execute(self: Box<Self>) -> Result<String, String>;
 }
 
 /// Largest file the file tools will load into memory.
@@ -90,7 +95,7 @@ fn background_task_failed(operation: &str, path: &str, error: impl std::fmt::Dis
 /// result, not a panic.
 pub async fn dispatch(tools: &[Box<dyn Tool>], name: &str, input: Value) -> Result<String, String> {
     match tools.iter().find(|t| t.definition().name == name) {
-        Some(tool) => tool.execute(input).await,
+        Some(tool) => tool.prepare(input).await?.execute().await,
         None => Err(format!("unknown tool: `{name}`")),
     }
 }
@@ -112,8 +117,21 @@ mod tests {
             }
         }
 
-        async fn execute(&self, input: Value) -> Result<String, String> {
-            Ok(format!("stub ran with {input}"))
+        async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
+            Ok(Box::new(StubInvocation(input)))
+        }
+    }
+
+    struct StubInvocation(Value);
+
+    #[async_trait::async_trait]
+    impl PreparedInvocation for StubInvocation {
+        fn approval_requirement(&self) -> ApprovalRequirement {
+            ApprovalRequirement::None
+        }
+
+        async fn execute(self: Box<Self>) -> Result<String, String> {
+            Ok(format!("stub ran with {}", self.0))
         }
     }
 
@@ -143,17 +161,21 @@ mod tests {
 
     #[test]
     fn operation_errors_follow_the_shared_message_format() {
-        assert_eq!(
+        // Arrange
+        let expected = [
+            "invalid read_file input: path must not be empty",
+            "failed to read `notes.txt`: permission denied",
+            "failed to write `notes.txt`: background task failed: task cancelled",
+        ];
+
+        // Act
+        let actual = [
             invalid_input("read_file", "path must not be empty"),
-            "invalid read_file input: path must not be empty"
-        );
-        assert_eq!(
             operation_failed("read", "notes.txt", "permission denied"),
-            "failed to read `notes.txt`: permission denied"
-        );
-        assert_eq!(
             background_task_failed("write", "notes.txt", "task cancelled"),
-            "failed to write `notes.txt`: background task failed: task cancelled"
-        );
+        ];
+
+        // Assert
+        assert_eq!(actual, expected);
     }
 }

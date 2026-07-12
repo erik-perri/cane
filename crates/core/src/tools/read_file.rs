@@ -1,11 +1,12 @@
+use crate::protocol::ApprovalRequirement;
 use crate::tools::{
-    MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, Tool, ToolDefinition, background_task_failed,
-    invalid_input, operation_failed,
+    MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition,
+    background_task_failed, invalid_input, operation_failed,
 };
 use crate::workspace::Workspace;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_READ_FILE_LIMIT: u64 = 2_000;
@@ -36,6 +37,11 @@ pub struct ReadFileTool {
 impl ReadFileTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
+    }
+
+    #[cfg(test)]
+    async fn execute(&self, input: Value) -> Result<String, String> {
+        self.prepare(input).await?.execute().await
     }
 }
 
@@ -72,7 +78,7 @@ impl Tool for ReadFileTool {
         }
     }
 
-    async fn execute(&self, input: Value) -> Result<String, String> {
+    async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
         let input: ReadFileInput =
             serde_json::from_value(input).map_err(|error| invalid_input("read_file", error))?;
 
@@ -91,18 +97,40 @@ impl Tool for ReadFileTool {
 
         let resolved_path = self.workspace.resolve(&input.path)?;
 
-        let requested_path = input.path;
+        Ok(Box::new(PreparedReadFile {
+            requested_path: input.path,
+            resolved_path,
+            offset: input.offset,
+            limit: input.limit,
+        }))
+    }
+}
 
-        tokio::task::spawn_blocking(move || {
-            read_lines_from_file(&resolved_path, input.offset, input.limit)
-        })
-        .await
-        .map_err(|error| background_task_failed("read", &requested_path, error))?
-        .map_err(|error| operation_failed("read", &requested_path, error))
+struct PreparedReadFile {
+    requested_path: String,
+    resolved_path: PathBuf,
+    offset: u64,
+    limit: u64,
+}
+
+#[async_trait::async_trait]
+impl PreparedInvocation for PreparedReadFile {
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::None
     }
 
-    fn read_only(&self) -> bool {
-        true
+    async fn execute(self: Box<Self>) -> Result<String, String> {
+        let Self {
+            requested_path,
+            resolved_path,
+            offset,
+            limit,
+        } = *self;
+
+        tokio::task::spawn_blocking(move || read_lines_from_file(&resolved_path, offset, limit))
+            .await
+            .map_err(|error| background_task_failed("read", &requested_path, error))?
+            .map_err(|error| operation_failed("read", &requested_path, error))
     }
 }
 
@@ -147,7 +175,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_reads_up_to_the_default_line_limit() {
+    async fn prepared_reads_do_not_require_approval() {
+        // Arrange
+        let file = temp_file_with(b"content");
+
+        // Act
+        let prepared = read_file_tool()
+            .prepare(json!({ "path": path_of(&file) }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(prepared.approval_requirement(), ApprovalRequirement::None);
+    }
+
+    #[tokio::test]
+    async fn execute_reads_an_entire_file_shorter_than_the_default_limit() {
         // Arrange
         let file = temp_file_with(b"line one\nline two\nline three");
 
@@ -275,7 +318,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_missing_fields_wrong_types_unknown_fields_and_non_objects() {
-        for (input, expected) in [
+        // Arrange
+        let cases = [
             (
                 json!({ "offset": 1 }),
                 "invalid read_file input: missing field `path`",
@@ -304,15 +348,22 @@ mod tests {
                 json!(null),
                 "invalid read_file input: invalid type: null, expected struct ReadFileInput",
             ),
-        ] {
-            let error = read_file_tool().execute(input).await.unwrap_err();
+        ];
+        let tool = read_file_tool();
+
+        for (input, expected) in cases {
+            // Act
+            let error = tool.execute(input).await.unwrap_err();
+
+            // Assert
             assert_eq!(error, expected);
         }
     }
 
     #[tokio::test]
     async fn execute_rejects_empty_and_out_of_range_parameters() {
-        for (input, expected) in [
+        // Arrange
+        let cases = [
             (
                 json!({ "path": "" }),
                 "invalid read_file input: path must not be empty".to_string(),
@@ -333,14 +384,21 @@ mod tests {
                     "invalid read_file input: limit must be between 1 and {MAX_READ_FILE_LIMIT}"
                 ),
             ),
-        ] {
-            let error = read_file_tool().execute(input).await.unwrap_err();
+        ];
+        let tool = read_file_tool();
+
+        for (input, expected) in cases {
+            // Act
+            let error = tool.execute(input).await.unwrap_err();
+
+            // Assert
             assert_eq!(error, expected);
         }
     }
 
     #[tokio::test]
-    async fn execute_reports_access_denial_without_calling_it_invalid_input() {
+    async fn execute_reports_outside_paths_as_access_denied() {
+        // Arrange
         let tool = read_file_tool();
         let outside = tool.workspace.root().parent().unwrap().join("outside.txt");
         let expected = format!(
@@ -349,24 +407,29 @@ mod tests {
             tool.workspace.root().display()
         );
 
+        // Act
         let error = tool
             .execute(json!({ "path": path_of_path(&outside) }))
             .await
             .unwrap_err();
 
+        // Assert
         assert_eq!(error, expected);
     }
 
     #[tokio::test]
     async fn execute_adds_operation_and_path_context_to_filesystem_errors() {
+        // Arrange
         let parent = tempdir().unwrap();
         let missing = parent.path().join("missing.txt");
 
+        // Act
         let error = read_file_tool()
             .execute(json!({ "path": path_of_path(&missing) }))
             .await
             .unwrap_err();
 
+        // Assert
         assert!(
             error.starts_with(&format!("failed to read `{}`: ", missing.display())),
             "unexpected error: {error}"

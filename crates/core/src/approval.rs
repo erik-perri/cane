@@ -1,5 +1,4 @@
-use crate::protocol::{AgentExit, EventSink};
-use crate::tools::Tool;
+use crate::protocol::{AgentExit, ApprovalRequirement, EventSink};
 use crate::{AgentEvent, ApprovalDecision};
 use std::collections::HashSet;
 use tokio::sync::oneshot;
@@ -22,15 +21,14 @@ impl ApprovalGate {
 
     pub async fn authorize(
         &mut self,
-        tool: &dyn Tool,
+        requirement: ApprovalRequirement,
+        tool_name: &str,
         call_id: &str,
         input: &serde_json::Value,
         events: &EventSink,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<ApprovalAuthorization, AgentExit> {
-        let definition = tool.definition();
-
-        if tool.read_only() || self.always_allowed.contains(&definition.name) {
+        if requirement == ApprovalRequirement::None || self.always_allowed.contains(tool_name) {
             return Ok(ApprovalAuthorization::Approved);
         }
 
@@ -40,7 +38,7 @@ impl ApprovalGate {
             .emit(AgentEvent::ApprovalRequest {
                 id: call_id.to_string(),
                 input: input.clone(),
-                name: definition.name.clone(),
+                name: tool_name.to_string(),
                 respond_to: decision_tx,
             })
             .await?;
@@ -48,7 +46,7 @@ impl ApprovalGate {
         match wait_for_response(decision_rx, events, cancel).await? {
             ApprovalDecision::Allow => Ok(ApprovalAuthorization::Approved),
             ApprovalDecision::AlwaysAllowSession => {
-                self.always_allowed.insert(definition.name);
+                self.always_allowed.insert(tool_name.to_string());
 
                 Ok(ApprovalAuthorization::Approved)
             }

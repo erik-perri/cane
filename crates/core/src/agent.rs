@@ -3,7 +3,7 @@ use crate::approval::{ApprovalAuthorization, ApprovalGate};
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolResultData};
 use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
-use crate::tools::ToolSet;
+use crate::tools::{PreparedInvocation, ToolSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -130,8 +130,8 @@ impl AgentSession {
                     }
                 }
                 Err(AgentExit::Cancelled) => {
-                    // cancel tripped mid-approval (or anywhere the gate propagates it):
-                    // the turn still gets its one marker before the session ends.
+                    // If a cancel is tripped mid-approval, the turn still gets
+                    // its one marker before the session ends.
                     let _ = self
                         .host_handle
                         .events
@@ -231,79 +231,102 @@ impl AgentSession {
         input: &serde_json::Value,
         gate: &mut ApprovalGate,
     ) -> Result<ToolResultData, AgentExit> {
-        self.host_handle
-            .events
-            .emit(AgentEvent::ToolStarted {
-                input: input.clone(),
-                name: name.to_string(),
-            })
-            .await?;
+        let invocation = match prepare_tool_call(&self.tool_set, id, name, input).await {
+            Ok(invocation) => invocation,
+            Err(result) => {
+                self.host_handle
+                    .events
+                    .emit(AgentEvent::ToolRejected {
+                        name: name.to_string(),
+                        error: result.content.clone(),
+                    })
+                    .await?;
+                return Ok(result);
+            }
+        };
 
-        let result =
-            resolve_tool_call(&self.tool_set, gate, &mut self.host_handle, id, name, input).await?;
+        match gate
+            .authorize(
+                invocation.approval_requirement(),
+                name,
+                id,
+                input,
+                &self.host_handle.events,
+                &self.host_handle.cancel,
+            )
+            .await?
+        {
+            ApprovalAuthorization::Denied { reason } => {
+                self.host_handle
+                    .events
+                    .emit(AgentEvent::ToolDenied {
+                        name: name.to_string(),
+                        reason: reason.to_string(),
+                    })
+                    .await?;
 
-        self.host_handle
-            .events
-            .emit(AgentEvent::ToolFinished {
-                is_error: result.is_error,
-                name: name.to_string(),
-                output: result.content.clone(),
-            })
-            .await?;
+                Ok(ToolResultData {
+                    content: format!(
+                        "The user declined this tool call and said: \"{reason}\". Do not assume the tool ran. Address their feedback, then retry if appropriate."
+                    ),
+                    is_error: false,
+                    tool_use_id: id.to_string(),
+                })
+            }
 
-        Ok(result)
+            ApprovalAuthorization::Approved => {
+                self.host_handle
+                    .events
+                    .emit(AgentEvent::ToolStarted {
+                        input: input.clone(),
+                        name: name.to_string(),
+                    })
+                    .await?;
+
+                let (content, is_error) = match invocation.execute().await {
+                    Ok(content) => (content, false),
+                    Err(error) => (error, true),
+                };
+
+                self.host_handle
+                    .events
+                    .emit(AgentEvent::ToolFinished {
+                        is_error,
+                        name: name.to_string(),
+                        output: content.clone(),
+                    })
+                    .await?;
+
+                Ok(ToolResultData {
+                    content,
+                    is_error,
+                    tool_use_id: id.to_string(),
+                })
+            }
+        }
     }
 }
 
-async fn resolve_tool_call(
+async fn prepare_tool_call(
     tool_set: &ToolSet,
-    gate: &mut ApprovalGate,
-    host_handle: &mut HostHandle,
     id: &str,
     name: &str,
     input: &serde_json::Value,
-) -> Result<ToolResultData, AgentExit> {
-    let tool = match tool_set.locate(name) {
-        Ok(tool) => tool,
-        Err(error) => {
-            return Ok(ToolResultData {
-                content: error.to_string(),
-                is_error: true,
-                tool_use_id: id.to_string(),
-            });
-        }
-    };
+) -> Result<Box<dyn PreparedInvocation>, ToolResultData> {
+    let tool = tool_set
+        .locate(name)
+        .map_err(|error| failed_tool_result(id, error))?;
+    tool.prepare(input.clone())
+        .await
+        .map_err(|error| failed_tool_result(id, error))
+}
 
-    let result = gate
-        .authorize(tool, id, input, &host_handle.events, &host_handle.cancel)
-        .await?;
-
-    match result {
-        ApprovalAuthorization::Approved => {
-            //
-        }
-        ApprovalAuthorization::Denied { reason } => {
-            return Ok(ToolResultData {
-                content: format!(
-                    "The user declined this tool call and said: \"{}\". Do not assume the tool ran. Address their feedback, then retry if appropriate.",
-                    reason
-                ),
-                is_error: false,
-                tool_use_id: id.to_string(),
-            });
-        }
-    }
-
-    let (content, is_error) = match tool.execute(input.clone()).await {
-        Ok(content) => (content, false),
-        Err(err) => (err, true),
-    };
-
-    Ok(ToolResultData {
-        content,
-        is_error,
+fn failed_tool_result(id: &str, error: String) -> ToolResultData {
+    ToolResultData {
+        content: error,
+        is_error: true,
         tool_use_id: id.to_string(),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -794,22 +817,27 @@ mod tests {
         let queued_message = nth_request_messages(&server, 2).await;
 
         // Assert
-        assert_eq!(3, first_turn.len());
+        assert_eq!(4, first_turn.len());
         assert_eq!(2, second_turn.len());
         assert_eq!(0, shutdown_events.len());
 
-        let Some(AgentEvent::ToolFinished { name, .. }) = first_turn.first() else {
-            panic!("Expected first event to be a ToolFinished event");
+        let Some(AgentEvent::ToolStarted { name, .. }) = first_turn.first() else {
+            panic!("Expected first event to be a ToolStarted event");
         };
         assert_eq!("write_file", name);
 
-        let Some(AgentEvent::TextDelta(text)) = first_turn.get(1) else {
-            panic!("Expected second event to be a TextDelta event");
+        let Some(AgentEvent::ToolFinished { name, .. }) = first_turn.get(1) else {
+            panic!("Expected second event to be a ToolFinished event");
+        };
+        assert_eq!("write_file", name);
+
+        let Some(AgentEvent::TextDelta(text)) = first_turn.get(2) else {
+            panic!("Expected third event to be a TextDelta event");
         };
         assert_eq!("what1", text);
 
-        let Some(AgentEvent::TurnComplete { outcome }) = first_turn.get(2) else {
-            panic!("Expected third event to be a TurnComplete event");
+        let Some(AgentEvent::TurnComplete { outcome }) = first_turn.get(3) else {
+            panic!("Expected fourth event to be a TurnComplete event");
         };
         assert_eq!(
             TurnOutcome::Completed {
@@ -847,6 +875,61 @@ mod tests {
                 "content": "what3"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_is_never_reported_as_started() {
+        let file = temp_file_with(b"original");
+        let file_path = file.path().to_str().unwrap();
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "write-1",
+                    "write_file",
+                    json!({ "path": file_path, "content": "changed" }),
+                )]),
+                text_turn("I did not change it."),
+            ],
+        )
+        .await;
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Change the file.".to_string()))
+            .await
+            .unwrap();
+
+        let respond_to = loop {
+            let event = handle.events.recv().await.unwrap();
+            match event {
+                AgentEvent::ApprovalRequest { respond_to, .. } => break respond_to,
+                AgentEvent::ToolStarted { .. } => {
+                    panic!("tool was reported as started before approval")
+                }
+                _ => {}
+            }
+        };
+        respond_to
+            .send(ApprovalDecision::Deny {
+                reason: "not this file".to_string(),
+            })
+            .unwrap();
+
+        let events = collect_turn(&mut handle.events).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolDenied { name, reason },
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete { .. },
+            ] if name == "write_file"
+                && reason == "not this file"
+                && text == "I did not change it."
+        ));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "original");
     }
 
     #[tokio::test]
@@ -969,7 +1052,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::ToolFinished { is_error: true, .. }))
+                .any(|event| matches!(event, AgentEvent::ToolRejected { .. }))
         );
         assert!(matches!(
             events.last(),
@@ -1026,6 +1109,16 @@ mod tests {
                 }
             })
         ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolRejected { name, .. }
+                if name == "write_the_file_at_the_path"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+        );
         let messages = nth_request_messages(&server, 1).await;
         assert_eq!(
             messages[2],
@@ -1069,6 +1162,8 @@ mod tests {
                 AgentEvent::ApprovalRequest { .. } => "approval",
                 AgentEvent::ToolStarted { .. } => "started",
                 AgentEvent::ToolFinished { .. } => "finished",
+                AgentEvent::ToolDenied { .. } => "denied",
+                AgentEvent::ToolRejected { .. } => "rejected",
                 AgentEvent::TextDelta(_) => "text",
                 AgentEvent::TurnComplete { .. } => "complete",
                 AgentEvent::Error(_) => "error",
@@ -1076,9 +1171,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec![
-                "started", "finished", "started", "finished", "text", "complete"
-            ]
+            vec!["started", "finished", "rejected", "text", "complete"]
         );
 
         // Assert
