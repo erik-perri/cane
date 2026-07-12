@@ -136,7 +136,12 @@ impl PreparedInvocation for PreparedReadFile {
 
 /// `offset` and `limit` have already been validated by `ReadFileInput`.
 fn read_lines_from_file(path: &Path, offset: u64, limit: u64) -> std::io::Result<String> {
-    let size = std::fs::metadata(path)?.len();
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("path is not a file"));
+    }
+
+    let size = metadata.len();
     if size > MAX_FILE_SIZE_BYTES {
         return Err(std::io::Error::other(format!(
             "file is {size} bytes, which exceeds the {MAX_FILE_SIZE_BYTES} byte read limit"

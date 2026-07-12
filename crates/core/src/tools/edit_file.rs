@@ -179,6 +179,12 @@ fn replace_in_file(
     explicit_occurrence_count: bool,
 ) -> Result<usize, EditFileError> {
     let metadata = std::fs::metadata(path).map_err(EditFileError::Read)?;
+    if !metadata.is_file() {
+        return Err(EditFileError::Read(std::io::Error::other(
+            "path is not a file",
+        )));
+    }
+
     if metadata.len() > MAX_FILE_SIZE_BYTES {
         return Err(EditFileError::TooLarge {
             size: metadata.len(),
