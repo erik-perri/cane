@@ -1,13 +1,14 @@
 use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
 use crate::tools::{
-    PreparedInvocation, Tool, ToolDefinition, background_task_failed, invalid_input,
-    operation_failed,
+    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, background_task_failed,
+    invalid_input, operation_failed,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,11 +24,6 @@ pub struct WriteFileTool {
 impl WriteFileTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
-    }
-
-    #[cfg(test)]
-    async fn execute(&self, input: Value) -> Result<String, String> {
-        self.prepare(input).await?.execute().await
     }
 }
 
@@ -96,7 +92,14 @@ impl PreparedInvocation for PreparedWriteFile {
         ApprovalRequirement::Required
     }
 
-    async fn execute(self: Box<Self>) -> Result<String, String> {
+    async fn execute(
+        self: Box<Self>,
+        cancel: CancellationToken,
+    ) -> Result<String, ToolExecutionError> {
+        if cancel.is_cancelled() {
+            return Err(ToolExecutionError::Cancelled);
+        }
+
         let Self {
             existed,
             requested_path,
@@ -132,6 +135,7 @@ fn write_to_file(path: &Path, content: String) -> std::io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolTestExt;
     use serde_json::json;
     use std::fs;
     use std::path::Path;

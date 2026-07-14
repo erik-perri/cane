@@ -2,7 +2,7 @@ use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
 use crate::tools::{
     MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition,
-    background_task_failed, invalid_input, operation_failed,
+    ToolExecutionError, background_task_failed, invalid_input, operation_failed,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -10,6 +10,7 @@ use std::fs::Permissions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,11 +28,6 @@ pub struct EditFileTool {
 impl EditFileTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
-    }
-
-    #[cfg(test)]
-    async fn execute(&self, input: Value) -> Result<String, String> {
-        self.prepare(input).await?.execute().await
     }
 }
 
@@ -128,7 +124,14 @@ impl PreparedInvocation for PreparedEditFile {
         ApprovalRequirement::Required
     }
 
-    async fn execute(self: Box<Self>) -> Result<String, String> {
+    async fn execute(
+        self: Box<Self>,
+        cancel: CancellationToken,
+    ) -> Result<String, ToolExecutionError> {
+        if cancel.is_cancelled() {
+            return Err(ToolExecutionError::Cancelled);
+        }
+
         let Self {
             requested_path,
             resolved_path,
@@ -150,13 +153,12 @@ impl PreparedInvocation for PreparedEditFile {
         .await
         .map_err(|error| background_task_failed("edit", &requested_path, error))?;
 
-        match result {
-            Ok(replaced) => Ok(format!(
-                "edited `{requested_path}`; {replaced} {} replaced",
-                occurrence_label(replaced)
-            )),
-            Err(error) => Err(format_edit_error(&requested_path, error)),
-        }
+        let replaced = result.map_err(|error| format_edit_error(&requested_path, error))?;
+
+        Ok(format!(
+            "edited `{requested_path}`; {replaced} {} replaced",
+            occurrence_label(replaced)
+        ))
     }
 }
 
@@ -180,9 +182,7 @@ fn replace_in_file(
 ) -> Result<usize, EditFileError> {
     let metadata = std::fs::metadata(path).map_err(EditFileError::Read)?;
     if !metadata.is_file() {
-        return Err(EditFileError::Read(std::io::Error::other(
-            "path is not a file",
-        )));
+        return Err(EditFileError::Read(io::Error::other("path is not a file")));
     }
 
     if metadata.len() > MAX_FILE_SIZE_BYTES {
@@ -271,6 +271,7 @@ fn occurrence_label(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolTestExt;
     use serde_json::json;
     use std::fs;
     use std::path::Path;

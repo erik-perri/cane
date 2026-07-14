@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 mod edit_file;
 mod read_file;
@@ -15,6 +16,17 @@ pub use write_file::WriteFileTool;
 pub struct ToolSet {
     tool_definitions: Vec<ToolDefinition>,
     tools: Vec<Box<dyn Tool>>,
+}
+
+pub enum ToolExecutionError {
+    Cancelled,
+    ToolError(String),
+}
+
+impl From<String> for ToolExecutionError {
+    fn from(error: String) -> Self {
+        Self::ToolError(error)
+    }
 }
 
 impl ToolSet {
@@ -68,7 +80,10 @@ pub trait Tool: Send + Sync {
 pub trait PreparedInvocation: Send {
     fn approval_requirement(&self) -> ApprovalRequirement;
 
-    async fn execute(self: Box<Self>) -> Result<String, String>;
+    async fn execute(
+        self: Box<Self>,
+        cancel: CancellationToken,
+    ) -> Result<String, ToolExecutionError>;
 }
 
 /// Largest file the file tools will load into memory.
@@ -89,6 +104,31 @@ fn background_task_failed(operation: &str, path: &str, error: impl std::fmt::Dis
         path,
         format_args!("background task failed: {error}"),
     )
+}
+
+#[cfg(test)]
+#[async_trait]
+pub(crate) trait ToolTestExt: Tool {
+    async fn execute(&self, input: Value) -> Result<String, String>;
+}
+
+#[cfg(test)]
+#[async_trait]
+impl<T> ToolTestExt for T
+where
+    T: Tool + ?Sized,
+{
+    async fn execute(&self, input: Value) -> Result<String, String> {
+        let invocation = self.prepare(input).await?;
+
+        match invocation.execute(CancellationToken::new()).await {
+            Ok(output) => Ok(output),
+            Err(ToolExecutionError::ToolError(error)) => Err(error),
+            Err(ToolExecutionError::Cancelled) => {
+                unreachable!("a fresh test cancellation token cannot be cancelled")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

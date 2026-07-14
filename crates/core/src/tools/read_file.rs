@@ -1,13 +1,14 @@
 use crate::protocol::ApprovalRequirement;
 use crate::tools::{
     MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition,
-    background_task_failed, invalid_input, operation_failed,
+    ToolExecutionError, background_task_failed, invalid_input, operation_failed,
 };
 use crate::workspace::Workspace;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_READ_FILE_LIMIT: u64 = 2_000;
 const MAX_READ_FILE_LIMIT: u64 = 2_000;
@@ -37,11 +38,6 @@ pub struct ReadFileTool {
 impl ReadFileTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
-    }
-
-    #[cfg(test)]
-    async fn execute(&self, input: Value) -> Result<String, String> {
-        self.prepare(input).await?.execute().await
     }
 }
 
@@ -119,7 +115,14 @@ impl PreparedInvocation for PreparedReadFile {
         ApprovalRequirement::None
     }
 
-    async fn execute(self: Box<Self>) -> Result<String, String> {
+    async fn execute(
+        self: Box<Self>,
+        cancel: CancellationToken,
+    ) -> Result<String, ToolExecutionError> {
+        if cancel.is_cancelled() {
+            return Err(ToolExecutionError::Cancelled);
+        }
+
         let Self {
             requested_path,
             resolved_path,
@@ -127,10 +130,14 @@ impl PreparedInvocation for PreparedReadFile {
             limit,
         } = *self;
 
-        tokio::task::spawn_blocking(move || read_lines_from_file(&resolved_path, offset, limit))
-            .await
-            .map_err(|error| background_task_failed("read", &requested_path, error))?
-            .map_err(|error| operation_failed("read", &requested_path, error))
+        let read = tokio::task::spawn_blocking(move || {
+            read_lines_from_file(&resolved_path, offset, limit)
+        })
+        .await
+        .map_err(|error| background_task_failed("read", &requested_path, error))?
+        .map_err(|error| operation_failed("read", &requested_path, error))?;
+
+        Ok(read)
     }
 }
 
@@ -160,7 +167,7 @@ fn read_lines_from_file(path: &Path, offset: u64, limit: u64) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::Tool;
+    use crate::tools::{Tool, ToolTestExt};
     use serde_json::json;
     use std::fs;
     use std::io::Write;

@@ -3,7 +3,7 @@ use crate::approval::{ApprovalAuthorization, ApprovalGate};
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolResultData};
 use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
-use crate::tools::{PreparedInvocation, ToolSet};
+use crate::tools::{PreparedInvocation, ToolExecutionError, ToolSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -283,9 +283,27 @@ impl AgentSession {
                     })
                     .await?;
 
-                let (content, is_error) = match invocation.execute().await {
+                let execution_cancel = self.host_handle.cancel.child_token();
+                let tool_future = invocation.execute(execution_cancel.clone());
+
+                let execution_result = tokio::select! {
+                    _ = self.host_handle.events.closed() => {
+                        execution_cancel.cancel();
+                        return Err(AgentExit::Disconnected);
+                    }
+                    _ = self.host_handle.cancel.cancelled() => {
+                        execution_cancel.cancel();
+                        return Err(AgentExit::Cancelled);
+                    }
+                    result = tool_future => result,
+                };
+
+                let (content, is_error) = match execution_result {
                     Ok(content) => (content, false),
-                    Err(error) => (error, true),
+                    Err(ToolExecutionError::ToolError(error)) => (error, true),
+                    Err(ToolExecutionError::Cancelled) => {
+                        return Err(AgentExit::Cancelled);
+                    }
                 };
 
                 self.host_handle
