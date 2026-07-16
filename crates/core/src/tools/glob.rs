@@ -260,13 +260,13 @@ fn glob_files(
 
     builder
         .hidden(false)
+        .parents(false)
         .ignore(false)
-        .git_ignore(true)
+        .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
-        .require_git(false)
+        .add_custom_ignore_filename(".gitignore")
         .follow_links(false)
-        .min_depth(Some(1))
         .filter_entry(|entry| entry.file_name() != ".git");
 
     let mut matches = Vec::new();
@@ -278,6 +278,12 @@ fn glob_files(
         }
 
         let entry = entry_result?;
+
+        // We don't filter out the root so WalkBuilder can load its .gitignore.
+        // The root itself is not a visited search entry or a possible match.
+        if entry.depth() == 0 {
+            continue;
+        }
 
         visited_nodes += 1;
         if visited_nodes > max_visited_nodes {
@@ -798,5 +804,36 @@ mod tests {
 
         // Assert
         assert_eq!(output, "main.rs");
+    }
+
+    #[test]
+    fn gitignore_rules_start_at_the_search_root() {
+        // Arrange
+        let (root, tool) = glob_tool();
+        let search_root = root.path().join("search");
+        fs::create_dir(&search_root).unwrap();
+        fs::write(root.path().join(".gitignore"), "parent-ignored.txt\n").unwrap();
+        fs::write(search_root.join(".gitignore"), "local-ignored.txt\n").unwrap();
+        fs::write(search_root.join("parent-ignored.txt"), "visible").unwrap();
+        fs::write(search_root.join("local-ignored.txt"), "ignored").unwrap();
+        fs::write(search_root.join("visible.txt"), "visible").unwrap();
+
+        // Act
+        let result = run_glob(
+            &tool,
+            json!({ "pattern": "*.txt", "path": "search" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+
+        // Assert
+        let GlobResult::Full(paths) = result else {
+            panic!("generous limits should not truncate this result");
+        };
+        assert!(paths.contains(&"search/parent-ignored.txt".to_string()));
+        assert!(paths.contains(&"search/visible.txt".to_string()));
+        assert!(!paths.contains(&"search/local-ignored.txt".to_string()));
+        assert_eq!(paths.len(), 2);
     }
 }
