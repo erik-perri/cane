@@ -4,6 +4,7 @@ use crate::message::{ContentBlock, Message, Role, StopReason, ToolResultData};
 use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
 use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
 use crate::tools::{PreparedInvocation, ToolExecutionError, ToolSet};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -228,7 +229,7 @@ impl AgentSession {
         &mut self,
         id: &str,
         name: &str,
-        input: &serde_json::Value,
+        input: &Value,
         gate: &mut ApprovalGate,
     ) -> Result<ToolResultData, AgentExit> {
         let invocation = match prepare_tool_call(&self.tool_set, id, name, input).await {
@@ -275,51 +276,7 @@ impl AgentSession {
             }
 
             ApprovalAuthorization::Approved => {
-                self.host_handle
-                    .events
-                    .emit(AgentEvent::ToolStarted {
-                        input: input.clone(),
-                        name: name.to_string(),
-                    })
-                    .await?;
-
-                let execution_cancel = self.host_handle.cancel.child_token();
-                let tool_future = invocation.execute(execution_cancel.clone());
-
-                let execution_result = tokio::select! {
-                    _ = self.host_handle.events.closed() => {
-                        execution_cancel.cancel();
-                        return Err(AgentExit::Disconnected);
-                    }
-                    _ = self.host_handle.cancel.cancelled() => {
-                        execution_cancel.cancel();
-                        return Err(AgentExit::Cancelled);
-                    }
-                    result = tool_future => result,
-                };
-
-                let (content, is_error) = match execution_result {
-                    Ok(content) => (content, false),
-                    Err(ToolExecutionError::ToolError(error)) => (error, true),
-                    Err(ToolExecutionError::Cancelled) => {
-                        return Err(AgentExit::Cancelled);
-                    }
-                };
-
-                self.host_handle
-                    .events
-                    .emit(AgentEvent::ToolFinished {
-                        is_error,
-                        name: name.to_string(),
-                        output: content.clone(),
-                    })
-                    .await?;
-
-                Ok(ToolResultData {
-                    content,
-                    is_error,
-                    tool_use_id: id.to_string(),
-                })
+                execute_invocation(&self.host_handle, id, name, input, invocation).await
             }
         }
     }
@@ -329,7 +286,7 @@ async fn prepare_tool_call(
     tool_set: &ToolSet,
     id: &str,
     name: &str,
-    input: &serde_json::Value,
+    input: &Value,
 ) -> Result<Box<dyn PreparedInvocation>, ToolResultData> {
     let tool = tool_set
         .locate(name)
@@ -347,19 +304,77 @@ fn failed_tool_result(id: &str, error: String) -> ToolResultData {
     }
 }
 
+async fn execute_invocation(
+    host_handle: &HostHandle,
+    id: &str,
+    name: &str,
+    input: &Value,
+    invocation: Box<dyn PreparedInvocation>,
+) -> Result<ToolResultData, AgentExit> {
+    host_handle
+        .events
+        .emit(AgentEvent::ToolStarted {
+            input: input.clone(),
+            name: name.to_string(),
+        })
+        .await?;
+
+    let execution_cancel = host_handle.cancel.child_token();
+    let tool_future = invocation.execute(execution_cancel.clone());
+
+    let execution_result = tokio::select! {
+        _ = host_handle.events.closed() => {
+            execution_cancel.cancel();
+            return Err(AgentExit::Disconnected);
+        }
+        _ = host_handle.cancel.cancelled() => {
+            execution_cancel.cancel();
+            return Err(AgentExit::Cancelled);
+        }
+        result = tool_future => result,
+    };
+
+    let (content, is_error) = match execution_result {
+        Ok(content) => (content, false),
+        Err(ToolExecutionError::ToolError(error)) => (error, true),
+        Err(ToolExecutionError::Cancelled) => {
+            return Err(AgentExit::Cancelled);
+        }
+    };
+
+    host_handle
+        .events
+        .emit(AgentEvent::ToolFinished {
+            is_error,
+            name: name.to_string(),
+            output: content.clone(),
+        })
+        .await?;
+
+    Ok(ToolResultData {
+        content,
+        is_error,
+        tool_use_id: id.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ApprovalDecision;
-    use serde_json::json;
+    use crate::protocol::ApprovalRequirement;
+    use crate::tools::{Tool, ToolDefinition};
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
     use std::io::Write;
     use std::time::Duration;
     use tempfile::NamedTempFile;
+    use tokio::sync::Notify;
     use tokio::time::timeout;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn stream_chunk(delta: serde_json::Value, finish_reason: Option<&str>) -> serde_json::Value {
+    fn stream_chunk(delta: Value, finish_reason: Option<&str>) -> Value {
         json!({
             "id": "chatcmpl-123",
             "object": "chat.completion.chunk",
@@ -369,7 +384,7 @@ mod tests {
         })
     }
 
-    fn sse_response(chunks: &[serde_json::Value]) -> ResponseTemplate {
+    fn sse_response(chunks: &[Value]) -> ResponseTemplate {
         let mut body = String::new();
         for chunk in chunks {
             body.push_str(&format!("data: {chunk}\n\n"));
@@ -387,7 +402,7 @@ mod tests {
         ])
     }
 
-    fn tool_call_turn(calls: &[(&str, &str, serde_json::Value)]) -> ResponseTemplate {
+    fn tool_call_turn(calls: &[(&str, &str, Value)]) -> ResponseTemplate {
         let chunks: Vec<_> = calls
             .iter()
             .enumerate()
@@ -433,6 +448,28 @@ mod tests {
 
     fn test_workspace() -> Workspace {
         Workspace::new(std::env::temp_dir()).unwrap()
+    }
+
+    fn test_session(
+        server: &MockServer,
+        host_handle: HostHandle,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> AgentSession {
+        let provider = test_provider(server);
+
+        let client = OpenAiClient::new(
+            provider.base_url,
+            provider.api_key,
+            provider.model,
+            provider.max_tokens,
+        )
+        .unwrap();
+
+        AgentSession {
+            host_handle,
+            client,
+            tool_set: ToolSet::from_tools(tools),
+        }
     }
 
     async fn run_agent(prompt: &str, server: &MockServer) -> Vec<AgentEvent> {
@@ -486,9 +523,9 @@ mod tests {
         file
     }
 
-    async fn nth_request_messages(server: &MockServer, n: usize) -> serde_json::Value {
+    async fn nth_request_messages(server: &MockServer, n: usize) -> Value {
         let requests = server.received_requests().await.unwrap();
-        let body: serde_json::Value = requests[n].body_json().unwrap();
+        let body: Value = requests[n].body_json().unwrap();
         body["messages"].clone()
     }
 
@@ -521,7 +558,7 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        let body: serde_json::Value = requests[0].body_json().unwrap();
+        let body: Value = requests[0].body_json().unwrap();
         assert_eq!(
             body["messages"],
             json!([{ "role": "user", "content": "Say hi" }])
@@ -540,7 +577,7 @@ mod tests {
         // Assert
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        let body: serde_json::Value = requests[0].body_json().unwrap();
+        let body: Value = requests[0].body_json().unwrap();
         let mut names = body["tools"]
             .as_array()
             .unwrap()
@@ -1635,5 +1672,341 @@ mod tests {
             ),
             "expected an Error followed by a cancelled TurnComplete, got {events:?}"
         );
+    }
+
+    enum TestExecution {
+        Fail(String),
+        Cancel,
+        Block { started: Arc<Notify> },
+    }
+
+    struct TestInvocation {
+        execution: TestExecution,
+    }
+
+    #[async_trait]
+    impl PreparedInvocation for TestInvocation {
+        fn approval_requirement(&self) -> ApprovalRequirement {
+            ApprovalRequirement::None
+        }
+
+        async fn execute(
+            self: Box<Self>,
+            cancel: CancellationToken,
+        ) -> Result<String, ToolExecutionError> {
+            match self.execution {
+                TestExecution::Fail(error) => Err(ToolExecutionError::ToolError(error)),
+                TestExecution::Cancel => Err(ToolExecutionError::Cancelled),
+                TestExecution::Block { started } => {
+                    started.notify_one();
+                    cancel.cancelled().await;
+                    Err(ToolExecutionError::Cancelled)
+                }
+            }
+        }
+    }
+
+    struct BlockingTestTool {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingTestTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "test_tool".to_string(),
+                description: "Blocks until cancelled".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                }),
+            }
+        }
+
+        async fn prepare(&self, _input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
+            Ok(Box::new(TestInvocation {
+                execution: TestExecution::Block {
+                    started: Arc::clone(&self.started),
+                },
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_tool_execution_completes_turn_once_without_finishing_tool() {
+        // Arrange
+        let server = MockServer::start().await;
+
+        mount_turns(
+            &server,
+            vec![tool_call_turn(&[("tool-1", "test_tool", json!({}))])],
+        )
+        .await;
+
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (commands_tx, commands_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let host_handle = HostHandle {
+            cancel: cancel.clone(),
+            commands: commands_rx,
+            events: EventSink::new(events_tx),
+        };
+
+        let started = Arc::new(Notify::new());
+
+        let session = test_session(
+            &server,
+            host_handle,
+            vec![Box::new(BlockingTestTool {
+                started: Arc::clone(&started),
+            })],
+        );
+
+        let session_task = tokio::spawn(session.run());
+
+        commands_tx
+            .send(AgentCommand::UserInput("Run the test tool".to_string()))
+            .await
+            .unwrap();
+
+        let started_event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("ToolStarted was not emitted")
+            .expect("event channel closed unexpectedly");
+
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tool invocation never started");
+
+        // Act
+        cancel.cancel();
+
+        let remaining_events = collect_until_events_close(&mut events_rx).await;
+
+        let session_result = timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("session did not stop promptly")
+            .expect("session task panicked");
+
+        // Assert
+        assert_eq!(session_result, Err(AgentExit::Cancelled));
+        assert!(matches!(
+            started_event,
+            AgentEvent::ToolStarted { ref name, .. } if name == "test_tool"
+        ));
+
+        assert!(matches!(
+            remaining_events.as_slice(),
+            [AgentEvent::TurnComplete {
+                outcome: TurnOutcome::Cancelled,
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_failure_returns_error_result_instead_of_cancelling() {
+        // Arrange
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
+        let event_sink = EventSink::new(events_tx.clone());
+
+        let host_handle = HostHandle {
+            cancel: CancellationToken::new(),
+            commands: commands_rx,
+            events: event_sink,
+        };
+
+        let mock_error = "Mock error".to_string();
+        let mock_id = "call-1".to_string();
+
+        // Act
+        let result = execute_invocation(
+            &host_handle,
+            mock_id.as_str(),
+            "test",
+            &json!({}),
+            Box::new(TestInvocation {
+                execution: TestExecution::Fail(mock_error.clone()),
+            }),
+        )
+        .await;
+
+        // Assert
+        assert_eq!(
+            result,
+            Ok(ToolResultData {
+                content: mock_error,
+                is_error: true,
+                tool_use_id: mock_id,
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_cancellation_becomes_agent_cancellation() {
+        // Arrange
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
+        let event_sink = EventSink::new(events_tx.clone());
+
+        let host_handle = HostHandle {
+            cancel: CancellationToken::new(),
+            commands: commands_rx,
+            events: event_sink,
+        };
+
+        // Act
+        let result = execute_invocation(
+            &host_handle,
+            "call-1",
+            "test",
+            &json!({}),
+            Box::new(TestInvocation {
+                execution: TestExecution::Cancel,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(result, AgentExit::Cancelled);
+
+        let event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("event was not emitted")
+            .expect("event channel closed");
+
+        assert!(matches!(
+            event,
+            AgentEvent::ToolStarted { ref name, .. } if name == "test"
+        ));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn frontend_disconnect_during_tool_execution_returns_disconnected() {
+        // Arrange
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
+        let event_sink = EventSink::new(events_tx.clone());
+
+        let host_handle = HostHandle {
+            cancel: CancellationToken::new(),
+            commands: commands_rx,
+            events: event_sink,
+        };
+
+        let started = Arc::new(Notify::new());
+        let invocation_started = Arc::clone(&started);
+
+        let execution = tokio::spawn(async move {
+            execute_invocation(
+                &host_handle,
+                "call-1",
+                "test",
+                &json!({}),
+                Box::new(TestInvocation {
+                    execution: TestExecution::Block {
+                        started: invocation_started,
+                    },
+                }),
+            )
+            .await
+        });
+
+        let start_event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("ToolStarted was not emitted")
+            .expect("event channel closed unexpectedly");
+
+        // Confirm the invocation itself is executing.
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tool invocation never started");
+
+        // Act
+        // Drop the receiver to disconnect the frontend.
+        drop(events_rx);
+
+        let result = timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("tool execution did not stop promptly")
+            .expect("execution task panicked")
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(result, AgentExit::Disconnected);
+
+        assert!(matches!(
+            start_event,
+            AgentEvent::ToolStarted { ref name, .. } if name == "test"
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_cancellation_during_tool_execution_returns_cancelled_without_finishing() {
+        // Arrange
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
+        let event_sink = EventSink::new(events_tx.clone());
+        let cancel = CancellationToken::new();
+
+        let host_handle = HostHandle {
+            cancel: cancel.clone(),
+            commands: commands_rx,
+            events: event_sink,
+        };
+
+        let started = Arc::new(Notify::new());
+        let invocation_started = Arc::clone(&started);
+
+        let execution = tokio::spawn(async move {
+            execute_invocation(
+                &host_handle,
+                "call-1",
+                "test",
+                &json!({}),
+                Box::new(TestInvocation {
+                    execution: TestExecution::Block {
+                        started: invocation_started,
+                    },
+                }),
+            )
+            .await
+        });
+
+        let started_event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("ToolStarted was not emitted")
+            .expect("event channel closed unexpectedly");
+
+        // Confirm the invocation itself is executing.
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tool invocation never started");
+
+        // Act
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("tool execution did not stop promptly")
+            .expect("execution task panicked")
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(result, AgentExit::Cancelled);
+        assert!(matches!(
+            started_event,
+            AgentEvent::ToolStarted { ref name, .. } if name == "test"
+        ));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

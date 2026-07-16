@@ -59,6 +59,19 @@ impl ToolSet {
             .find(|tool| tool.definition().name == name)
             .ok_or_else(|| format!("unknown tool: `{name}`"))
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        let tool_definitions = tools
+            .iter()
+            .map(|tool| tool.definition())
+            .collect();
+
+        Self {
+            tool_definitions,
+            tools,
+        }
+    }
 }
 
 /// A tool the model can call.
