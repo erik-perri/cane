@@ -10,6 +10,7 @@ mod write_file;
 
 use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
+use crate::tools::glob::GlobTool;
 pub use edit_file::EditFileTool;
 pub use read_file::ReadFileTool;
 pub use write_file::WriteFileTool;
@@ -35,14 +36,12 @@ impl ToolSet {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(EditFileTool::new(Arc::clone(&workspace))),
+            Box::new(GlobTool::new(Arc::clone(&workspace))),
             Box::new(ReadFileTool::new(Arc::clone(&workspace))),
             Box::new(WriteFileTool::new(Arc::clone(&workspace))),
         ];
 
-        let tool_definitions = tools
-            .iter()
-            .map(|tool| tool.definition())
-            .collect();
+        let tool_definitions = tools.iter().map(|tool| tool.definition()).collect();
 
         Self {
             tool_definitions,
@@ -64,10 +63,7 @@ impl ToolSet {
 
     #[cfg(test)]
     pub(crate) fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        let tool_definitions = tools
-            .iter()
-            .map(|tool| tool.definition())
-            .collect();
+        let tool_definitions = tools.iter().map(|tool| tool.definition()).collect();
 
         Self {
             tool_definitions,
