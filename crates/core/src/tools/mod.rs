@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 mod edit_file;
+mod glob;
 mod read_file;
 mod write_file;
 
@@ -18,6 +19,7 @@ pub struct ToolSet {
     tools: Vec<Box<dyn Tool>>,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum ToolExecutionError {
     Cancelled,
     ToolError(String),
