@@ -586,7 +586,7 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort_unstable();
 
-        assert_eq!(names, vec!["edit_file", "read_file", "write_file"]);
+        assert_eq!(names, vec!["edit_file", "glob", "read_file", "write_file"]);
     }
 
     #[tokio::test]
