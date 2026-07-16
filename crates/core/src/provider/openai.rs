@@ -690,7 +690,11 @@ mod tests {
     #[test]
     fn endpoint_rejects_invalid_base_urls() {
         // Arrange
-        let base_urls = ["not a URL", "https://example.test/v1#fragment"];
+        let base_urls = [
+            "not a URL",
+            "https://example.test/v1#fragment",
+            "mailto:user@example.test",
+        ];
 
         for base_url in base_urls {
             // Act
