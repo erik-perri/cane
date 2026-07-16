@@ -40,7 +40,7 @@ impl ToolSet {
         let tool_definitions = tools
             .iter()
             .map(|tool| tool.definition())
-            .collect::<Vec<ToolDefinition>>();
+            .collect();
 
         Self {
             tool_definitions,

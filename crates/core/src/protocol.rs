@@ -72,7 +72,7 @@ pub struct HostHandle {
     pub cancel: CancellationToken,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum AgentExit {
     /// Command channel or event channel closed — clean shutdown.
     Disconnected,
