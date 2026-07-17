@@ -472,13 +472,13 @@ mod tests {
     #[test]
     fn no_path_uses_workspace_root() {
         // Arrange
-        let (root, tool) = glob_tool();
+        let (_root, tool) = glob_tool();
 
         // Act
         let result = tool.prepare_glob(json!({ "pattern": "*" })).unwrap();
 
         // Assert
-        assert_eq!(result.resolved_path, root.path());
+        assert_eq!(result.resolved_path, tool.workspace.root());
         assert_eq!(result.requested_path, ".");
     }
 
