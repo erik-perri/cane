@@ -317,9 +317,10 @@ fn glob_files(
             })?;
 
             matches.push(GlobMatch {
-                modified: std::fs::metadata(entry.path())
-                    .and_then(|metadata| metadata.modified())
-                    .ok(),
+                modified: entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok()),
                 output_path: normalize_workspace_path(result_path),
             });
         }
