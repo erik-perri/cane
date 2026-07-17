@@ -125,4 +125,34 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn message_deserializes_missing_optional_fields_to_their_defaults() {
+        let serialized = json!({
+            "role": "assistant",
+            "content": [
+                { "type": "tool_use", "id": "Mock ID", "name": "Mock Name", "input": {} },
+                { "type": "tool_result", "tool_use_id": "Mock ID", "content": "Mock Content" },
+            ]
+        });
+
+        // Act
+        let unserialized: Message = serde_json::from_value(serialized).unwrap();
+
+        // Assert
+        assert!(matches!(
+            &unserialized.content[0],
+            ToolUse {
+                raw_input: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &unserialized.content[1],
+            ToolResult(ToolResultData {
+                is_error: false,
+                ..
+            })
+        ));
+    }
 }
