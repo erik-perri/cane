@@ -105,6 +105,10 @@ impl GlobTool {
         let input: GlobInput =
             serde_json::from_value(input).map_err(|error| invalid_input("glob", error))?;
 
+        if input.pattern.is_empty() {
+            return Err(invalid_input("glob", "`pattern` must not be empty"));
+        }
+
         let (requested_path, resolved_path) = match input.path {
             Some(path) if path.is_empty() => {
                 return Err(invalid_input("glob", "`path` must not be empty"));
@@ -115,10 +119,6 @@ impl GlobTool {
             }
             None => (".".to_owned(), self.workspace.root().to_path_buf()),
         };
-
-        if input.pattern.is_empty() {
-            return Err(invalid_input("glob", "`pattern` must not be empty"));
-        }
 
         let matcher = GlobBuilder::new(&input.pattern)
             .backslash_escape(true)
