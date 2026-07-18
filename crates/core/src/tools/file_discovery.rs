@@ -63,14 +63,26 @@ impl LocatedFile {
 
 #[derive(Debug, Error)]
 pub(super) enum FileDiscoveryError {
+    #[error("background discovery task failed: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
+
     #[error("file discovery was cancelled")]
     Cancelled,
+
+    #[error("failed to load ignore file `{path}`: {source}")]
+    Ignore {
+        path: PathBuf,
+        source: ignore::Error,
+    },
 
     #[error("invalid discovery scope: workspace `{workspace_root}`, search root `{search_root}`")]
     InvalidScope {
         workspace_root: PathBuf,
         search_root: PathBuf,
     },
+
+    #[error("search root must not be inside `.git`: {0}")]
+    RootInGit(PathBuf),
 
     #[error("failed to get metadata for search root `{path}`: {source}")]
     RootMetadata {
@@ -81,9 +93,6 @@ pub(super) enum FileDiscoveryError {
     #[error("search root is not a directory: {0}")]
     RootNotDirectory(PathBuf),
 
-    #[error("search root must not be inside `.git`: {0}")]
-    RootInGit(PathBuf),
-
     #[error("file discovery exceeded the {limit}-entry limit; choose a narrower search path")]
     TooManyEntries { limit: usize },
 
@@ -92,9 +101,6 @@ pub(super) enum FileDiscoveryError {
 
     #[error("walked path `{path}` was outside expected root `{root}`")]
     UnexpectedPath { path: PathBuf, root: PathBuf },
-
-    #[error("background discovery task failed: {0}")]
-    BlockingTask(#[from] tokio::task::JoinError),
 }
 
 pub(super) async fn locate_files(
@@ -161,9 +167,7 @@ fn locate_files_with_limit(
         .components()
         .any(|component| component.as_os_str() == ".git")
     {
-        return Err(FileDiscoveryError::RootInGit(
-            search_root.to_path_buf(),
-        ));
+        return Err(FileDiscoveryError::RootInGit(search_root.to_path_buf()));
     }
 
     let metadata = std::fs::symlink_metadata(search_root).map_err(|source| {
@@ -191,6 +195,8 @@ fn locate_files_with_limit(
         .follow_links(false)
         .filter_entry(|entry| entry.file_name() != ".git");
 
+    attach_ancestor_gitignores(cancel, workspace_root, search_root, &mut builder)?;
+
     collect_files(
         cancel,
         workspace_root,
@@ -199,6 +205,61 @@ fn locate_files_with_limit(
         max_visited_entries,
         builder.build(),
     )
+}
+
+fn attach_ancestor_gitignores(
+    cancel: &CancellationToken,
+    workspace_root: &Path,
+    search_root: &Path,
+    builder: &mut WalkBuilder,
+) -> Result<(), FileDiscoveryError> {
+    if search_root.eq(workspace_root) {
+        return Ok(());
+    }
+
+    let mut ancestors = search_root
+        .ancestors()
+        .skip(1) // exclude search_root itself
+        .take_while(|ancestor| ancestor.starts_with(workspace_root))
+        .collect::<Vec<_>>();
+
+    ancestors.reverse();
+
+    for ancestor in ancestors {
+        if cancel.is_cancelled() {
+            return Err(FileDiscoveryError::Cancelled);
+        }
+
+        let ignore_path = ancestor.join(".gitignore");
+
+        match std::fs::symlink_metadata(&ignore_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(source) => {
+                return Err(FileDiscoveryError::Ignore {
+                    path: ignore_path,
+                    source: source.into(),
+                });
+            }
+            Ok(_) => {}
+        }
+
+        builder.current_dir(ancestor);
+
+        if let Some(source) = builder.add_ignore(&ignore_path) {
+            return Err(FileDiscoveryError::Ignore {
+                path: ignore_path,
+                source,
+            });
+        }
+    }
+
+    if cancel.is_cancelled() {
+        return Err(FileDiscoveryError::Cancelled);
+    }
+
+    Ok(())
 }
 
 fn collect_files(
@@ -327,6 +388,48 @@ mod tests {
             result,
             Err(FileDiscoveryError::TooManyEntries { limit: 1 })
         ));
+    }
+
+    #[test]
+    fn nearer_ancestor_gitignore_overrides_an_outer_rule() {
+        // Arrange
+        let (_root, workspace_root) = workspace();
+        let package_root = workspace_root.join("packages");
+        let search_root = package_root.join("app");
+        fs::create_dir_all(&search_root).unwrap();
+        fs::write(workspace_root.join(".gitignore"), "restored.txt\n").unwrap();
+        fs::write(package_root.join(".gitignore"), "!restored.txt\n").unwrap();
+        fs::write(search_root.join("restored.txt"), "visible").unwrap();
+
+        // Act
+        let files = locate_all(&workspace_root, &search_root).unwrap();
+
+        // Assert
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, search_root.join("restored.txt"));
+    }
+
+    #[test]
+    fn malformed_ancestor_gitignore_fails_with_its_path() {
+        // Arrange
+        let (_root, workspace_root) = workspace();
+        let search_root = workspace_root.join("nested");
+        fs::create_dir(&search_root).unwrap();
+        let ignore_path = workspace_root.join(".gitignore");
+        fs::write(&ignore_path, "*.{rs,txt\n").unwrap();
+        fs::write(search_root.join("visible.txt"), "visible").unwrap();
+
+        // Act
+        let result = locate_all(&workspace_root, &search_root);
+
+        // Assert
+        assert!(
+            matches!(
+                result,
+                Err(FileDiscoveryError::Ignore { ref path, .. }) if path == &ignore_path
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

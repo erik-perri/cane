@@ -125,7 +125,10 @@ impl GlobTool {
             .components()
             .any(|component| component.as_os_str() == ".git")
         {
-            return Err(invalid_input("glob", "path must not be inside a `.git` directory"));
+            return Err(invalid_input(
+                "glob",
+                "path must not be inside a `.git` directory",
+            ));
         }
 
         Ok(PreparedGlob {
