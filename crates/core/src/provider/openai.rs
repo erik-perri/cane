@@ -517,7 +517,7 @@ fn map_stop_reason(finish_reason: Option<&str>) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::ContentBlock::{Text, ToolResult, ToolUse};
+    use crate::message::ContentBlock;
     use serde_json::json;
 
     #[test]
@@ -526,13 +526,13 @@ mod tests {
         let history = vec![
             Message {
                 role: Role::User,
-                content: vec![Text {
+                content: vec![ContentBlock::Text {
                     text: "What's in Cargo.toml?".to_string(),
                 }],
             },
             Message {
                 role: Role::Assistant,
-                content: vec![ToolUse {
+                content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
                     name: "read_file".to_string(),
                     input: json!({"path": "Cargo.toml"}),
@@ -542,12 +542,12 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![
-                    ToolResult(ToolResultData {
+                    ContentBlock::ToolResult(ToolResultData {
                         tool_use_id: "call_abc".to_string(),
                         content: "[package]\nname = \"cane\"".to_string(),
                         is_error: false,
                     }),
-                    ToolResult(ToolResultData {
+                    ContentBlock::ToolResult(ToolResultData {
                         tool_use_id: "call_def".to_string(),
                         content: "file not found: Cargo.lock".to_string(),
                         is_error: true,
@@ -556,7 +556,7 @@ mod tests {
             },
             Message {
                 role: Role::Assistant,
-                content: vec![Text {
+                content: vec![ContentBlock::Text {
                     text: "It declares the cane package.".to_string(),
                 }],
             },
@@ -595,10 +595,10 @@ mod tests {
         let history = vec![Message {
             role: Role::User,
             content: vec![
-                Text {
+                ContentBlock::Text {
                     text: "and also, what about this?".to_string(),
                 },
-                ToolResult(ToolResultData {
+                ContentBlock::ToolResult(ToolResultData {
                     tool_use_id: "call_abc".to_string(),
                     content: "ok".to_string(),
                     is_error: false,
@@ -640,7 +640,7 @@ mod tests {
         let raw_input = "{\"path\": unclosed";
         let history = vec![Message {
             role: Role::Assistant,
-            content: vec![ToolUse {
+            content: vec![ContentBlock::ToolUse {
                 id: "call_bad".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::Value::String(raw_input.to_string()),
@@ -759,7 +759,7 @@ mod tests {
     fn user_history() -> Vec<Message> {
         vec![Message {
             role: Role::User,
-            content: vec![Text {
+            content: vec![ContentBlock::Text {
                 text: "What's in Cargo.toml?".to_string(),
             }],
         }]
@@ -972,7 +972,7 @@ mod tests {
             message,
             Message {
                 role: Role::Assistant,
-                content: vec![Text {
+                content: vec![ContentBlock::Text {
                     text: "Hello world".to_string(),
                 }],
             }
@@ -1024,7 +1024,7 @@ mod tests {
             message,
             Message {
                 role: Role::Assistant,
-                content: vec![ToolUse {
+                content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
                     name: "read_file".to_string(),
                     input: json!({ "path": "Cargo.toml" }),
@@ -1076,7 +1076,7 @@ mod tests {
             message
                 .content
                 .iter()
-                .any(|block| matches!(block, ToolUse { .. }))
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
         );
     }
 
@@ -1116,7 +1116,7 @@ mod tests {
             message,
             Message {
                 role: Role::Assistant,
-                content: vec![ToolUse {
+                content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
                     name: "list_tools".to_string(),
                     input: json!({}),
@@ -1167,7 +1167,7 @@ mod tests {
             message,
             Message {
                 role: Role::Assistant,
-                content: vec![ToolUse {
+                content: vec![ContentBlock::ToolUse {
                     id: "call_bad".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::Value::String("{\"path\": unclosed".to_string()),
@@ -1226,13 +1226,13 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![
-                    ToolUse {
+                    ContentBlock::ToolUse {
                         id: "call_abc".to_string(),
                         name: "read_file".to_string(),
                         input: json!({ "path": "a.txt" }),
                         raw_input: None,
                     },
-                    ToolUse {
+                    ContentBlock::ToolUse {
                         id: "call_def".to_string(),
                         name: "read_file".to_string(),
                         input: json!({ "path": "b.txt" }),
@@ -1289,10 +1289,10 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![
-                    Text {
+                    ContentBlock::Text {
                         text: "Let me check that file.".to_string(),
                     },
-                    ToolUse {
+                    ContentBlock::ToolUse {
                         id: "call_abc".to_string(),
                         name: "read_file".to_string(),
                         input: json!({ "path": "Cargo.toml" }),
@@ -1385,6 +1385,152 @@ mod tests {
         )
         .await
         .expect("stream_message should return promptly on cancellation, not hang");
+
+        // Assert
+        assert!(
+            matches!(result, Err(ProviderError::Cancelled)),
+            "expected ProviderError::Cancelled, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_message_errors_when_a_tool_call_index_exceeds_the_cap() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[
+                stream_chunk(
+                    json!({
+                        "tool_calls": [{
+                            "index": MAX_TOOL_CALLS_PER_TURN,
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{}" }
+                        }]
+                    }),
+                    None,
+                ),
+                stream_chunk(json!({}), Some("tool_calls")),
+            ]),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let error = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap_err();
+
+        // Assert
+        match error {
+            ProviderError::Protocol { detail } => {
+                assert!(detail.contains("exceeds the per-turn cap"), "{detail}");
+            }
+            other => panic!("expected ProviderError::Protocol, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_message_errors_when_a_tool_call_is_missing_its_id_or_name() {
+        // Arrange
+        let missing_id = json!({
+            "tool_calls": [{
+                "index": 0,
+                "function": { "name": "read_file", "arguments": "{}" }
+            }]
+        });
+        let missing_name = json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_abc",
+                "function": { "arguments": "{}" }
+            }]
+        });
+
+        for delta in [missing_id, missing_name] {
+            let server = MockServer::start().await;
+            mount_stream(
+                &server,
+                sse_stream(&[
+                    stream_chunk(delta.clone(), None),
+                    stream_chunk(json!({}), Some("tool_calls")),
+                ]),
+            )
+            .await;
+            let (tx, _rx) = mpsc::channel(16);
+            let cancel = CancellationToken::new();
+
+            // Act
+            let error = test_client(&server)
+                .stream_message(&user_history(), &[], &tx, &cancel)
+                .await
+                .unwrap_err();
+
+            // Assert
+            match error {
+                ProviderError::Protocol { detail } => {
+                    assert_eq!(detail, "tool call id and name cannot be empty", "{delta}");
+                }
+                other => panic!("expected ProviderError::Protocol, got {other:?} for {delta}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_message_errors_when_done_arrives_without_a_finish_reason() {
+        // Arrange
+        let server = MockServer::start().await;
+        // sse_stream appends [DONE], so this is a complete stream in which no
+        // chunk ever carried a finish_reason.
+        mount_stream(
+            &server,
+            sse_stream(&[stream_chunk(
+                json!({ "role": "assistant", "content": "Hel" }),
+                None,
+            )]),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let error = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap_err();
+
+        // Assert
+        match error {
+            ProviderError::Protocol { detail } => {
+                assert!(detail.contains("[DONE]"), "{detail}");
+            }
+            other => panic!("expected ProviderError::Protocol, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_message_returns_cancelled_when_the_event_receiver_is_dropped_mid_stream() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[
+                stream_chunk(json!({ "role": "assistant", "content": "Hello" }), None),
+                stream_chunk(json!({}), Some("stop")),
+            ]),
+        )
+        .await;
+        let (tx, rx) = mpsc::channel(16);
+        drop(rx);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let result = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await;
 
         // Assert
         assert!(
