@@ -123,7 +123,7 @@ fn reject_git_directory(
     {
         return Err(invalid_input(
             tool,
-            "path must not be inside the `.git` directory",
+            "path must not be inside a `.git` directory",
         ));
     }
 

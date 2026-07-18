@@ -149,6 +149,23 @@ fn locate_files_with_limit(
         });
     }
 
+    let relative_search_root =
+        search_root
+            .strip_prefix(workspace_root)
+            .map_err(|_| FileDiscoveryError::InvalidScope {
+                workspace_root: workspace_root.to_path_buf(),
+                search_root: search_root.to_path_buf(),
+            })?;
+
+    if relative_search_root
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        return Err(FileDiscoveryError::RootInGit(
+            search_root.to_path_buf(),
+        ));
+    }
+
     let metadata = std::fs::symlink_metadata(search_root).map_err(|source| {
         FileDiscoveryError::RootMetadata {
             path: search_root.to_path_buf(),
@@ -400,5 +417,23 @@ mod tests {
 
         // Assert
         assert_eq!(names, [".gitignore", "visible.txt"]);
+    }
+
+    #[test]
+    fn discovery_rejects_a_search_root_inside_dot_git() {
+        // Arrange
+        let (_root, workspace_root) = workspace();
+        let search_root = workspace_root.join(".git").join("objects");
+        fs::create_dir_all(&search_root).unwrap();
+        fs::write(search_root.join("object"), "contents").unwrap();
+
+        // Act
+        let result = locate_all(&workspace_root, &search_root);
+
+        // Assert
+        assert!(
+            matches!(result, Err(FileDiscoveryError::RootInGit(ref path)) if path == &search_root),
+            "{result:?}"
+        );
     }
 }

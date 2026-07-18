@@ -759,7 +759,7 @@ mod tests {
             // Assert
             assert_eq!(
                 error,
-                "invalid edit_file input: path must not be inside the `.git` directory"
+                "invalid edit_file input: path must not be inside a `.git` directory"
             );
         }
         assert_eq!(
@@ -812,7 +812,7 @@ mod tests {
         // Assert
         assert_eq!(
             error,
-            "invalid edit_file input: path must not be inside the `.git` directory"
+            "invalid edit_file input: path must not be inside a `.git` directory"
         );
         assert_eq!(fs::read_to_string(target).unwrap(), "original");
     }

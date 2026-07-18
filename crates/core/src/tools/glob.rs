@@ -121,6 +121,13 @@ impl GlobTool {
         let selector =
             FileSelector::glob(&input.pattern).map_err(|error| invalid_input("glob", error))?;
 
+        if resolved_path
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+        {
+            return Err(invalid_input("glob", "path must not be inside a `.git` directory"));
+        }
+
         Ok(PreparedGlob {
             limits: self.limits,
             selector,
@@ -587,6 +594,29 @@ mod tests {
 
         // Assert
         assert!(error.contains("outside workspace root"), "{error}");
+    }
+
+    #[test]
+    fn preparation_rejects_a_search_root_inside_dot_git() {
+        // Arrange
+        let (root, tool) = glob_tool();
+        fs::create_dir_all(root.path().join(".git/objects")).unwrap();
+
+        // Act
+        let result = tool.prepare_glob(json!({
+            "pattern": "*",
+            "path": ".git/objects",
+        }));
+
+        // Assert
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("glob preparation should reject `.git` targets"),
+        };
+        assert_eq!(
+            error,
+            "invalid glob input: path must not be inside a `.git` directory"
+        );
     }
 
     #[test]
