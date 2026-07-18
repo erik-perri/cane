@@ -31,12 +31,12 @@ fn default_read_file_limit() -> u64 {
     DEFAULT_READ_FILE_LIMIT
 }
 
-pub struct ReadFileTool {
+pub(super) struct ReadFileTool {
     workspace: Arc<Workspace>,
 }
 
 impl ReadFileTool {
-    pub fn new(workspace: Arc<Workspace>) -> Self {
+    pub(super) fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
     }
 }

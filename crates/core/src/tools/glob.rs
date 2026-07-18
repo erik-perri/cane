@@ -34,7 +34,7 @@ struct GlobLimits {
     output_bytes: usize,
 }
 
-pub struct GlobTool {
+pub(super) struct GlobTool {
     limits: GlobLimits,
     workspace: Arc<Workspace>,
 }
@@ -89,7 +89,7 @@ impl Tool for GlobTool {
 }
 
 impl GlobTool {
-    pub fn new(workspace: Arc<Workspace>) -> Self {
+    pub(super) fn new(workspace: Arc<Workspace>) -> Self {
         Self {
             limits: GlobLimits {
                 matches: MAX_GLOB_MATCHES,

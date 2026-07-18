@@ -17,12 +17,12 @@ struct WriteFileInput {
     content: String,
 }
 
-pub struct WriteFileTool {
+pub(super) struct WriteFileTool {
     workspace: Arc<Workspace>,
 }
 
 impl WriteFileTool {
-    pub fn new(workspace: Arc<Workspace>) -> Self {
+    pub(super) fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
     }
 }

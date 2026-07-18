@@ -12,18 +12,18 @@ mod write_file;
 
 use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
-use crate::tools::glob::GlobTool;
-pub use edit_file::EditFileTool;
-pub use read_file::ReadFileTool;
-pub use write_file::WriteFileTool;
+use edit_file::EditFileTool;
+use glob::GlobTool;
+use read_file::ReadFileTool;
+use write_file::WriteFileTool;
 
-pub struct ToolSet {
+pub(crate) struct ToolSet {
     tool_definitions: Vec<ToolDefinition>,
     tools: Vec<Box<dyn Tool>>,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum ToolExecutionError {
+pub(crate) enum ToolExecutionError {
     Cancelled,
     ToolError(String),
 }
@@ -35,7 +35,7 @@ impl From<String> for ToolExecutionError {
 }
 
 impl ToolSet {
-    pub fn new(workspace: Arc<Workspace>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>) -> Self {
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(EditFileTool::new(Arc::clone(&workspace))),
             Box::new(GlobTool::new(Arc::clone(&workspace))),
@@ -51,11 +51,11 @@ impl ToolSet {
         }
     }
 
-    pub fn definitions(&self) -> &[ToolDefinition] {
+    pub(crate) fn definitions(&self) -> &[ToolDefinition] {
         &self.tool_definitions
     }
 
-    pub fn locate(&self, name: &str) -> Result<&dyn Tool, String> {
+    pub(crate) fn locate(&self, name: &str) -> Result<&dyn Tool, String> {
         self.tools
             .iter()
             .map(Box::as_ref)
@@ -76,21 +76,21 @@ impl ToolSet {
 
 /// A tool the model can call.
 #[derive(Clone, Debug)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
+pub(crate) struct ToolDefinition {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) input_schema: Value,
 }
 
 #[async_trait::async_trait]
-pub trait Tool: Send + Sync {
+pub(crate) trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 
     async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String>;
 }
 
 #[async_trait]
-pub trait PreparedInvocation: Send {
+pub(crate) trait PreparedInvocation: Send {
     fn approval_requirement(&self) -> ApprovalRequirement;
 
     async fn execute(
@@ -144,7 +144,7 @@ fn background_task_failed(operation: &str, path: &str, error: impl std::fmt::Dis
 
 #[cfg(test)]
 #[async_trait]
-pub(crate) trait ToolTestExt: Tool {
+trait ToolTestExt: Tool {
     async fn execute(&self, input: Value) -> Result<String, String>;
 }
 

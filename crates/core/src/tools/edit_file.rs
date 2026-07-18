@@ -22,12 +22,12 @@ struct EditFileInput {
     expected_occurrences: Option<usize>,
 }
 
-pub struct EditFileTool {
+pub(super) struct EditFileTool {
     workspace: Arc<Workspace>,
 }
 
 impl EditFileTool {
-    pub fn new(workspace: Arc<Workspace>) -> Self {
+    pub(super) fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
     }
 }
