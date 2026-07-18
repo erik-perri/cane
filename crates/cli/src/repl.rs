@@ -147,7 +147,7 @@ mod tests {
     use super::*;
     use cane_core::StopReason;
     use std::io::Cursor;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     #[tokio::test]
     async fn run_displays_tool_errors_but_hides_successful_tool_output() {
@@ -218,5 +218,238 @@ mod tests {
             "> \n[tool: read_file null]\n\n[tool: read_file null]\n[tool error: access denied]\nI could not read it.\n> "
         );
         assert!(!output.contains("secret successful output"));
+    }
+
+    #[tokio::test]
+    async fn run_displays_an_approval_request_and_sends_allow_through_its_responder() {
+        // Arrange
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (event_tx, events) = mpsc::channel(8);
+        let agent = AgentHandle {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let frontend = tokio::spawn(async move {
+            command_rx.recv().await.unwrap();
+            let (respond_to, decision_rx) = oneshot::channel();
+            event_tx
+                .send(AgentEvent::ApprovalRequest {
+                    id: "call_abc".to_string(),
+                    input: Default::default(),
+                    name: "write_file".to_string(),
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            assert_eq!(decision_rx.await.unwrap(), ApprovalDecision::Allow);
+            event_tx
+                .send(AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                })
+                .await
+                .unwrap();
+        });
+        let input = Cursor::new("write the file\ny\n/quit\n");
+        let mut output = Vec::new();
+
+        // Act
+        run(agent, input, &mut output).await.unwrap();
+        frontend.await.unwrap();
+
+        // Assert
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output,
+            "> \n[approval request: write_file null] [y,n,a]\n> \n> "
+        );
+    }
+
+    #[tokio::test]
+    async fn run_writes_agent_errors_to_the_output() {
+        // Arrange
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (event_tx, events) = mpsc::channel(8);
+        let agent = AgentHandle {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let frontend = tokio::spawn(async move {
+            command_rx.recv().await.unwrap();
+            event_tx
+                .send(AgentEvent::Error("provider fell over".to_string()))
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Failed,
+                })
+                .await
+                .unwrap();
+        });
+        let input = Cursor::new("hello\n/quit\n");
+        let mut output = Vec::new();
+
+        // Act
+        run(agent, input, &mut output).await.unwrap();
+        frontend.await.unwrap();
+
+        // Assert
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, "> \nerror: provider fell over\n\n> ");
+    }
+
+    #[tokio::test]
+    async fn run_returns_after_a_cancelled_turn_without_reading_more_input() {
+        // Arrange
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (event_tx, events) = mpsc::channel(8);
+        let agent = AgentHandle {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let frontend = tokio::spawn(async move {
+            command_rx.recv().await.unwrap();
+            event_tx
+                .send(AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Cancelled,
+                })
+                .await
+                .unwrap();
+        });
+        let input = Cursor::new("start something\nnever read\n");
+        let mut output = Vec::new();
+
+        // Act
+        run(agent, input, &mut output).await.unwrap();
+        frontend.await.unwrap();
+
+        // Assert
+        // One prompt, then the turn's closing newline. The second input line
+        // was never consumed.
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, "> \n");
+    }
+
+    #[tokio::test]
+    async fn run_exits_cleanly_when_the_agent_command_channel_is_closed() {
+        // Arrange
+        let (commands, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        let (_event_tx, events) = mpsc::channel(8);
+        let agent = AgentHandle {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let input = Cursor::new("hello\n");
+        let mut output = Vec::new();
+
+        // Act
+        let result = run(agent, input, &mut output).await;
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(String::from_utf8(output).unwrap(), "> ");
+    }
+
+    #[test]
+    fn read_decision_returns_deny_with_the_entered_reason() {
+        // Arrange
+        let mut input = Cursor::new("n\nit would clobber my changes\n");
+        let mut output = Vec::new();
+
+        // Act
+        let decision = read_decision(&mut input, &mut output).unwrap();
+
+        // Assert
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny {
+                reason: "it would clobber my changes".to_string()
+            }
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), "> \nreason:\n> ");
+    }
+
+    #[test]
+    fn read_decision_treats_an_empty_decision_as_deny() {
+        // Arrange
+        let mut input = Cursor::new("\nnot like that\n");
+        let mut output = Vec::new();
+
+        // Act
+        let decision = read_decision(&mut input, &mut output).unwrap();
+
+        // Assert
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny {
+                reason: "not like that".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn read_decision_accepts_always_allow_case_insensitively_with_whitespace() {
+        // Arrange
+        let mut input = Cursor::new("  A  \n");
+        let mut output = Vec::new();
+
+        // Act
+        let decision = read_decision(&mut input, &mut output).unwrap();
+
+        // Assert
+        assert_eq!(decision, ApprovalDecision::AlwaysAllowSession);
+    }
+
+    #[test]
+    fn read_decision_reprompts_after_unrecognized_input() {
+        // Arrange
+        let mut input = Cursor::new("maybe\ny\n");
+        let mut output = Vec::new();
+
+        // Act
+        let decision = read_decision(&mut input, &mut output).unwrap();
+
+        // Assert
+        assert_eq!(decision, ApprovalDecision::Allow);
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output.matches("> ").count(),
+            2,
+            "junk input must reprompt, not fall through: {output:?}"
+        );
+    }
+
+    #[test]
+    fn read_decision_errors_on_eof_before_a_decision() {
+        // Arrange
+        let mut input = Cursor::new("");
+        let mut output = Vec::new();
+
+        // Act
+        let result = read_decision(&mut input, &mut output);
+
+        // Assert
+        assert_eq!(result.unwrap_err().to_string(), "eof");
+    }
+
+    #[test]
+    fn read_decision_errors_on_eof_before_a_denial_reason() {
+        // Arrange
+        let mut input = Cursor::new("n\n");
+        let mut output = Vec::new();
+
+        // Act
+        let result = read_decision(&mut input, &mut output);
+
+        // Assert
+        assert_eq!(result.unwrap_err().to_string(), "eof");
+        assert!(String::from_utf8(output).unwrap().contains("reason:"));
     }
 }
