@@ -4,7 +4,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 mod edit_file;
+mod file_discovery;
 mod glob;
+mod path_display;
 mod read_file;
 mod write_file;
 

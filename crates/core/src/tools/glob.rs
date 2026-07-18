@@ -1,16 +1,18 @@
 use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
-use crate::tools::{
-    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, background_task_failed,
-    invalid_input, operation_failed,
+#[cfg(test)]
+use crate::tools::file_discovery::locate_files_sync;
+use crate::tools::file_discovery::{FileDiscoveryError, FileSelector, LocatedFile, locate_files};
+use crate::tools::path_display::{
+    PathDisplayError, RenderedPath, compare_located_files, render_workspace_path,
 };
-use globset::{GlobBuilder, GlobMatcher};
-use ignore::{DirEntry, WalkBuilder};
+use crate::tools::{
+    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, invalid_input, operation_failed,
+};
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -21,8 +23,6 @@ struct GlobInput {
     pattern: String,
 }
 
-/// The maximum number of nodes to visit when searching for files.
-const MAX_GLOB_VISITED_NODES: usize = 100000;
 /// Most matches a single glob call will return; the newest are kept.
 const MAX_GLOB_MATCHES: usize = 250;
 /// The maximum size (in bytes) allowed to return for glob lists.
@@ -32,12 +32,11 @@ const MAX_GLOB_OUTPUT_BYTES: usize = 32 * 1024;
 struct GlobLimits {
     matches: usize,
     output_bytes: usize,
-    visited_nodes: usize,
 }
 
 pub struct GlobTool {
-    workspace: Arc<Workspace>,
     limits: GlobLimits,
+    workspace: Arc<Workspace>,
 }
 
 #[async_trait::async_trait]
@@ -92,12 +91,11 @@ impl Tool for GlobTool {
 impl GlobTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self {
-            workspace,
             limits: GlobLimits {
                 matches: MAX_GLOB_MATCHES,
                 output_bytes: MAX_GLOB_OUTPUT_BYTES,
-                visited_nodes: MAX_GLOB_VISITED_NODES,
             },
+            workspace,
         }
     }
 
@@ -120,20 +118,15 @@ impl GlobTool {
             None => (".".to_owned(), self.workspace.root().to_path_buf()),
         };
 
-        let matcher = GlobBuilder::new(&input.pattern)
-            .backslash_escape(true)
-            .case_insensitive(false)
-            .literal_separator(true)
-            .build()
-            .map_err(|error| invalid_input("glob", error))?
-            .compile_matcher();
+        let selector =
+            FileSelector::glob(&input.pattern).map_err(|error| invalid_input("glob", error))?;
 
         Ok(PreparedGlob {
             limits: self.limits,
-            matcher,
+            selector,
             requested_path,
-            resolved_path,
-            workspace_path: self.workspace.root().to_path_buf(),
+            search_root: resolved_path,
+            workspace_root: self.workspace.root().to_path_buf(),
         })
     }
 }
@@ -141,10 +134,10 @@ impl GlobTool {
 #[derive(Debug)]
 struct PreparedGlob {
     limits: GlobLimits,
-    matcher: GlobMatcher,
     requested_path: String,
-    resolved_path: PathBuf,
-    workspace_path: PathBuf,
+    search_root: PathBuf,
+    selector: FileSelector,
+    workspace_root: PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -163,28 +156,22 @@ impl PreparedInvocation for PreparedGlob {
 
         let Self {
             limits,
-            matcher,
+            selector,
             requested_path,
-            resolved_path,
-            workspace_path,
+            search_root,
+            workspace_root,
         } = *self;
 
-        let result = tokio::task::spawn_blocking(move || {
-            glob_files(
-                cancel.clone(),
-                &matcher,
-                &resolved_path,
-                &workspace_path,
-                limits.visited_nodes,
-                limits.matches,
-            )
-        })
+        let files = match locate_files(
+            cancel.clone(),
+            workspace_root.clone(),
+            search_root,
+            selector,
+        )
         .await
-        .map_err(|error| background_task_failed("glob", &requested_path, error))?;
-
-        let result = match result {
-            Ok(paths) => paths,
-            Err(GlobError::Cancelled) => {
+        {
+            Ok(files) => files,
+            Err(FileDiscoveryError::Cancelled) => {
                 return Err(ToolExecutionError::Cancelled);
             }
             Err(error) => {
@@ -192,41 +179,34 @@ impl PreparedInvocation for PreparedGlob {
             }
         };
 
+        if cancel.is_cancelled() {
+            return Err(ToolExecutionError::Cancelled);
+        }
+
+        let result = build_glob_result(files, &workspace_root, limits.matches)
+            .map_err(|error| operation_failed("glob", &requested_path, error))?;
+
+        if cancel.is_cancelled() {
+            return Err(ToolExecutionError::Cancelled);
+        }
+
         Ok(format_result_output(result, limits.output_bytes))
     }
 }
 
 #[derive(Debug, Error)]
 enum GlobError {
-    #[error("glob was cancelled")]
-    Cancelled,
+    #[error(transparent)]
+    Discovery(#[from] FileDiscoveryError),
 
-    #[error("failed to get metadata for root path `{path}`: {source}")]
-    RootMetadata {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[error("root path is not a directory: {0}")]
-    RootNotDirectory(PathBuf),
-
-    #[error(
-        "glob traversal exceeded the {limit}-entry limit; \
-       choose a narrower search path"
-    )]
-    TooManyFiles { limit: usize },
-
-    #[error("failed while traversing files: {0}")]
-    Traversal(#[from] ignore::Error),
-
-    #[error("walked path `{path}` was outside expected root `{root}`")]
-    UnexpectedPath { path: PathBuf, root: PathBuf },
+    #[error(transparent)]
+    PathDisplay(#[from] PathDisplayError),
 }
 
 #[derive(Debug)]
 struct GlobMatch {
-    modified: Option<SystemTime>,
-    output_path: String,
+    file: LocatedFile,
+    rendered_path: RenderedPath,
 }
 
 #[derive(Debug, PartialEq)]
@@ -238,66 +218,36 @@ enum GlobResult {
     },
 }
 
-fn glob_files(
-    cancel: CancellationToken,
-    matcher: &GlobMatcher,
-    resolved_path: &Path,
-    workspace_path: &Path,
-    max_visited_nodes: usize,
+fn build_glob_result(
+    files: Vec<LocatedFile>,
+    workspace_root: &std::path::Path,
     max_matches: usize,
 ) -> Result<GlobResult, GlobError> {
-    let metadata = std::fs::metadata(resolved_path).map_err(|source| GlobError::RootMetadata {
-        path: resolved_path.to_path_buf(),
-        source,
-    })?;
+    let mut matches = files
+        .into_iter()
+        .map(|file| {
+            let rendered_path = render_workspace_path(workspace_root, &file.path)?;
+            Ok(GlobMatch {
+                file,
+                rendered_path,
+            })
+        })
+        .collect::<Result<Vec<_>, PathDisplayError>>()?;
 
-    if !metadata.is_dir() {
-        return Err(GlobError::RootNotDirectory(resolved_path.to_path_buf()));
-    }
-
-    let mut builder = WalkBuilder::new(resolved_path);
-
-    builder
-        .hidden(false)
-        .parents(false)
-        .ignore(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .add_custom_ignore_filename(".gitignore")
-        .follow_links(false)
-        .filter_entry(|entry| entry.file_name() != ".git");
-
-    let mut matches = collect_matches(
-        &cancel,
-        matcher,
-        resolved_path,
-        workspace_path,
-        max_visited_nodes,
-        builder.build(),
-    )?;
-
-    if cancel.is_cancelled() {
-        return Err(GlobError::Cancelled);
-    }
-
-    // Sort the list by mtime
     matches.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| left.output_path.cmp(&right.output_path))
+        compare_located_files(
+            &left.file,
+            &left.rendered_path,
+            &right.file,
+            &right.rendered_path,
+        )
     });
-
-    if cancel.is_cancelled() {
-        return Err(GlobError::Cancelled);
-    }
 
     let found_paths = matches.len();
     let returned_paths: Vec<_> = matches
         .into_iter()
         .take(max_matches)
-        .map(|m| m.output_path)
+        .map(|glob_match| glob_match.rendered_path.text)
         .collect();
 
     if found_paths > returned_paths.len() {
@@ -308,77 +258,6 @@ fn glob_files(
     }
 
     Ok(GlobResult::Full(returned_paths))
-}
-
-/// Walk `entries`, collecting every regular file whose root-relative path
-/// matches. The first walker error fails the whole call so an incomplete
-/// listing is never returned as if it were complete.
-fn collect_matches(
-    cancel: &CancellationToken,
-    matcher: &GlobMatcher,
-    resolved_path: &Path,
-    workspace_path: &Path,
-    max_visited_nodes: usize,
-    entries: impl Iterator<Item = Result<DirEntry, ignore::Error>>,
-) -> Result<Vec<GlobMatch>, GlobError> {
-    let mut matches = Vec::new();
-    let mut visited_nodes = 0;
-
-    for entry_result in entries {
-        if cancel.is_cancelled() {
-            return Err(GlobError::Cancelled);
-        }
-
-        let entry = entry_result?;
-
-        // We don't filter out the root so WalkBuilder can load its .gitignore.
-        // The root itself is not a visited search entry or a possible match.
-        if entry.depth() == 0 {
-            continue;
-        }
-
-        visited_nodes += 1;
-        if visited_nodes > max_visited_nodes {
-            return Err(GlobError::TooManyFiles {
-                limit: max_visited_nodes,
-            });
-        }
-
-        // Directories and symlinks are excluded.
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-
-        // Match relative to the requested search root, not against an absolute path.
-        let matching_path =
-            entry
-                .path()
-                .strip_prefix(resolved_path)
-                .map_err(|_| GlobError::UnexpectedPath {
-                    path: entry.path().to_path_buf(),
-                    root: resolved_path.to_path_buf(),
-                })?;
-
-        if matcher.is_match(matching_path) {
-            // Results should be relative to the workspace.
-            let result_path = entry.path().strip_prefix(workspace_path).map_err(|_| {
-                GlobError::UnexpectedPath {
-                    path: entry.path().to_path_buf(),
-                    root: workspace_path.to_path_buf(),
-                }
-            })?;
-
-            matches.push(GlobMatch {
-                modified: entry
-                    .metadata()
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok()),
-                output_path: normalize_workspace_path(result_path),
-            });
-        }
-    }
-
-    Ok(matches)
 }
 
 fn format_result_output(result: GlobResult, max_bytes: usize) -> String {
@@ -444,20 +323,14 @@ fn format_result_output(result: GlobResult, max_bytes: usize) -> String {
     }
 }
 
-fn normalize_workspace_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::ToolTestExt;
     use serde_json::json;
     use std::fs;
-    use std::time::Duration;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
     use tempfile::{TempDir, tempdir};
 
     fn glob_tool() -> (TempDir, GlobTool) {
@@ -471,7 +344,6 @@ mod tests {
         GlobLimits {
             matches: usize::MAX,
             output_bytes: usize::MAX,
-            visited_nodes: usize::MAX,
         }
     }
 
@@ -483,14 +355,14 @@ mod tests {
     ) -> Result<GlobResult, GlobError> {
         let prepared = tool.prepare_glob(input).unwrap();
 
-        glob_files(
-            cancel,
-            &prepared.matcher,
-            &prepared.resolved_path,
-            &prepared.workspace_path,
-            limits.visited_nodes,
-            limits.matches,
-        )
+        let files = locate_files_sync(
+            &cancel,
+            &prepared.workspace_root,
+            &prepared.search_root,
+            &prepared.selector,
+        )?;
+
+        build_glob_result(files, &prepared.workspace_root, limits.matches)
     }
 
     fn set_mtime(path: &Path, seconds_after_epoch: u64) {
@@ -508,7 +380,7 @@ mod tests {
         let result = tool.prepare_glob(json!({ "pattern": "*" })).unwrap();
 
         // Assert
-        assert_eq!(result.resolved_path, tool.workspace.root());
+        assert_eq!(result.search_root, tool.workspace.root());
         assert_eq!(result.requested_path, ".");
     }
 
@@ -733,7 +605,7 @@ mod tests {
         // Assert
         assert!(matches!(
             result,
-            Err(GlobError::RootMetadata { source, .. })
+            Err(GlobError::Discovery(FileDiscoveryError::RootMetadata { source, .. }))
                 if source.kind() == std::io::ErrorKind::NotFound
         ));
     }
@@ -753,30 +625,11 @@ mod tests {
         );
 
         // Assert
-        assert!(
-            matches!(result, Err(GlobError::RootNotDirectory(path)) if path.ends_with("root.txt"))
-        );
-    }
-
-    #[test]
-    fn traversal_limit_is_an_error_with_the_injected_limit() {
-        // Arrange
-        let (root, tool) = glob_tool();
-        fs::write(root.path().join("one.rs"), "one").unwrap();
-        fs::write(root.path().join("two.rs"), "two").unwrap();
-        let mut limits = generous_limits();
-        limits.visited_nodes = 1;
-
-        // Act
-        let result = run_glob(
-            &tool,
-            json!({ "pattern": "*" }),
-            CancellationToken::new(),
-            limits,
-        );
-
-        // Assert
-        assert!(matches!(result, Err(GlobError::TooManyFiles { limit: 1 })));
+        assert!(matches!(
+            result,
+            Err(GlobError::Discovery(FileDiscoveryError::RootNotDirectory(path)))
+                if path.ends_with("root.txt")
+        ));
     }
 
     #[test]
@@ -834,37 +687,6 @@ mod tests {
 
         // Assert
         assert_eq!(output, "main.rs");
-    }
-
-    #[test]
-    fn gitignore_rules_start_at_the_search_root() {
-        // Arrange
-        let (root, tool) = glob_tool();
-        let search_root = root.path().join("search");
-        fs::create_dir(&search_root).unwrap();
-        fs::write(root.path().join(".gitignore"), "parent-ignored.txt\n").unwrap();
-        fs::write(search_root.join(".gitignore"), "local-ignored.txt\n").unwrap();
-        fs::write(search_root.join("parent-ignored.txt"), "visible").unwrap();
-        fs::write(search_root.join("local-ignored.txt"), "ignored").unwrap();
-        fs::write(search_root.join("visible.txt"), "visible").unwrap();
-
-        // Act
-        let result = run_glob(
-            &tool,
-            json!({ "pattern": "*.txt", "path": "search" }),
-            CancellationToken::new(),
-            generous_limits(),
-        )
-        .unwrap();
-
-        // Assert
-        let GlobResult::Full(paths) = result else {
-            panic!("generous limits should not truncate this result");
-        };
-        assert!(paths.contains(&"search/parent-ignored.txt".to_string()));
-        assert!(paths.contains(&"search/visible.txt".to_string()));
-        assert!(!paths.contains(&"search/local-ignored.txt".to_string()));
-        assert_eq!(paths.len(), 2);
     }
 
     #[test]
@@ -1119,69 +941,5 @@ mod tests {
 
         // Assert
         assert_eq!(result, GlobResult::Full(vec![]));
-    }
-
-    #[test]
-    fn unreadable_directories_fail_instead_of_returning_partial_results() {
-        // Arrange
-        let (root, tool) = glob_tool();
-        fs::write(root.path().join("a.txt"), "a").unwrap();
-        fs::write(root.path().join("b.txt"), "b").unwrap();
-        let prepared = tool.prepare_glob(json!({ "pattern": "*.txt" })).unwrap();
-
-        // Both matches are visited before the error, as when a walker fails on
-        // an unreadable directory after listing readable siblings.
-        let unreadable = ignore::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "permission denied",
-        ));
-        let entries = WalkBuilder::new(&prepared.resolved_path)
-            .build()
-            .chain(std::iter::once(Err(unreadable)));
-
-        // Act
-        let result = collect_matches(
-            &CancellationToken::new(),
-            &prepared.matcher,
-            &prepared.resolved_path,
-            &prepared.workspace_path,
-            usize::MAX,
-            entries,
-        );
-
-        // Assert
-        assert!(matches!(result, Err(GlobError::Traversal(_))), "{result:?}");
-    }
-
-    #[test]
-    fn cancellation_during_a_walk_stops_promptly() {
-        // Arrange
-        let (root, tool) = glob_tool();
-        fs::write(root.path().join("a.txt"), "a").unwrap();
-        fs::write(root.path().join("b.txt"), "b").unwrap();
-        let prepared = tool.prepare_glob(json!({ "pattern": "*.txt" })).unwrap();
-
-        let mut walked = 0;
-        let cancel = CancellationToken::new();
-        let entries = WalkBuilder::new(&prepared.resolved_path)
-            .build()
-            .inspect(|_entry| {
-                walked += 1;
-                cancel.cancel();
-            });
-
-        // Act
-        let result = collect_matches(
-            &cancel,
-            &prepared.matcher,
-            &prepared.resolved_path,
-            &prepared.workspace_path,
-            usize::MAX,
-            entries,
-        );
-
-        // Assert
-        assert_eq!(walked, 1);
-        assert!(matches!(result, Err(GlobError::Cancelled)), "{result:?}");
     }
 }
