@@ -47,14 +47,19 @@ impl Tool for ReadFileTool {
         ToolDefinition {
             name: "read_file".to_string(),
             description: format!(
-                "Read a text file from the local filesystem. Returns the requested lines as raw text. Files larger than {MAX_FILE_SIZE_MIB} MiB cannot be read."
+                "Read a UTF-8 text file from the workspace. Returns the requested line \
+                 range as raw text. At most {MAX_READ_FILE_LIMIT} lines are returned per \
+                 call; use offset and limit to page through larger files. Bytes that are \
+                 not valid UTF-8 are replaced with replacement characters. Files larger \
+                 than {MAX_FILE_SIZE_MIB} MiB cannot be read."
             ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to read."
+                        "description": "Path to the file to read, relative to the \
+                            workspace root (or an absolute path inside the workspace)."
                     },
                     "offset": {
                         "type": "integer",

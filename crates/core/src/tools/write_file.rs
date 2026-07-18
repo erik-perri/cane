@@ -32,15 +32,17 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".to_string(),
-            description:
-                "Create or overwrite a file in the workspace, creating missing parent directories."
-                    .to_string(),
+            description: "Create or overwrite a file in the workspace, creating missing \
+                 parent directories. Overwriting replaces the entire file; use edit_file \
+                 to change part of an existing file."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to write."
+                        "description": "Path to the file to write, relative to the \
+                            workspace root (or an absolute path inside the workspace)."
                     },
                     "content": {
                         "type": "string",

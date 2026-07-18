@@ -37,14 +37,19 @@ impl Tool for EditFileTool {
         ToolDefinition {
             name: "edit_file".to_string(),
             description: format!(
-                "Replace an exact string in a UTF-8 text file in the workspace. By default, the string must occur exactly once. Files larger than {MAX_FILE_SIZE_MIB} MiB cannot be edited."
+                "Replace an exact string in a UTF-8 text file in the workspace. By \
+                 default old_str must occur exactly once; set expected_occurrences to \
+                 replace that many matches at once. The match is exact, including \
+                 whitespace and indentation. Files larger than {MAX_FILE_SIZE_MIB} MiB \
+                 cannot be edited."
             ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to edit."
+                        "description": "Path to the file to edit, relative to the \
+                            workspace root (or an absolute path inside the workspace)."
                     },
                     "old_str": {
                         "type": "string",
@@ -245,17 +250,27 @@ fn write_atomically(path: &Path, contents: &str, permissions: Permissions) -> io
 fn format_edit_error(path: &str, error: EditFileError) -> String {
     match error {
         EditFileError::Read(error) => operation_failed("read", path, error),
-        EditFileError::TooLarge { size } => format!(
-            "file `{path}` is {size} bytes, which exceeds the {MAX_FILE_SIZE_BYTES} byte edit limit"
+        EditFileError::TooLarge { size } => operation_failed(
+            "edit",
+            path,
+            format_args!(
+                "file is {size} bytes, which exceeds the {MAX_FILE_SIZE_BYTES} byte edit limit"
+            ),
         ),
-        EditFileError::InvalidUtf8 => format!("file `{path}` is not valid UTF-8"),
-        EditFileError::NoMatch => format!("old_str not found in `{path}`"),
-        EditFileError::NonUnique { found } => format!(
-            "old_str matches {found} times in `{path}`; include more surrounding context to make it unique"
+        EditFileError::InvalidUtf8 => operation_failed("edit", path, "file is not valid UTF-8"),
+        EditFileError::NoMatch => operation_failed("edit", path, "old_str not found"),
+        EditFileError::NonUnique { found } => operation_failed(
+            "edit",
+            path,
+            format_args!(
+                "old_str matches {found} times; include more surrounding context to make it unique"
+            ),
         ),
-        EditFileError::UnexpectedOccurrences { expected, found } => {
-            format!("old_str matches {found} times in `{path}`; expected {expected}")
-        }
+        EditFileError::UnexpectedOccurrences { expected, found } => operation_failed(
+            "edit",
+            path,
+            format_args!("old_str matches {found} times, expected {expected}"),
+        ),
         EditFileError::Write(error) => operation_failed("write", path, error),
     }
 }
@@ -502,7 +517,7 @@ mod tests {
             .unwrap_err();
 
         // Assert
-        assert_eq!(error, "old_str not found in `target.txt`");
+        assert_eq!(error, "failed to edit `target.txt`: old_str not found");
         assert_eq!(fs::read_to_string(target).unwrap(), "original");
     }
 
@@ -526,7 +541,7 @@ mod tests {
         // Assert
         assert_eq!(
             error,
-            "old_str matches 3 times in `target.txt`; include more surrounding context to make it unique"
+            "failed to edit `target.txt`: old_str matches 3 times; include more surrounding context to make it unique"
         );
         assert_eq!(fs::read_to_string(target).unwrap(), "old and old and old");
     }
@@ -573,7 +588,10 @@ mod tests {
             .unwrap_err();
 
         // Assert
-        assert_eq!(error, "old_str matches 2 times in `target.txt`; expected 3");
+        assert_eq!(
+            error,
+            "failed to edit `target.txt`: old_str matches 2 times, expected 3"
+        );
         assert_eq!(fs::read_to_string(target).unwrap(), "old and old");
     }
 
@@ -596,7 +614,10 @@ mod tests {
             .unwrap_err();
 
         // Assert
-        assert_eq!(error, "old_str matches 2 times in `target.txt`; expected 1");
+        assert_eq!(
+            error,
+            "failed to edit `target.txt`: old_str matches 2 times, expected 1"
+        );
         assert_eq!(fs::read_to_string(target).unwrap(), "old and old");
     }
 
@@ -729,7 +750,10 @@ mod tests {
             .unwrap_err();
 
         // Assert
-        assert_eq!(error, "file `binary.dat` is not valid UTF-8");
+        assert_eq!(
+            error,
+            "failed to edit `binary.dat`: file is not valid UTF-8"
+        );
         assert_eq!(fs::read(target).unwrap(), original);
     }
 
@@ -826,7 +850,7 @@ mod tests {
         assert_eq!(
             error,
             format!(
-                "file `huge.txt` is {} bytes, which exceeds the {MAX_FILE_SIZE_BYTES} byte edit limit",
+                "failed to edit `huge.txt`: file is {} bytes, which exceeds the {MAX_FILE_SIZE_BYTES} byte edit limit",
                 MAX_FILE_SIZE_BYTES + 1
             )
         );

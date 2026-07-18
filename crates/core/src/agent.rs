@@ -47,7 +47,7 @@ pub fn spawn_agent(provider: ProviderConfig, workspace: Workspace) -> AgentHandl
 
         match session.run().await {
             Ok(()) | Err(AgentExit::Disconnected) => {
-                // Clean shutdown: nothing to say, no one to say it to.
+                // Clean shutdown; the frontend is already gone.
             }
             Err(AgentExit::Cancelled) => {
                 // Already surfaced as Error + TurnComplete inside the loop.

@@ -208,8 +208,8 @@ impl OpenAiClient {
                                 tokio::select! {
                                     _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
                                     sent = events.send(AgentEvent::TextDelta(delta)) => {
-                                        // A dropped receiver means the frontend is gone; stop
-                                        // pulling the stream for nobody.
+                                        // A dropped receiver means the frontend is gone;
+                                        // stop pulling the stream.
                                         if sent.is_err() {
                                             return Err(ProviderError::Cancelled);
                                         }
@@ -444,7 +444,7 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
 /// an empty string for a no-parameter tool call. That's a well-formed call,
 /// not an error, so it maps to `{}`. A non-empty string that doesn't parse is
 /// kept raw so the tool layer can reject it with context instead of the turn
-/// failing here: model mistakes are model feedback, not protocol failures.
+/// failing here.
 fn parse_tool_arguments(raw: String) -> (serde_json::Value, Option<String>) {
     if raw.trim().is_empty() {
         return (serde_json::json!({}), None);

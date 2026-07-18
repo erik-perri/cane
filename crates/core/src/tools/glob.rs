@@ -51,7 +51,7 @@ impl Tool for GlobTool {
                  to read_file or edit_file. Only files are listed, never directories or \
                  symlinks. Files ignored by .gitignore are excluded, .git is skipped, and \
                  hidden files are included. At most {MAX_GLOB_MATCHES} paths are returned; \
-                 a truncated result says so explicitly — narrow the pattern and search \
+                 a truncated result says so explicitly; narrow the pattern and search \
                  again. Finding no matches is a normal result, not an error. File names \
                  that are not valid UTF-8 are displayed with replacement characters and \
                  may not open by that displayed name."
@@ -311,8 +311,8 @@ fn glob_files(
 }
 
 /// Walk `entries`, collecting every regular file whose root-relative path
-/// matches. The first walker error fails the whole call: an unfinished walk
-/// has no honest partial result.
+/// matches. The first walker error fails the whole call so an incomplete
+/// listing is never returned as if it were complete.
 fn collect_matches(
     cancel: &CancellationToken,
     matcher: &GlobMatcher,
