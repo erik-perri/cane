@@ -5,7 +5,7 @@ use crate::tools::{
     invalid_input, operation_failed,
 };
 use globset::{GlobBuilder, GlobMatcher};
-use ignore::WalkBuilder;
+use ignore::{DirEntry, WalkBuilder};
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -269,10 +269,63 @@ fn glob_files(
         .follow_links(false)
         .filter_entry(|entry| entry.file_name() != ".git");
 
+    let mut matches = collect_matches(
+        &cancel,
+        matcher,
+        resolved_path,
+        workspace_path,
+        max_visited_nodes,
+        builder.build(),
+    )?;
+
+    if cancel.is_cancelled() {
+        return Err(GlobError::Cancelled);
+    }
+
+    // Sort the list by mtime
+    matches.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.output_path.cmp(&right.output_path))
+    });
+
+    if cancel.is_cancelled() {
+        return Err(GlobError::Cancelled);
+    }
+
+    let found_paths = matches.len();
+    let returned_paths: Vec<_> = matches
+        .into_iter()
+        .take(max_matches)
+        .map(|m| m.output_path)
+        .collect();
+
+    if found_paths > returned_paths.len() {
+        return Ok(GlobResult::Truncated {
+            paths: returned_paths,
+            total_matches: found_paths,
+        });
+    }
+
+    Ok(GlobResult::Full(returned_paths))
+}
+
+/// Walk `entries`, collecting every regular file whose root-relative path
+/// matches. The first walker error fails the whole call: an unfinished walk
+/// has no honest partial result.
+fn collect_matches(
+    cancel: &CancellationToken,
+    matcher: &GlobMatcher,
+    resolved_path: &Path,
+    workspace_path: &Path,
+    max_visited_nodes: usize,
+    entries: impl Iterator<Item = Result<DirEntry, ignore::Error>>,
+) -> Result<Vec<GlobMatch>, GlobError> {
     let mut matches = Vec::new();
     let mut visited_nodes = 0;
 
-    for entry_result in builder.build() {
+    for entry_result in entries {
         if cancel.is_cancelled() {
             return Err(GlobError::Cancelled);
         }
@@ -326,37 +379,7 @@ fn glob_files(
         }
     }
 
-    if cancel.is_cancelled() {
-        return Err(GlobError::Cancelled);
-    }
-
-    // Sort the list by mtime
-    matches.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| left.output_path.cmp(&right.output_path))
-    });
-
-    if cancel.is_cancelled() {
-        return Err(GlobError::Cancelled);
-    }
-
-    let found_paths = matches.len();
-    let returned_paths: Vec<_> = matches
-        .into_iter()
-        .take(max_matches)
-        .map(|m| m.output_path)
-        .collect();
-
-    if found_paths > returned_paths.len() {
-        return Ok(GlobResult::Truncated {
-            paths: returned_paths,
-            total_matches: found_paths,
-        });
-    }
-
-    Ok(GlobResult::Full(returned_paths))
+    Ok(matches)
 }
 
 fn format_result_output(result: GlobResult, max_bytes: usize) -> String {
