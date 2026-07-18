@@ -167,7 +167,6 @@ impl PreparedInvocation for PreparedGlob {
             requested_path,
             resolved_path,
             workspace_path,
-            ..
         } = *self;
 
         let result = tokio::task::spawn_blocking(move || {
@@ -230,7 +229,7 @@ struct GlobMatch {
     output_path: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum GlobResult {
     Full(Vec<String>),
     Truncated {
@@ -458,6 +457,7 @@ mod tests {
     use crate::tools::ToolTestExt;
     use serde_json::json;
     use std::fs;
+    use std::time::Duration;
     use tempfile::{TempDir, tempdir};
 
     fn glob_tool() -> (TempDir, GlobTool) {
@@ -491,6 +491,12 @@ mod tests {
             limits.visited_nodes,
             limits.matches,
         )
+    }
+
+    fn set_mtime(path: &Path, seconds_after_epoch: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_after_epoch))
+            .unwrap();
     }
 
     #[test]
@@ -601,7 +607,7 @@ mod tests {
         // Arrange
         let (root, tool) = glob_tool();
         let root_path = root.path().to_path_buf();
-        std::fs::remove_dir(&root_path).unwrap();
+        fs::remove_dir(&root_path).unwrap();
 
         // Act
         let result = tool.prepare(json!({ "pattern": "*" })).await;
@@ -859,5 +865,321 @@ mod tests {
         assert!(paths.contains(&"search/visible.txt".to_string()));
         assert!(!paths.contains(&"search/local-ignored.txt".to_string()));
         assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn direct_and_recursive_patterns_have_distinct_scope() {
+        // Arrange
+        let (root, tool) = glob_tool();
+        let nested_root = root.path().join("nested");
+        fs::create_dir(&nested_root).unwrap();
+
+        let direct_path = root.path().join("direct.rs");
+        let nested_path = nested_root.join("nested.rs");
+
+        fs::write(&direct_path, "direct").unwrap();
+        fs::write(&nested_path, "nested").unwrap();
+
+        set_mtime(&direct_path, 1);
+        set_mtime(&nested_path, 1);
+
+        // Act
+        let direct_result = run_glob(
+            &tool,
+            json!({ "pattern": "*.rs" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+        let recursive_result = run_glob(
+            &tool,
+            json!({ "pattern": "**/*.rs" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(
+            direct_result,
+            GlobResult::Full(vec!["direct.rs".to_string()],)
+        );
+
+        assert_eq!(
+            recursive_result,
+            GlobResult::Full(vec![
+                "direct.rs".to_string(),
+                "nested/nested.rs".to_string()
+            ],)
+        );
+    }
+
+    #[test]
+    fn question_classes_alternation_escaping_and_case_sensitivity_match_the_contract() {
+        // Arrange
+        let (root, tool) = glob_tool();
+        let files = vec![
+            "a.txt",
+            "b.txt",
+            "c.txt",
+            "file.txt",
+            "{weird}.txt",
+            "nested/a.txt",
+        ];
+
+        fs::create_dir(root.path().join("nested")).unwrap();
+
+        for file in &files {
+            fs::write(root.path().join(file), "exists").unwrap();
+            set_mtime(&root.path().join(file), 1);
+        }
+
+        let cases = [
+            (
+                json!({ "pattern": "fi?e.txt" }),
+                vec!["file.txt".to_string()],
+            ),
+            (json!({ "pattern": "*.TXT" }), vec![]),
+            (json!({ "pattern": "nested?a.txt" }), vec![]),
+            (
+                json!({ "pattern": "\\{*\\}.txt" }),
+                vec!["{weird}.txt".to_string()],
+            ),
+            (
+                json!({ "pattern": "[ab].txt" }),
+                vec!["a.txt".to_string(), "b.txt".to_string()],
+            ),
+            (
+                json!({ "pattern": "{a,c}.txt" }),
+                vec!["a.txt".to_string(), "c.txt".to_string()],
+            ),
+        ];
+
+        // Act
+        for (pattern, expected) in cases {
+            let actual =
+                run_glob(&tool, pattern, CancellationToken::new(), generous_limits()).unwrap();
+
+            assert_eq!(actual, GlobResult::Full(expected));
+        }
+    }
+
+    #[test]
+    fn gitignore_is_honored_without_a_git_directory() {
+        // Arrange
+        let (root, tool) = glob_tool();
+        fs::write(root.path().join(".gitignore"), "parent-ignored.txt\n").unwrap();
+        fs::write(root.path().join("parent-ignored.txt"), "visible").unwrap();
+
+        // Act
+        let result = run_glob(
+            &tool,
+            json!({ "pattern": "*.txt" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(result, GlobResult::Full(vec![]));
+    }
+
+    #[test]
+    fn hidden_paths_are_visible_but_dot_git_is_pruned() {
+        // Arrange
+        let (root, tool) = glob_tool();
+
+        fs::create_dir_all(root.path().join(".github/workflows")).unwrap();
+        fs::create_dir_all(root.path().join(".git/objects")).unwrap();
+
+        fs::write(root.path().join(".github/workflows/ci.yml"), "ci").unwrap();
+        fs::write(root.path().join(".git/objects/example"), "example").unwrap();
+
+        // Act
+        let result = run_glob(
+            &tool,
+            json!({ "pattern": "**/*" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(
+            result,
+            GlobResult::Full(vec![".github/workflows/ci.yml".to_string(),])
+        );
+    }
+
+    #[test]
+    fn matches_are_ordered_by_mtime_then_portable_lexical_path() {
+        // Arrange
+        let (root, tool) = glob_tool();
+
+        let path = root.path().join("a.txt");
+        fs::write(&path, "a").unwrap();
+        set_mtime(&path, 1);
+
+        let path = root.path().join("b.txt");
+        fs::write(&path, "b").unwrap();
+        set_mtime(&path, 2);
+
+        let path = root.path().join("c.txt");
+        fs::write(&path, "c").unwrap();
+        set_mtime(&path, 3);
+
+        let path = root.path().join("d.txt");
+        fs::write(&path, "d").unwrap();
+        set_mtime(&path, 3);
+
+        // Act
+        let result = run_glob(
+            &tool,
+            json!({ "pattern": "*.txt" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(
+            result,
+            GlobResult::Full(vec![
+                "c.txt".to_string(),
+                "d.txt".to_string(),
+                "b.txt".to_string(),
+                "a.txt".to_string()
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_skipped_and_non_utf8_names_are_formatted_lossily() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Arrange
+        let (root, tool) = glob_tool();
+
+        let exists_path = root.path().join("exists.txt");
+        let bad_utf8_bytes = b"why_\xFF.txt";
+        let bad_utf8_name = std::ffi::OsStr::from_bytes(bad_utf8_bytes);
+        let non_utf8_path = root.path().join(bad_utf8_name);
+
+        fs::write(&exists_path, "exists").unwrap();
+        set_mtime(&exists_path, 3);
+        fs::write(&non_utf8_path, "exists").unwrap();
+        set_mtime(&non_utf8_path, 3);
+        std::os::unix::fs::symlink(exists_path, root.path().join("linked.txt")).unwrap();
+
+        // Act
+        let result = run_glob(
+            &tool,
+            json!({ "pattern": "*.txt" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(
+            result,
+            GlobResult::Full(vec![
+                "exists.txt".to_string(),
+                "why_\u{FFFD}.txt".to_string()
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matching_is_performed_against_non_lossy_version() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Arrange
+        let (root, tool) = glob_tool();
+
+        let bad_utf8_bytes = b"why_\xFF.txt";
+        let bad_utf8_name = std::ffi::OsStr::from_bytes(bad_utf8_bytes);
+        let non_utf8_path = root.path().join(bad_utf8_name);
+
+        fs::write(&non_utf8_path, "exists").unwrap();
+        set_mtime(&non_utf8_path, 3);
+
+        // Act
+        let result = run_glob(
+            &tool,
+            json!({ "pattern": "why_\u{FFFD}.txt" }),
+            CancellationToken::new(),
+            generous_limits(),
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(result, GlobResult::Full(vec![]));
+    }
+
+    #[test]
+    fn unreadable_directories_fail_instead_of_returning_partial_results() {
+        // Arrange
+        let (root, tool) = glob_tool();
+        fs::write(root.path().join("a.txt"), "a").unwrap();
+        fs::write(root.path().join("b.txt"), "b").unwrap();
+        let prepared = tool.prepare_glob(json!({ "pattern": "*.txt" })).unwrap();
+
+        // Both matches are visited before the error, as when a walker fails on
+        // an unreadable directory after listing readable siblings.
+        let unreadable = ignore::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let entries = WalkBuilder::new(&prepared.resolved_path)
+            .build()
+            .chain(std::iter::once(Err(unreadable)));
+
+        // Act
+        let result = collect_matches(
+            &CancellationToken::new(),
+            &prepared.matcher,
+            &prepared.resolved_path,
+            &prepared.workspace_path,
+            usize::MAX,
+            entries,
+        );
+
+        // Assert
+        assert!(matches!(result, Err(GlobError::Traversal(_))), "{result:?}");
+    }
+
+    #[test]
+    fn cancellation_during_a_walk_stops_promptly() {
+        // Arrange
+        let (root, tool) = glob_tool();
+        fs::write(root.path().join("a.txt"), "a").unwrap();
+        fs::write(root.path().join("b.txt"), "b").unwrap();
+        let prepared = tool.prepare_glob(json!({ "pattern": "*.txt" })).unwrap();
+
+        let mut walked = 0;
+        let cancel = CancellationToken::new();
+        let entries = WalkBuilder::new(&prepared.resolved_path)
+            .build()
+            .inspect(|_entry| {
+                walked += 1;
+                cancel.cancel();
+            });
+
+        // Act
+        let result = collect_matches(
+            &cancel,
+            &prepared.matcher,
+            &prepared.resolved_path,
+            &prepared.workspace_path,
+            usize::MAX,
+            entries,
+        );
+
+        // Assert
+        assert_eq!(walked, 1);
+        assert!(matches!(result, Err(GlobError::Cancelled)), "{result:?}");
     }
 }
