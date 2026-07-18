@@ -105,6 +105,29 @@ fn invalid_input(tool: &str, reason: impl std::fmt::Display) -> String {
     format!("invalid {tool} input: {reason}")
 }
 
+/// Reject resolved paths inside a `.git` directory.
+fn reject_git_directory(
+    tool: &str,
+    workspace: &Workspace,
+    resolved_path: &std::path::Path,
+) -> Result<(), String> {
+    let relative = resolved_path
+        .strip_prefix(workspace.root())
+        .expect("resolve returns paths inside the workspace root");
+
+    if relative
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        return Err(invalid_input(
+            tool,
+            "path must not be inside the `.git` directory",
+        ));
+    }
+
+    Ok(())
+}
+
 fn operation_failed(operation: &str, path: &str, error: impl std::fmt::Display) -> String {
     format!("failed to {operation} `{path}`: {error}")
 }

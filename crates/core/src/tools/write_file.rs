@@ -2,7 +2,7 @@ use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
 use crate::tools::{
     PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, background_task_failed,
-    invalid_input, operation_failed,
+    invalid_input, operation_failed, reject_git_directory,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -34,7 +34,7 @@ impl Tool for WriteFileTool {
             name: "write_file".to_string(),
             description: "Create or overwrite a file in the workspace, creating missing \
                  parent directories. Overwriting replaces the entire file; use edit_file \
-                 to change part of an existing file."
+                 to change part of an existing file. Paths inside `.git` are rejected."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -71,6 +71,8 @@ impl Tool for WriteFileTool {
                 "path must name a file inside the workspace",
             ));
         }
+
+        reject_git_directory("write_file", &self.workspace, &resolved_path)?;
 
         Ok(Box::new(PreparedWriteFile {
             existed: resolved_path.exists(),
@@ -351,6 +353,88 @@ mod tests {
             );
         }
         assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_paths_inside_the_git_directory_without_writing() {
+        // Arrange
+        let (root, tool) = write_file_tool();
+        let git_dir = root.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        fs::write(git_dir.join("config"), "original").unwrap();
+        let absolute = path_str(&git_dir.join("config")).to_string();
+
+        for path in [
+            ".git".to_string(),
+            ".git/config".to_string(),
+            ".git/hooks/pre-commit".to_string(),
+            "nested/.git/config".to_string(),
+            absolute,
+        ] {
+            // Act
+            let error = tool
+                .execute(json!({ "path": path, "content": "hijacked" }))
+                .await
+                .unwrap_err();
+
+            // Assert
+            assert_eq!(
+                error,
+                "invalid write_file input: path must not be inside the `.git` directory"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(git_dir.join("config")).unwrap(),
+            "original"
+        );
+        assert!(!git_dir.join("hooks").exists());
+        assert!(!root.path().join("nested").exists());
+    }
+
+    #[tokio::test]
+    async fn execute_allows_git_prefixed_names_outside_the_git_directory() {
+        // Arrange
+        let (root, tool) = write_file_tool();
+
+        for path in [".gitignore", ".github/workflows/ci.yml"] {
+            // Act
+            let output = tool
+                .execute(json!({ "path": path, "content": "ok" }))
+                .await
+                .unwrap();
+
+            // Assert
+            assert_eq!(fs::read_to_string(root.path().join(path)).unwrap(), "ok");
+            assert_eq!(output, format!("created `{path}`; 2 bytes written"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_rejects_a_symlink_that_resolves_into_the_git_directory() {
+        use std::os::unix::fs::symlink;
+
+        // Arrange
+        // The guard runs on the resolved path, so following the link exposes `.git`.
+        let (root, tool) = write_file_tool();
+        let git_dir = root.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        let target = git_dir.join("config");
+        fs::write(&target, "original").unwrap();
+        symlink(&target, root.path().join("link.txt")).unwrap();
+
+        // Act
+        let error = tool
+            .execute(json!({ "path": "link.txt", "content": "hijacked" }))
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(
+            error,
+            "invalid write_file input: path must not be inside the `.git` directory"
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
     }
 
     #[tokio::test]

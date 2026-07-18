@@ -3,6 +3,7 @@ use crate::protocol::ApprovalRequirement;
 use crate::tools::{
     MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition,
     ToolExecutionError, background_task_failed, invalid_input, operation_failed,
+    reject_git_directory,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,7 +42,7 @@ impl Tool for EditFileTool {
                  default old_str must occur exactly once; set expected_occurrences to \
                  replace that many matches at once. The match is exact, including \
                  whitespace and indentation. Files larger than {MAX_FILE_SIZE_MIB} MiB \
-                 cannot be edited."
+                 cannot be edited. Paths inside `.git` are rejected."
             ),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -102,6 +103,8 @@ impl Tool for EditFileTool {
                 "path must name a file inside the workspace",
             ));
         }
+
+        reject_git_directory("edit_file", &self.workspace, &resolved_path)?;
 
         Ok(Box::new(PreparedEditFile {
             requested_path: input.path,
@@ -729,6 +732,89 @@ mod tests {
                 "invalid edit_file input: path must name a file inside the workspace"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_paths_inside_the_git_directory_without_editing() {
+        // Arrange
+        let (root, tool) = edit_file_tool();
+        let git_dir = root.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        fs::write(git_dir.join("config"), "original").unwrap();
+        let absolute = path_str(&git_dir.join("config")).to_string();
+
+        for path in [
+            ".git".to_string(),
+            ".git/config".to_string(),
+            ".git/hooks/pre-commit".to_string(),
+            "nested/.git/config".to_string(),
+            absolute,
+        ] {
+            // Act
+            let error = tool
+                .execute(json!({ "path": path, "old_str": "original", "new_str": "hijacked" }))
+                .await
+                .unwrap_err();
+
+            // Assert
+            assert_eq!(
+                error,
+                "invalid edit_file input: path must not be inside the `.git` directory"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(git_dir.join("config")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_allows_git_prefixed_names_outside_the_git_directory() {
+        // Arrange
+        let (root, tool) = edit_file_tool();
+        fs::create_dir_all(root.path().join(".github/workflows")).unwrap();
+
+        for path in [".gitignore", ".github/workflows/ci.yml"] {
+            fs::write(root.path().join(path), "old").unwrap();
+
+            // Act
+            let output = tool
+                .execute(json!({ "path": path, "old_str": "old", "new_str": "new" }))
+                .await
+                .unwrap();
+
+            // Assert
+            assert_eq!(fs::read_to_string(root.path().join(path)).unwrap(), "new");
+            assert_eq!(output, format!("edited `{path}`; 1 occurrence replaced"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_rejects_a_symlink_that_resolves_into_the_git_directory() {
+        use std::os::unix::fs::symlink;
+
+        // Arrange
+        // The guard runs on the resolved path, so following the link exposes `.git`.
+        let (root, tool) = edit_file_tool();
+        let git_dir = root.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        let target = git_dir.join("config");
+        fs::write(&target, "original").unwrap();
+        symlink(&target, root.path().join("link.txt")).unwrap();
+
+        // Act
+        let error = tool
+            .execute(json!({ "path": "link.txt", "old_str": "original", "new_str": "hijacked" }))
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(
+            error,
+            "invalid edit_file input: path must not be inside the `.git` directory"
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
     }
 
     #[tokio::test]
