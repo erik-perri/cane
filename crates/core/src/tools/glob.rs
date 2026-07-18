@@ -1053,7 +1053,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Mac is disabled due to APFS rejecting non-UTF-8 filenames with EILSEQ.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn symlinks_are_skipped_and_non_utf8_names_are_formatted_lossily() {
         use std::os::unix::ffi::OsStrExt;
@@ -1091,7 +1092,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Mac is disabled due to APFS rejecting non-UTF-8 filenames with EILSEQ.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn matching_is_performed_against_non_lossy_version() {
         use std::os::unix::ffi::OsStrExt;
