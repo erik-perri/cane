@@ -586,7 +586,10 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort_unstable();
 
-        assert_eq!(names, vec!["edit_file", "glob", "read_file", "write_file"]);
+        assert_eq!(
+            names,
+            vec!["edit_file", "glob", "grep", "read_file", "write_file"]
+        );
     }
 
     #[tokio::test]
@@ -1050,6 +1053,65 @@ mod tests {
                 "tool_call_id": "call_abc",
                 "content": "[workspace]\nmembers = [\"crates/core\"]"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grep_tool_turn_runs_without_approval_and_round_trips_matches() {
+        // Arrange
+        let file = temp_file_with(b"before\nneedle\nafter\n");
+        let file_path = file.path().to_str().unwrap();
+        let rendered_path = file.path().file_name().unwrap().to_str().unwrap();
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "grep-1",
+                    "grep",
+                    json!({ "path": file_path, "pattern": "needle" }),
+                )]),
+                text_turn("Found it."),
+            ],
+        )
+        .await;
+
+        // Act
+        let events = run_agent("Find needle.", &server).await;
+
+        // Assert
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolStarted { name: started, .. },
+                AgentEvent::ToolFinished {
+                    name: finished,
+                    output,
+                    is_error: false,
+                },
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
+                },
+            ] if started == "grep"
+                && finished == "grep"
+                && output == &format!("{rendered_path}:\n  2: needle")
+                && text == "Found it."
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. }))
+        );
+
+        let messages = nth_request_messages(&server, 1).await;
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "grep-1");
+        assert_eq!(
+            messages[2]["content"],
+            format!("{rendered_path}:\n  2: needle")
         );
     }
 

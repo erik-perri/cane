@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 mod edit_file;
 mod file_discovery;
 mod glob;
+mod grep;
 mod path_display;
 mod read_file;
 mod write_file;
@@ -14,6 +15,7 @@ use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
 use edit_file::EditFileTool;
 use glob::GlobTool;
+use grep::GrepTool;
 use read_file::ReadFileTool;
 use write_file::WriteFileTool;
 
@@ -39,6 +41,7 @@ impl ToolSet {
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(EditFileTool::new(Arc::clone(&workspace))),
             Box::new(GlobTool::new(Arc::clone(&workspace))),
+            Box::new(GrepTool::new(Arc::clone(&workspace))),
             Box::new(ReadFileTool::new(Arc::clone(&workspace))),
             Box::new(WriteFileTool::new(Arc::clone(&workspace))),
         ];

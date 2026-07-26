@@ -39,7 +39,6 @@ impl FileSelector {
 
 #[derive(Debug)]
 pub(super) struct LocatedMetadata {
-    pub(super) size: u64,
     pub(super) modified: Option<SystemTime>,
 }
 
@@ -54,7 +53,6 @@ impl LocatedFile {
         Self {
             path,
             metadata: Some(LocatedMetadata {
-                size: metadata.len(),
                 modified: metadata.modified().ok(),
             }),
         }
@@ -325,7 +323,6 @@ fn collect_files(
         })?;
 
         let metadata = entry.metadata().ok().map(|metadata| LocatedMetadata {
-            size: metadata.len(),
             modified: metadata.modified().ok(),
         });
 
