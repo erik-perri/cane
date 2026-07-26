@@ -4,6 +4,8 @@ use anyhow::Context;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt};
 
+const DEFAULT_MAX_TOKENS: u32 = 32 * 1024;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     fmt()
@@ -19,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let base_url = std::env::var("CANE_BASE_URL").context("CANE_BASE_URL not set")?;
     let model = std::env::var("CANE_MODEL").context("CANE_MODEL not set")?;
     let max_tokens: u32 = std::env::var("CANE_MAX_TOKENS")
-        .unwrap_or_else(|_| "8192".into())
+        .unwrap_or_else(|_| DEFAULT_MAX_TOKENS.to_string())
         .parse()
         .context("CANE_MAX_TOKENS must be an integer")?;
     let path = std::env::current_dir()?;
