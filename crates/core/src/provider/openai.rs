@@ -490,9 +490,14 @@ fn endpoint_from_base_url(base_url: String) -> Result<reqwest::Url, ProviderErro
     Ok(endpoint)
 }
 
-/// Some compat backends ship finish_reason "stop" alongside tool calls, so the
-/// stop reason is decided from the message content, not the server's label.
+/// Some compat backends ship finish_reason "stop" alongside tool calls, so tool
+/// content takes precedence over non-terminal labels. A native "length" still
+/// means the response was truncated, even if it contains a partial tool call.
 fn resolve_stop_reason(content: &[ContentBlock], finish_reason: Option<&str>) -> StopReason {
+    if finish_reason == Some("length") {
+        return StopReason::MaxTokens;
+    }
+
     let has_tool_use = content
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
@@ -1072,6 +1077,47 @@ mod tests {
 
         // Assert
         assert_eq!(stop_reason, StopReason::ToolUse);
+        assert!(
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_message_preserves_length_finish_reason_when_message_has_tool_calls() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_stream(
+            &server,
+            sse_stream(&[
+                stream_chunk(
+                    json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": { "name": "write_file", "arguments": "{\"path\":\"src/shell.rs\"" }
+                        }]
+                    }),
+                    None,
+                ),
+                stream_chunk(json!({}), Some("length")),
+            ]),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let (message, stop_reason) = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(stop_reason, StopReason::MaxTokens);
         assert!(
             message
                 .content
