@@ -1,7 +1,7 @@
 use super::scan::{GrepFileResult, GrepLine, GrepTruncation, GrepWarnings};
 use super::{
     BINARY_FILE_SKIPPED, ESCAPED_PATH_WARNING, EXCERPT_WARNING, GrepLimits, LOSSY_PATH_WARNING,
-    LOSSY_SOURCE_WARNING, NO_MATCHES, OMITTED_SOURCE_MARKER, OutputMode,
+    LOSSY_SOURCE_WARNING, NO_MATCHES, OMITTED_SOURCE_MARKER, OutputMode, RECURSIVE_INCLUDE_HINT,
 };
 use crate::tools::path_display::RenderedPath;
 use std::borrow::Cow;
@@ -29,6 +29,15 @@ pub(super) fn format_results(
             format_path_results(results, limits, warnings, truncation.paths)
         }
     }
+}
+
+pub(super) fn append_recursive_include_hint(mut output: String, max_bytes: usize) -> String {
+    let additional_bytes = 1usize.saturating_add(RECURSIVE_INCLUDE_HINT.len());
+    if output.len().saturating_add(additional_bytes) <= max_bytes {
+        output.push('\n');
+        output.push_str(RECURSIVE_INCLUDE_HINT);
+    }
+    output
 }
 
 #[derive(Debug)]
@@ -497,6 +506,21 @@ mod tests {
             paths: usize::MAX,
             source_line_bytes: usize::MAX,
         }
+    }
+
+    #[test]
+    fn recursive_include_hint_is_appended_only_when_it_fits_the_output_limit() {
+        // Arrange
+        let output = NO_MATCHES.to_string();
+        let hinted_len = output.len() + 1 + RECURSIVE_INCLUDE_HINT.len();
+
+        // Act
+        let exact = append_recursive_include_hint(output.clone(), hinted_len);
+        let too_small = append_recursive_include_hint(output.clone(), hinted_len - 1);
+
+        // Assert
+        assert_eq!(exact, format!("{NO_MATCHES}\n{RECURSIVE_INCLUDE_HINT}"));
+        assert_eq!(too_small, output);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 mod output;
 mod scan;
 
-use output::format_results;
+use output::{append_recursive_include_hint, format_results};
 use scan::{GrepCandidate, ScanOptions, scan_candidates};
 
 #[derive(Deserialize)]
@@ -58,6 +58,7 @@ const MAX_GREP_CONTEXT: usize = 10;
 const MAX_GREP_SOURCE_LINE_BYTES: usize = 2 * 1024;
 
 const NO_MATCHES: &str = "No matches found.";
+const RECURSIVE_INCLUDE_HINT: &str = "[hint: include patterns without `/` match only direct children; prefix with `**/` to match recursively]";
 const BINARY_FILE_SKIPPED: &str = "binary file skipped";
 const OMITTED_SOURCE_MARKER: &str = "[...]";
 const LOSSY_SOURCE_WARNING: &str =
@@ -85,6 +86,7 @@ pub(super) struct GrepTool {
 #[derive(Debug)]
 struct PreparedGrep {
     context: usize,
+    include_has_no_separator: bool,
     limits: GrepLimits,
     matcher: RegexMatcher,
     multiline: bool,
@@ -106,7 +108,8 @@ impl Tool for GrepTool {
                  numbers, or only the paths of files with matches. Directory searches exclude \
                  files ignored by .gitignore, skip .git and symlinks, include hidden files, and \
                  silently skip binary files. Files larger than {MAX_FILE_SIZE_MIB} MiB are not \
-                 searched. Results \
+                 searched. Include globs are relative to the search directory: patterns without \
+                 `/` match only direct children; prefix with `**/` to match recursively. Results \
                  are grouped by file, most recently modified first. Content output returns at \
                  most {MAX_GREP_MATCHED_LINES} matched lines; file-list output returns at most \
                  {MAX_GREP_PATHS} paths. A truncated result says so explicitly; narrow path, \
@@ -232,14 +235,15 @@ impl GrepTool {
             ));
         }
 
-        let selector = match input.include {
+        let (selector, include_has_no_separator) = match input.include {
             Some(pattern) if pattern.is_empty() => {
                 return Err(invalid_input("grep", "`include` must not be empty"));
             }
-            Some(pattern) => {
-                FileSelector::glob(&pattern).map_err(|error| invalid_input("grep", error))?
-            }
-            None => FileSelector::all(),
+            Some(pattern) => (
+                FileSelector::glob(&pattern).map_err(|error| invalid_input("grep", error))?,
+                !pattern.contains('/'),
+            ),
+            None => (FileSelector::all(), false),
         };
 
         let matcher = compile_matcher(&input.pattern, input.case_insensitive, input.multiline)
@@ -255,6 +259,7 @@ impl GrepTool {
 
         Ok(PreparedGrep {
             context: input.context,
+            include_has_no_separator,
             limits: self.limits,
             matcher,
             multiline: input.multiline,
@@ -398,6 +403,7 @@ impl PreparedInvocation for PreparedGrep {
 
         let Self {
             context,
+            include_has_no_separator,
             limits,
             matcher,
             multiline,
@@ -416,6 +422,8 @@ impl PreparedInvocation for PreparedGrep {
             &workspace_root,
         )
         .await?;
+        let show_recursive_include_hint =
+            include_has_no_separator && !candidates.explicit_file && candidates.values.is_empty();
 
         let scan_cancel = cancel.clone();
         let scan_requested_path = requested_path.clone();
@@ -441,13 +449,17 @@ impl PreparedInvocation for PreparedGrep {
             return Err(ToolExecutionError::Cancelled);
         }
 
-        let formatted_results = format_results(
+        let mut formatted_results = format_results(
             scan.results,
             output_mode,
             limits,
             scan.warnings,
             scan.truncation,
         );
+        if show_recursive_include_hint {
+            formatted_results =
+                append_recursive_include_hint(formatted_results, limits.output_bytes);
+        }
 
         if cancel.is_cancelled() {
             return Err(ToolExecutionError::Cancelled);
@@ -489,6 +501,11 @@ mod tests {
 
         // Assert
         assert_eq!(definition.name, "grep");
+        assert!(
+            definition
+                .description
+                .contains("prefix with `**/` to match recursively")
+        );
         assert_eq!(definition.input_schema["type"], "object");
         assert_eq!(definition.input_schema["required"], json!(["pattern"]));
         assert_eq!(definition.input_schema["additionalProperties"], false);
@@ -530,6 +547,12 @@ mod tests {
         assert_eq!(
             definition.input_schema["properties"]["context"]["maximum"],
             10
+        );
+        assert!(
+            definition.input_schema["properties"]["include"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("`*.rs` matches only direct children; `**/*.rs` matches recursively")
         );
     }
 
@@ -988,6 +1011,74 @@ mod tests {
         // Assert
         assert_eq!(basename_output, "src/main.rs:\n  1: needle");
         assert_eq!(relative_path_output, "No matches found.");
+    }
+
+    #[tokio::test]
+    async fn basename_include_with_no_selected_directory_files_suggests_recursion() {
+        // Arrange
+        let (root, tool) = grep_tool();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/main.rs"), "needle\n").unwrap();
+
+        // Act
+        let output = tool
+            .execute(json!({ "pattern": "needle", "include": "*.rs" }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(output, format!("{NO_MATCHES}\n{RECURSIVE_INCLUDE_HINT}"));
+    }
+
+    #[tokio::test]
+    async fn basename_include_with_selected_files_and_no_content_match_omits_the_hint() {
+        // Arrange
+        let (root, tool) = grep_tool();
+        fs::write(root.path().join("main.rs"), "haystack\n").unwrap();
+
+        // Act
+        let output = tool
+            .execute(json!({ "pattern": "needle", "include": "*.rs" }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(output, NO_MATCHES);
+    }
+
+    #[tokio::test]
+    async fn basename_include_with_an_explicit_file_target_omits_the_hint() {
+        // Arrange
+        let (root, tool) = grep_tool();
+        fs::write(root.path().join("main.rs"), "needle\n").unwrap();
+
+        // Act
+        let output = tool
+            .execute(json!({
+                "pattern": "needle",
+                "path": "main.rs",
+                "include": "*.txt"
+            }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(output, NO_MATCHES);
+    }
+
+    #[tokio::test]
+    async fn path_include_with_no_selected_directory_files_omits_the_hint() {
+        // Arrange
+        let (_root, tool) = grep_tool();
+
+        // Act
+        let output = tool
+            .execute(json!({ "pattern": "needle", "include": "src/*.rs" }))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(output, NO_MATCHES);
     }
 
     #[tokio::test]
