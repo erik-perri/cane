@@ -109,7 +109,7 @@ impl AgentSession {
 
         loop {
             let command = tokio::select! {
-                _ = self.host_handle.cancel.cancelled() => return Err(AgentExit::Cancelled),
+                _ = self.host_handle.cancel.cancelled() => return Ok(()),
                 _ = self.host_handle.events.closed() => return Ok(()),
                 command = self.host_handle.commands.recv() => {
                     match command {
@@ -632,6 +632,44 @@ mod tests {
         assert!(
             events.is_empty(),
             "idle session emitted unexpected events: {events:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "idle session made a provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_idle_session_exits_cleanly_without_a_turn_outcome() {
+        // Arrange
+        let server = MockServer::start().await;
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let session = test_session(
+            &server,
+            HostHandle {
+                cancel: cancel.clone(),
+                commands: commands_rx,
+                events: EventSink::new(events_tx),
+            },
+            Vec::new(),
+        );
+        let session_task = tokio::spawn(session.run());
+
+        // Act
+        cancel.cancel();
+        let session_result = timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("idle session did not stop promptly")
+            .expect("session task panicked");
+        let events = collect_until_events_close(&mut events_rx).await;
+
+        // Assert
+        assert_eq!(session_result, Ok(()));
+        assert!(
+            events.is_empty(),
+            "idle session emitted an unexpected turn outcome: {events:?}"
         );
         assert!(
             server.received_requests().await.unwrap().is_empty(),

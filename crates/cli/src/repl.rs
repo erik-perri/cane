@@ -1,14 +1,93 @@
 use anyhow::Context;
 use cane_core::{AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, TurnOutcome};
 use std::io::{BufRead, Write};
+use tokio::sync::mpsc;
 
-pub(crate) async fn run(
+struct InputLines {
+    receiver: mpsc::Receiver<std::io::Result<Option<String>>>,
+}
+
+impl InputLines {
+    #[cfg(test)]
+    fn from_reader(reader: impl BufRead + Send + 'static) -> Self {
+        Self::spawn(move |sender| read_lines(reader, sender))
+    }
+
+    fn stdin() -> Self {
+        Self::spawn(move |sender| {
+            let stdin = std::io::stdin();
+            read_lines(stdin.lock(), sender);
+        })
+    }
+
+    fn spawn(
+        read: impl FnOnce(mpsc::Sender<std::io::Result<Option<String>>>) + Send + 'static,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        std::thread::spawn(move || read(sender));
+        Self { receiver }
+    }
+
+    async fn recv(&mut self) -> std::io::Result<Option<String>> {
+        self.receiver.recv().await.unwrap_or(Ok(None))
+    }
+}
+
+fn read_lines(mut reader: impl BufRead, sender: mpsc::Sender<std::io::Result<Option<String>>>) {
+    loop {
+        let mut line = String::new();
+        let result = match reader.read_line(&mut line) {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line.trim_end().to_owned())),
+            Err(error) => Err(error),
+        };
+        let finished = !matches!(result, Ok(Some(_)));
+
+        if sender.blocking_send(result).is_err() || finished {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn run(
+    agent: AgentHandle,
+    input: impl BufRead + Send + 'static,
+    output: impl Write,
+) -> anyhow::Result<()> {
+    run_with_input(agent, InputLines::from_reader(input), output).await
+}
+
+pub(crate) async fn run_stdio(agent: AgentHandle) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    run_with_input(agent, InputLines::stdin(), stdout.lock()).await
+}
+
+async fn run_with_input(
     mut agent: AgentHandle,
-    mut input: impl BufRead,
+    mut input: InputLines,
     mut output: impl Write,
 ) -> anyhow::Result<()> {
     loop {
-        let Some(line) = read_input(&mut input, &mut output)? else {
+        write_prompt(&mut output)?;
+        let line = tokio::select! {
+            line = input.recv() => line?,
+            event = agent.events.recv() => {
+                match event {
+                    None => break,
+                    Some(AgentEvent::Error(error)) => {
+                        writeln!(output, "\nerror: {error}")?;
+                        continue;
+                    }
+                    Some(event) => {
+                        return Err(anyhow::anyhow!(
+                            "agent emitted an unexpected event while idle: {event:?}"
+                        ));
+                    }
+                }
+            }
+        };
+        let Some(line) = line else {
             break;
         };
 
@@ -94,7 +173,14 @@ pub(crate) async fn run(
                     )?;
                     output.flush()?;
 
-                    let decision = read_decision(&mut input, &mut output)?;
+                    let decision = tokio::select! {
+                        _ = agent.cancel.cancelled() => None,
+                        decision = read_decision(&mut input, &mut output) => Some(decision?),
+                    };
+
+                    let Some(decision) = decision else {
+                        continue;
+                    };
 
                     if respond_to.send(decision).is_err() {
                         // Exit if the agent task disappears.
@@ -108,12 +194,12 @@ pub(crate) async fn run(
     Ok(())
 }
 
-fn read_decision(
-    input: &mut impl BufRead,
+async fn read_decision(
+    input: &mut InputLines,
     output: &mut impl Write,
 ) -> anyhow::Result<ApprovalDecision> {
     loop {
-        let Some(line) = read_input(input, output)? else {
+        let Some(line) = read_input(input, output).await? else {
             return Err(anyhow::anyhow!("eof"));
         };
 
@@ -123,7 +209,7 @@ fn read_decision(
             writeln!(output, "\nreason:")?;
             output.flush()?;
 
-            let Some(reason) = read_input(input, output)? else {
+            let Some(reason) = read_input(input, output).await? else {
                 return Err(anyhow::anyhow!("eof"));
             };
 
@@ -136,25 +222,58 @@ fn read_decision(
     }
 }
 
-fn read_input(input: &mut impl BufRead, output: &mut impl Write) -> anyhow::Result<Option<String>> {
+async fn read_input(
+    input: &mut InputLines,
+    output: &mut impl Write,
+) -> anyhow::Result<Option<String>> {
+    write_prompt(output)?;
+    Ok(input.recv().await?)
+}
+
+fn write_prompt(output: &mut impl Write) -> anyhow::Result<()> {
     write!(output, "> ")?;
     output.flush()?;
-
-    let mut line = String::new();
-
-    match input.read_line(&mut line) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(line.trim_end().to_owned())),
-        Err(e) => Err(e.into()),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cane_core::StopReason;
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Read};
+    use std::sync::mpsc as std_mpsc;
     use tokio::sync::{mpsc, oneshot};
+
+    struct GatedEof {
+        released: bool,
+        release: std_mpsc::Receiver<()>,
+    }
+
+    impl GatedEof {
+        fn wait_for_release(&mut self) -> io::Result<()> {
+            if !self.released {
+                self.release.recv().map_err(|_| io::ErrorKind::BrokenPipe)?;
+                self.released = true;
+            }
+            Ok(())
+        }
+    }
+
+    impl Read for GatedEof {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            self.wait_for_release()?;
+            Ok(0)
+        }
+    }
+
+    impl BufRead for GatedEof {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.wait_for_release()?;
+            Ok(&[])
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
 
     #[tokio::test]
     async fn run_displays_tool_errors_but_hides_successful_tool_output() {
@@ -358,7 +477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_returns_after_a_cancelled_turn_without_reading_more_input() {
+    async fn run_returns_after_a_cancelled_turn_without_processing_more_input() {
         // Arrange
         let (commands, mut command_rx) = mpsc::channel(1);
         let (event_tx, events) = mpsc::channel(8);
@@ -385,9 +504,29 @@ mod tests {
 
         // Assert
         // One prompt, then the turn's closing newline. The second input line
-        // was never consumed.
+        // was never processed as another user turn.
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output, "> \n");
+    }
+
+    #[tokio::test]
+    async fn run_treats_idle_eof_as_a_clean_exit() {
+        // Arrange
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_event_tx, events) = mpsc::channel(1);
+        let agent = AgentHandle {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let mut output = Vec::new();
+
+        // Act
+        let result = run(agent, Cursor::new(""), &mut output).await;
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(String::from_utf8(output).unwrap(), "> ");
     }
 
     #[tokio::test]
@@ -412,14 +551,41 @@ mod tests {
         assert_eq!(String::from_utf8(output).unwrap(), "> ");
     }
 
-    #[test]
-    fn read_decision_returns_deny_with_the_entered_reason() {
+    #[tokio::test]
+    async fn run_exits_when_an_idle_agent_stops_while_input_is_blocked() {
         // Arrange
-        let mut input = Cursor::new("n\nit would clobber my changes\n");
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (event_tx, events) = mpsc::channel(1);
+        drop(event_tx);
+        let agent = AgentHandle {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let input = GatedEof {
+            released: false,
+            release: release_rx,
+        };
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).unwrap();
+        let result = run(agent, input, &mut output).await;
+        release_tx.send(()).unwrap();
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(String::from_utf8(output).unwrap(), "> ");
+    }
+
+    #[tokio::test]
+    async fn read_decision_returns_deny_with_the_entered_reason() {
+        // Arrange
+        let mut input = InputLines::from_reader(Cursor::new("n\nit would clobber my changes\n"));
+        let mut output = Vec::new();
+
+        // Act
+        let decision = read_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
         assert_eq!(
@@ -431,14 +597,14 @@ mod tests {
         assert_eq!(String::from_utf8(output).unwrap(), "> \nreason:\n> ");
     }
 
-    #[test]
-    fn read_decision_treats_an_empty_decision_as_deny() {
+    #[tokio::test]
+    async fn read_decision_treats_an_empty_decision_as_deny() {
         // Arrange
-        let mut input = Cursor::new("\nnot like that\n");
+        let mut input = InputLines::from_reader(Cursor::new("\nnot like that\n"));
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).unwrap();
+        let decision = read_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
         assert_eq!(
@@ -449,27 +615,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_decision_accepts_always_allow_case_insensitively_with_whitespace() {
+    #[tokio::test]
+    async fn read_decision_accepts_always_allow_case_insensitively_with_whitespace() {
         // Arrange
-        let mut input = Cursor::new("  A  \n");
+        let mut input = InputLines::from_reader(Cursor::new("  A  \n"));
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).unwrap();
+        let decision = read_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
         assert_eq!(decision, ApprovalDecision::AlwaysAllowSession);
     }
 
-    #[test]
-    fn read_decision_reprompts_after_unrecognized_input() {
+    #[tokio::test]
+    async fn read_decision_reprompts_after_unrecognized_input() {
         // Arrange
-        let mut input = Cursor::new("maybe\ny\n");
+        let mut input = InputLines::from_reader(Cursor::new("maybe\ny\n"));
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).unwrap();
+        let decision = read_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
         assert_eq!(decision, ApprovalDecision::Allow);
@@ -481,27 +647,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_decision_errors_on_eof_before_a_decision() {
+    #[tokio::test]
+    async fn read_decision_errors_on_eof_before_a_decision() {
         // Arrange
-        let mut input = Cursor::new("");
+        let mut input = InputLines::from_reader(Cursor::new(""));
         let mut output = Vec::new();
 
         // Act
-        let result = read_decision(&mut input, &mut output);
+        let result = read_decision(&mut input, &mut output).await;
 
         // Assert
         assert_eq!(result.unwrap_err().to_string(), "eof");
     }
 
-    #[test]
-    fn read_decision_errors_on_eof_before_a_denial_reason() {
+    #[tokio::test]
+    async fn read_decision_errors_on_eof_before_a_denial_reason() {
         // Arrange
-        let mut input = Cursor::new("n\n");
+        let mut input = InputLines::from_reader(Cursor::new("n\n"));
         let mut output = Vec::new();
 
         // Act
-        let result = read_decision(&mut input, &mut output);
+        let result = read_decision(&mut input, &mut output).await;
 
         // Assert
         assert_eq!(result.unwrap_err().to_string(), "eof");

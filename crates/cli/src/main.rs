@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     let agent = cane_core::spawn_agent(provider, workspace);
 
-    // Esc-to-interrupt stand-in: Ctrl-C trips the cancellation token
+    // Esc-to-interrupt stand-in: Ctrl-C cancels active work or exits an idle session.
     tokio::spawn({
         let cancel = agent.cancel.clone();
         async move {
@@ -45,13 +45,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let stdin = std::io::stdin();
-    let input = stdin.lock();
-
-    let stdout = std::io::stdout();
-    let output = stdout.lock();
-
-    repl::run(agent, input, output).await?;
+    repl::run_stdio(agent).await?;
 
     println!();
 

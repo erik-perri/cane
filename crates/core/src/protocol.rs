@@ -77,7 +77,7 @@ pub struct HostHandle {
 pub enum AgentExit {
     /// Command channel or event channel closed; clean shutdown.
     Disconnected,
-    /// Cancellation token tripped.
+    /// Cancellation token tripped while a turn was active.
     Cancelled,
 }
 
