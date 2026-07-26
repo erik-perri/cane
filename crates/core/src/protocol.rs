@@ -39,6 +39,7 @@ pub enum AgentEvent {
 #[derive(Debug, PartialEq)]
 pub enum TurnOutcome {
     Completed { stop_reason: StopReason },
+    Paused { reason: String },
     Failed,
     Cancelled,
 }

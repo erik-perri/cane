@@ -65,13 +65,20 @@ pub(crate) async fn run(
                     output.flush()?;
                 }
 
-                AgentEvent::TurnComplete { outcome } => {
-                    writeln!(output)?;
-                    if matches!(outcome, TurnOutcome::Cancelled) {
+                AgentEvent::TurnComplete { outcome } => match outcome {
+                    TurnOutcome::Paused { reason } => {
+                        writeln!(output, "\npaused: {reason}")?;
+                        break;
+                    }
+                    TurnOutcome::Cancelled => {
+                        writeln!(output)?;
                         return Ok(());
                     }
-                    break;
-                }
+                    TurnOutcome::Completed { .. } | TurnOutcome::Failed => {
+                        writeln!(output)?;
+                        break;
+                    }
+                },
 
                 AgentEvent::Error(e) => writeln!(output, "\nerror: {e}")?,
 
@@ -300,6 +307,54 @@ mod tests {
         // Assert
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output, "> \nerror: provider fell over\n\n> ");
+    }
+
+    #[tokio::test]
+    async fn run_displays_a_pause_and_accepts_a_continuation() {
+        // Arrange
+        let (commands, mut command_rx) = mpsc::channel(2);
+        let (event_tx, events) = mpsc::channel(2);
+        let agent = AgentHandle {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let frontend = tokio::spawn(async move {
+            assert_eq!(
+                command_rx.recv().await,
+                Some(AgentCommand::UserInput("start".to_string()))
+            );
+            event_tx
+                .send(AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Paused {
+                        reason: "provider round budget reached".to_string(),
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                command_rx.recv().await,
+                Some(AgentCommand::UserInput("Continue".to_string()))
+            );
+            event_tx
+                .send(AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                })
+                .await
+                .unwrap();
+        });
+        let input = Cursor::new("start\nContinue\n/quit\n");
+        let mut output = Vec::new();
+
+        // Act
+        run(agent, input, &mut output).await.unwrap();
+        frontend.await.unwrap();
+
+        // Assert
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, "> \npaused: provider round budget reached\n> \n> ");
     }
 
     #[tokio::test]

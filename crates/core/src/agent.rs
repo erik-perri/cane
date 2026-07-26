@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+const MAX_PROVIDER_ROUNDS_PER_TURN: usize = 24;
+
 pub struct AgentSession {
     client: OpenAiClient,
     host_handle: HostHandle,
@@ -19,6 +21,24 @@ pub struct AgentHandle {
     pub cancel: CancellationToken,
     pub commands: mpsc::Sender<AgentCommand>,
     pub events: mpsc::Receiver<AgentEvent>,
+}
+
+#[derive(Default)]
+struct TurnBudget {
+    provider_rounds: usize,
+}
+
+impl TurnBudget {
+    fn begin_provider_round(&mut self) -> Result<(), String> {
+        if self.provider_rounds >= MAX_PROVIDER_ROUNDS_PER_TURN {
+            return Err(format!(
+                "turn paused after {MAX_PROVIDER_ROUNDS_PER_TURN} provider rounds; send another message to continue with the existing context"
+            ));
+        }
+
+        self.provider_rounds += 1;
+        Ok(())
+    }
 }
 
 pub fn spawn_agent(provider: ProviderConfig, workspace: Workspace) -> AgentHandle {
@@ -153,7 +173,13 @@ impl AgentSession {
         history: &mut Vec<Message>,
         gate: &mut ApprovalGate,
     ) -> Result<TurnOutcome, AgentExit> {
+        let mut budget = TurnBudget::default();
+
         loop {
+            if let Err(reason) = budget.begin_provider_round() {
+                return Ok(TurnOutcome::Paused { reason });
+            }
+
             let stream_result = tokio::select! {
                 _ = self.host_handle.events.closed() => return Err(AgentExit::Disconnected),
                 result = self.client.stream_message(history, self.tool_set.definitions(), self.host_handle.events.sender(), &self.host_handle.cancel) => {
@@ -713,6 +739,85 @@ mod tests {
                 { "role": "assistant", "content": "Hello!" },
                 { "role": "user", "content": "Do you remember my name?" },
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_round_limit_preserves_history_and_resets_for_the_next_turn() {
+        // Arrange
+        let file = temp_file_with(b"alpha");
+        let file_path = file.path().to_str().unwrap();
+        let server = MockServer::start().await;
+        let mut turns = Vec::new();
+        for index in 0..MAX_PROVIDER_ROUNDS_PER_TURN {
+            let id = format!("read-{index}");
+            turns.push(tool_call_turn(&[(
+                &id,
+                "read_file",
+                json!({ "path": file_path }),
+            )]));
+        }
+        turns.push(text_turn("Finished after continuing."));
+        mount_turns(&server, turns).await;
+        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+
+        // Act
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Inspect repeatedly.".to_string()))
+            .await
+            .unwrap();
+        let paused_turn = collect_turn(&mut handle.events).await;
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Continue".to_string()))
+            .await
+            .unwrap();
+        let continued_turn = collect_turn(&mut handle.events).await;
+        drop(handle.commands);
+        let shutdown_events = collect_until_events_close(&mut handle.events).await;
+        let requests = server.received_requests().await.unwrap();
+        let continued_request: Value = requests[MAX_PROVIDER_ROUNDS_PER_TURN].body_json().unwrap();
+        let messages = continued_request["messages"].as_array().unwrap();
+
+        // Assert
+        assert!(matches!(
+            paused_turn.last(),
+            Some(AgentEvent::TurnComplete {
+                outcome: TurnOutcome::Paused { reason }
+            }) if reason
+                == "turn paused after 24 provider rounds; send another message to continue with the existing context"
+        ));
+        assert!(
+            !paused_turn
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error(_))),
+            "a resumable pause must not be reported as an error: {paused_turn:?}"
+        );
+        assert!(matches!(
+            continued_turn.as_slice(),
+            [
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn
+                    }
+                }
+            ] if text == "Finished after continuing."
+        ));
+        assert!(
+            shutdown_events.is_empty(),
+            "clean shutdown emitted unexpected events: {shutdown_events:?}"
+        );
+        assert_eq!(requests.len(), MAX_PROVIDER_ROUNDS_PER_TURN + 1);
+        assert_eq!(messages.len(), 2 * MAX_PROVIDER_ROUNDS_PER_TURN + 2);
+        assert_eq!(
+            messages.first().unwrap(),
+            &json!({ "role": "user", "content": "Inspect repeatedly." })
+        );
+        assert_eq!(
+            messages.last().unwrap(),
+            &json!({ "role": "user", "content": "Continue" })
         );
     }
 
