@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn glob_rejects_a_missing_search_root() {
         // Arrange
-        let (root, tool) = glob_tool();
+        let (_root, tool) = glob_tool();
 
         // Act
         let result = run_glob(
@@ -657,7 +657,7 @@ mod tests {
         else {
             panic!("expected missing-root metadata error");
         };
-        assert_eq!(path, root.path().join("missing"));
+        assert_eq!(path, tool.workspace.root().join("missing"));
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
     }
 
@@ -679,7 +679,7 @@ mod tests {
         let Err(GlobError::Discovery(FileDiscoveryError::RootNotDirectory(path))) = result else {
             panic!("expected root-not-directory error");
         };
-        assert_eq!(path, root.path().join("root.txt"));
+        assert_eq!(path, tool.workspace.root().join("root.txt"));
     }
 
     #[test]

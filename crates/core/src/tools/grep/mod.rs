@@ -536,15 +536,15 @@ mod tests {
     #[test]
     fn omitted_options_use_the_documented_defaults() {
         // Arrange
-        let (root, tool) = grep_tool();
+        let (_root, tool) = grep_tool();
 
         // Act
         let prepared = tool.prepare_grep(json!({ "pattern": "needle" })).unwrap();
 
         // Assert
         assert_eq!(prepared.requested_path, ".");
-        assert_eq!(prepared.search_root, root.path());
-        assert_eq!(prepared.workspace_root, root.path());
+        assert_eq!(prepared.search_root, tool.workspace.root());
+        assert_eq!(prepared.workspace_root, tool.workspace.root());
         assert_eq!(prepared.context, 0);
         assert!(!prepared.multiline);
         assert_eq!(prepared.output_mode, OutputMode::Content);
