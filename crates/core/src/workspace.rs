@@ -264,10 +264,17 @@ mod tests {
         let workspace = Workspace::new(root).unwrap();
 
         // Act
-        let resolved = workspace.resolve(path_str(&outside));
+        let error = workspace.resolve(path_str(&outside)).unwrap_err();
 
         // Assert
-        assert!(resolved.is_err());
+        assert_eq!(
+            error,
+            format!(
+                "access denied: path `{}` is outside workspace root `{}`",
+                outside.display(),
+                workspace.root().display()
+            )
+        );
     }
 
     #[test]
@@ -313,10 +320,17 @@ mod tests {
         let workspace = Workspace::new(workspace_root.path().to_path_buf()).unwrap();
 
         // Act
-        let resolved = workspace.resolve(path_str(&candidate));
+        let error = workspace.resolve(path_str(&candidate)).unwrap_err();
 
         // Assert
-        assert!(resolved.is_err());
+        assert_eq!(
+            error,
+            format!(
+                "access denied: path `{}` is outside workspace root `{}`",
+                candidate.display(),
+                workspace.root().display()
+            )
+        );
     }
 
     #[test]
@@ -342,10 +356,16 @@ mod tests {
         let workspace = Workspace::new(root).unwrap();
 
         // Act
-        let resolved = workspace.resolve("missing/../../outside.txt");
+        let error = workspace.resolve("missing/../../outside.txt").unwrap_err();
 
         // Assert
-        assert!(resolved.is_err());
+        assert_eq!(
+            error,
+            format!(
+                "access denied: path `missing/../../outside.txt` is outside workspace root `{}`",
+                workspace.root().display()
+            )
+        );
     }
 
     #[test]
@@ -360,10 +380,17 @@ mod tests {
         let candidate = root.join("..").join("outside.txt");
 
         // Act
-        let resolved = workspace.resolve(path_str(&candidate));
+        let error = workspace.resolve(path_str(&candidate)).unwrap_err();
 
         // Assert
-        assert!(resolved.is_err());
+        assert_eq!(
+            error,
+            format!(
+                "access denied: path `{}` is outside workspace root `{}`",
+                candidate.display(),
+                workspace.root().display()
+            )
+        );
     }
 
     #[test]
@@ -434,10 +461,16 @@ mod tests {
         let workspace = Workspace::new(root).unwrap();
 
         // Act
-        let resolved = workspace.resolve("link.txt");
+        let error = workspace.resolve("link.txt").unwrap_err();
 
         // Assert
-        assert!(resolved.is_err());
+        assert_eq!(
+            error,
+            format!(
+                "access denied: path `link.txt` is outside workspace root `{}`",
+                workspace.root().display()
+            )
+        );
     }
 
     #[cfg(unix)]
@@ -456,10 +489,16 @@ mod tests {
         let workspace = Workspace::new(workspace_root.path().to_path_buf()).unwrap();
 
         // Act
-        let resolved = workspace.resolve("outside-link/new.txt");
+        let error = workspace.resolve("outside-link/new.txt").unwrap_err();
 
         // Assert
-        assert!(resolved.is_err());
+        assert_eq!(
+            error,
+            format!(
+                "access denied: path `outside-link/new.txt` is outside workspace root `{}`",
+                workspace.root().display()
+            )
+        );
     }
 
     #[cfg(unix)]

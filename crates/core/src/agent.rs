@@ -1236,7 +1236,7 @@ mod tests {
                     AgentEvent::TurnComplete {
                         outcome: TurnOutcome::Failed
                     }
-                ] if msg.contains("401")
+                ] if msg == "api error (401): bad key"
             ),
             "expected an Error followed by a failed TurnComplete, got {events:?}"
         );
@@ -1282,7 +1282,7 @@ mod tests {
                     AgentEvent::TurnComplete {
                         outcome: TurnOutcome::Failed
                     }
-                ] if msg.contains("401")
+                ] if msg == "api error (401): bad key"
             ),
             "expected an Error followed by a failed TurnComplete, got {failed_turn:?}"
         );
@@ -1668,7 +1668,7 @@ mod tests {
                     AgentEvent::TurnComplete {
                         outcome: TurnOutcome::Cancelled
                     }
-                ] if msg.contains("cancel")
+                ] if msg == "cancelled"
             ),
             "expected an Error followed by a cancelled TurnComplete, got {events:?}"
         );

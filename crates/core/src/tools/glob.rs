@@ -39,6 +39,15 @@ pub(super) struct GlobTool {
     workspace: Arc<Workspace>,
 }
 
+#[derive(Debug)]
+struct PreparedGlob {
+    limits: GlobLimits,
+    requested_path: String,
+    search_root: PathBuf,
+    selector: FileSelector,
+    workspace_root: PathBuf,
+}
+
 #[async_trait::async_trait]
 impl Tool for GlobTool {
     fn definition(&self) -> ToolDefinition {
@@ -139,15 +148,6 @@ impl GlobTool {
             workspace_root: self.workspace.root().to_path_buf(),
         })
     }
-}
-
-#[derive(Debug)]
-struct PreparedGlob {
-    limits: GlobLimits,
-    requested_path: String,
-    search_root: PathBuf,
-    selector: FileSelector,
-    workspace_root: PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -535,8 +535,11 @@ mod tests {
         let output = format_result_output(result, 1024);
 
         // Assert
-        assert!(output.contains("src/lib.rs\nsrc/main.rs"));
-        assert!(output.contains("showing 2 most recently modified of 20 matches"));
+        assert_eq!(
+            output,
+            "src/lib.rs\nsrc/main.rs\n[truncated: showing 2 most recently modified of 20 \
+             matches; narrow the pattern or search path]"
+        );
     }
 
     #[test]
@@ -548,13 +551,20 @@ mod tests {
 
         let max_bytes = 256;
 
+        let first_path = paths[0].clone();
         let result = GlobResult::Full(paths);
 
         // Act
         let output = format_result_output(result, max_bytes);
 
         // Assert
-        assert!(output.contains("[truncated: showing 1 most recently modified of 5 matches; output limited to 256 bytes; narrow the pattern or search path]"));
+        assert_eq!(
+            output,
+            format!(
+                "{first_path}\n[truncated: showing 1 most recently modified of 5 matches; output \
+                 limited to 256 bytes; narrow the pattern or search path]"
+            )
+        );
         assert!(output.len() <= max_bytes);
     }
 
@@ -596,7 +606,14 @@ mod tests {
             .unwrap_err();
 
         // Assert
-        assert!(error.contains("outside workspace root"), "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "access denied: path `{}` is outside workspace root `{}`",
+                outside.path().display(),
+                tool.workspace.root().display()
+            )
+        );
     }
 
     #[test]
@@ -625,7 +642,7 @@ mod tests {
     #[test]
     fn glob_rejects_a_missing_search_root() {
         // Arrange
-        let (_root, tool) = glob_tool();
+        let (root, tool) = glob_tool();
 
         // Act
         let result = run_glob(
@@ -636,11 +653,12 @@ mod tests {
         );
 
         // Assert
-        assert!(matches!(
-            result,
-            Err(GlobError::Discovery(FileDiscoveryError::RootMetadata { source, .. }))
-                if source.kind() == std::io::ErrorKind::NotFound
-        ));
+        let Err(GlobError::Discovery(FileDiscoveryError::RootMetadata { path, source })) = result
+        else {
+            panic!("expected missing-root metadata error");
+        };
+        assert_eq!(path, root.path().join("missing"));
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -658,19 +676,19 @@ mod tests {
         );
 
         // Assert
-        assert!(matches!(
-            result,
-            Err(GlobError::Discovery(FileDiscoveryError::RootNotDirectory(path)))
-                if path.ends_with("root.txt")
-        ));
+        let Err(GlobError::Discovery(FileDiscoveryError::RootNotDirectory(path))) = result else {
+            panic!("expected root-not-directory error");
+        };
+        assert_eq!(path, root.path().join("root.txt"));
     }
 
     #[test]
     fn match_limit_returns_the_total_and_only_the_requested_number_of_paths() {
         // Arrange
         let (root, tool) = glob_tool();
-        for name in ["one.rs", "two.rs", "three.rs"] {
+        for (name, modified) in [("one.rs", 1), ("two.rs", 2), ("three.rs", 3)] {
             fs::write(root.path().join(name), name).unwrap();
+            set_mtime(&root.path().join(name), modified);
         }
         let mut limits = generous_limits();
         limits.matches = 2;
@@ -685,13 +703,13 @@ mod tests {
         .unwrap();
 
         // Assert
-        assert!(matches!(
+        assert_eq!(
             result,
             GlobResult::Truncated {
-                paths,
+                paths: vec!["three.rs".to_string(), "two.rs".to_string()],
                 total_matches: 3,
-            } if paths.len() == 2
-        ));
+            }
+        );
     }
 
     #[tokio::test]

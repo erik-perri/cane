@@ -1427,7 +1427,10 @@ mod tests {
         // Assert
         match error {
             ProviderError::Protocol { detail } => {
-                assert!(detail.contains("exceeds the per-turn cap"), "{detail}");
+                assert_eq!(
+                    detail,
+                    format!("tool call index {MAX_TOOL_CALLS_PER_TURN} exceeds the per-turn cap")
+                );
             }
             other => panic!("expected ProviderError::Protocol, got {other:?}"),
         }
@@ -1505,7 +1508,10 @@ mod tests {
         // Assert
         match error {
             ProviderError::Protocol { detail } => {
-                assert!(detail.contains("[DONE]"), "{detail}");
+                assert_eq!(
+                    detail,
+                    "stream completed ([DONE]) but no chunk carried a finish_reason"
+                );
             }
             other => panic!("expected ProviderError::Protocol, got {other:?}"),
         }

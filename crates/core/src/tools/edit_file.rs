@@ -966,7 +966,7 @@ mod tests {
 
         // Assert
         assert_eq!(output, "edited `exact.txt`; 1 occurrence replaced");
-        assert!(fs::read_to_string(target).unwrap().ends_with("new"));
+        assert_eq!(fs::read_to_string(target).unwrap(), format!("{padding}new"));
     }
 
     #[cfg(unix)]
