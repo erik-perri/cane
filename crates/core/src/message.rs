@@ -22,6 +22,13 @@ pub struct ToolResultData {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ToolInput {
+    Valid(serde_json::Value),
+    Invalid(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -30,9 +37,7 @@ pub enum ContentBlock {
     ToolUse {
         id: String,
         name: String,
-        input: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        raw_input: Option<String>,
+        input: ToolInput,
     },
     ToolResult(ToolResultData),
 }
@@ -43,7 +48,8 @@ impl From<ToolResultData> for ContentBlock {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
     ToolUse,
@@ -69,8 +75,7 @@ mod tests {
                 ToolUse {
                     id: "Mock ID".to_string(),
                     name: "Mock Name".to_string(),
-                    input: serde_json::Value::String("Mock Input".to_string()),
-                    raw_input: None,
+                    input: ToolInput::Valid(serde_json::Value::String("Mock Input".to_string())),
                 },
                 ToolResult(ToolResultData {
                     tool_use_id: "Mock ID".to_string(),
@@ -92,7 +97,12 @@ mod tests {
                 "role": "assistant",
                 "content": [
                     { "type": "text", "text": "Mock Text" },
-                    { "type": "tool_use", "id": "Mock ID", "name": "Mock Name", "input": "Mock Input" },
+                    {
+                        "type": "tool_use",
+                        "id": "Mock ID",
+                        "name": "Mock Name",
+                        "input": { "type": "valid", "value": "Mock Input" }
+                    },
                     { "type": "tool_result", "tool_use_id": "Mock ID", "content": "Mock Content", "is_error": true }
                 ]
             })
@@ -128,10 +138,16 @@ mod tests {
 
     #[test]
     fn message_deserializes_missing_optional_fields_to_their_defaults() {
+        // Arrange
         let serialized = json!({
             "role": "assistant",
             "content": [
-                { "type": "tool_use", "id": "Mock ID", "name": "Mock Name", "input": {} },
+                {
+                    "type": "tool_use",
+                    "id": "Mock ID",
+                    "name": "Mock Name",
+                    "input": { "type": "valid", "value": {} }
+                },
                 { "type": "tool_result", "tool_use_id": "Mock ID", "content": "Mock Content" },
             ]
         });
@@ -143,7 +159,7 @@ mod tests {
         assert!(matches!(
             &unserialized.content[0],
             ToolUse {
-                raw_input: None,
+                input: ToolInput::Valid(_),
                 ..
             }
         ));
@@ -154,5 +170,25 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn invalid_tool_input_serializes_once_and_round_trips() {
+        // Arrange
+        let input = ToolInput::Invalid("{\"path\": unclosed".to_string());
+
+        // Act
+        let serialized = serde_json::to_value(&input).unwrap();
+        let unserialized: ToolInput = serde_json::from_value(serialized.clone()).unwrap();
+
+        // Assert
+        assert_eq!(unserialized, input);
+        assert_eq!(
+            serialized,
+            json!({
+                "type": "invalid",
+                "value": "{\"path\": unclosed"
+            })
+        );
     }
 }

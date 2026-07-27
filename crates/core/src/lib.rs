@@ -1,5 +1,6 @@
 mod agent;
 mod approval;
+pub mod journal;
 mod message;
 mod protocol;
 mod provider;
@@ -7,7 +8,8 @@ mod tools;
 mod workspace;
 
 pub use agent::{AgentHandle, spawn_agent};
-pub use message::StopReason;
+pub use message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 pub use protocol::{AgentCommand, AgentEvent, ApprovalDecision, TurnOutcome};
-pub use provider::ProviderConfig;
+pub use provider::{ModelTurn, ModelUsage, ProviderConfig, ReportedCost};
+pub use tools::ToolDefinition;
 pub use workspace::Workspace;

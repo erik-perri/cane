@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -78,11 +79,11 @@ impl ToolSet {
 }
 
 /// A tool the model can call.
-#[derive(Clone, Debug)]
-pub(crate) struct ToolDefinition {
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) input_schema: Value,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
 }
 
 #[async_trait::async_trait]

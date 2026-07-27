@@ -1,7 +1,7 @@
-use crate::message::{ContentBlock, Message, Role, StopReason, ToolResultData};
+use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::AgentEvent;
-use crate::provider::ProviderError;
 use crate::provider::sse::SseParser;
+use crate::provider::{ModelTurn, ProviderError};
 use crate::tools::ToolDefinition;
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -163,7 +163,7 @@ impl OpenAiClient {
         tools: &[ToolDefinition],
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
-    ) -> Result<(Message, StopReason), ProviderError> {
+    ) -> Result<ModelTurn, ProviderError> {
         let body = self.build_request(messages, tools);
 
         let response = tokio::select! {
@@ -282,25 +282,25 @@ impl OpenAiClient {
                     });
                 }
 
-                let (input, raw_input) = parse_tool_arguments(tool_call.args_buf);
-
                 content.push(ContentBlock::ToolUse {
                     id: tool_call.id,
-                    input,
+                    input: parse_tool_arguments(tool_call.args_buf),
                     name: tool_call.name,
-                    raw_input,
                 })
             }
 
             let end_reason = resolve_stop_reason(&content, Some(&finish));
 
-            return Ok((
-                Message {
+            return Ok(ModelTurn {
+                message: Message {
                     role: Role::Assistant,
                     content,
                 },
-                end_reason,
-            ));
+                stop_reason: end_reason,
+                usage: None,
+                request_id: None,
+                provider_cost: None,
+            });
         }
 
         Err(ProviderError::Protocol {
@@ -387,16 +387,12 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
                         ContentBlock::Text { text } => {
                             combined_text.push_str(text);
                         }
-                        ContentBlock::ToolUse {
-                            id,
-                            input,
-                            name,
-                            raw_input,
-                        } => {
-                            let arguments = raw_input.clone().unwrap_or_else(|| {
-                                serde_json::to_string(&input)
-                                    .expect("failed to serialize tool call arguments")
-                            });
+                        ContentBlock::ToolUse { id, input, name } => {
+                            let arguments = match input {
+                                ToolInput::Valid(input) => serde_json::to_string(input)
+                                    .expect("failed to serialize tool call arguments"),
+                                ToolInput::Invalid(raw) => raw.clone(),
+                            };
 
                             tool_calls.push(OpenAiRequestToolCall {
                                 function: OpenAiRequestFunctionCall {
@@ -445,14 +441,14 @@ fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
 /// not an error, so it maps to `{}`. A non-empty string that doesn't parse is
 /// kept raw so the tool layer can reject it with context instead of the turn
 /// failing here.
-fn parse_tool_arguments(raw: String) -> (serde_json::Value, Option<String>) {
+fn parse_tool_arguments(raw: String) -> ToolInput {
     if raw.trim().is_empty() {
-        return (serde_json::json!({}), None);
+        return ToolInput::Valid(serde_json::json!({}));
     }
 
     match serde_json::from_str(&raw) {
-        Ok(value) => (value, None),
-        Err(_) => (serde_json::Value::String(raw.clone()), Some(raw)),
+        Ok(value) => ToolInput::Valid(value),
+        Err(_) => ToolInput::Invalid(raw),
     }
 }
 
@@ -540,8 +536,7 @@ mod tests {
                 content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
                     name: "read_file".to_string(),
-                    input: json!({"path": "Cargo.toml"}),
-                    raw_input: None,
+                    input: ToolInput::Valid(json!({"path": "Cargo.toml"})),
                 }],
             },
             Message {
@@ -648,8 +643,7 @@ mod tests {
             content: vec![ContentBlock::ToolUse {
                 id: "call_bad".to_string(),
                 name: "read_file".to_string(),
-                input: serde_json::Value::String(raw_input.to_string()),
-                raw_input: Some(raw_input.to_string()),
+                input: ToolInput::Invalid(raw_input.to_string()),
             }],
         }];
 
@@ -965,7 +959,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1019,7 +1017,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1032,8 +1034,7 @@ mod tests {
                 content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
                     name: "read_file".to_string(),
-                    input: json!({ "path": "Cargo.toml" }),
-                    raw_input: None,
+                    input: ToolInput::Valid(json!({ "path": "Cargo.toml" })),
                 }],
             }
         );
@@ -1070,7 +1071,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1111,7 +1116,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1152,7 +1161,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1165,8 +1178,7 @@ mod tests {
                 content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
                     name: "list_tools".to_string(),
-                    input: json!({}),
-                    raw_input: None,
+                    input: ToolInput::Valid(json!({})),
                 }],
             }
         );
@@ -1203,7 +1215,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1216,8 +1232,7 @@ mod tests {
                 content: vec![ContentBlock::ToolUse {
                     id: "call_bad".to_string(),
                     name: "read_file".to_string(),
-                    input: serde_json::Value::String("{\"path\": unclosed".to_string()),
-                    raw_input: Some("{\"path\": unclosed".to_string()),
+                    input: ToolInput::Invalid("{\"path\": unclosed".to_string()),
                 }],
             }
         );
@@ -1261,7 +1276,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1275,14 +1294,12 @@ mod tests {
                     ContentBlock::ToolUse {
                         id: "call_abc".to_string(),
                         name: "read_file".to_string(),
-                        input: json!({ "path": "a.txt" }),
-                        raw_input: None,
+                        input: ToolInput::Valid(json!({ "path": "a.txt" })),
                     },
                     ContentBlock::ToolUse {
                         id: "call_def".to_string(),
                         name: "read_file".to_string(),
-                        input: json!({ "path": "b.txt" }),
-                        raw_input: None,
+                        input: ToolInput::Valid(json!({ "path": "b.txt" })),
                     },
                 ],
             }
@@ -1320,7 +1337,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = test_client(&server)
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = test_client(&server)
             .stream_message(&user_history(), &[], &tx, &cancel)
             .await
             .unwrap();
@@ -1341,8 +1362,7 @@ mod tests {
                     ContentBlock::ToolUse {
                         id: "call_abc".to_string(),
                         name: "read_file".to_string(),
-                        input: json!({ "path": "Cargo.toml" }),
-                        raw_input: None,
+                        input: ToolInput::Valid(json!({ "path": "Cargo.toml" })),
                     },
                 ],
             }
@@ -1618,7 +1638,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Act
-        let (message, stop_reason) = client
+        let ModelTurn {
+            message,
+            stop_reason,
+            ..
+        } = client
             .stream_message(&messages, &[], &tx, &cancel)
             .await
             .unwrap();

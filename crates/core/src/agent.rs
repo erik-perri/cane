@@ -1,8 +1,8 @@
 use crate::Workspace;
 use crate::approval::{ApprovalAuthorization, ApprovalGate};
-use crate::message::{ContentBlock, Message, Role, StopReason, ToolResultData};
+use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
-use crate::provider::{OpenAiClient, ProviderConfig, ProviderError};
+use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::tools::{PreparedInvocation, ToolExecutionError, ToolSet};
 use serde_json::Value;
 use std::sync::Arc;
@@ -187,7 +187,11 @@ impl AgentSession {
                 }
             };
 
-            let (assistant_msg, stop_reason) = match stream_result {
+            let ModelTurn {
+                message: assistant_msg,
+                stop_reason,
+                ..
+            } = match stream_result {
                 Ok(result) => result,
                 Err(error) => {
                     let cancelled = matches!(&error, ProviderError::Cancelled);
@@ -220,7 +224,26 @@ impl AgentSession {
                     ContentBlock::ToolUse {
                         id, input, name, ..
                     } => {
-                        let tool_result = self.execute_tool_call(id, name, input, gate).await?;
+                        let tool_result = match input {
+                            ToolInput::Valid(input) => {
+                                self.execute_tool_call(id, name, input, gate).await?
+                            }
+                            ToolInput::Invalid(raw) => {
+                                let error = format!(
+                                    "invalid input for tool `{name}`: arguments are not valid JSON: {raw}"
+                                );
+
+                                self.host_handle
+                                    .events
+                                    .emit(AgentEvent::ToolRejected {
+                                        name: name.to_string(),
+                                        error: error.clone(),
+                                    })
+                                    .await?;
+
+                                failed_tool_result(id, error)
+                            }
+                        };
 
                         results.push(ContentBlock::ToolResult(tool_result));
                     }
@@ -448,6 +471,23 @@ mod tests {
             .chain([stream_chunk(json!({}), Some("tool_calls"))])
             .collect();
         sse_response(&chunks)
+    }
+
+    fn malformed_tool_call_turn(id: &str, name: &str, arguments: &str) -> ResponseTemplate {
+        sse_response(&[
+            stream_chunk(
+                json!({
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                }),
+                None,
+            ),
+            stream_chunk(json!({}), Some("tool_calls")),
+        ])
     }
 
     async fn mount_turns(server: &MockServer, turns: Vec<ResponseTemplate>) {
@@ -1359,6 +1399,51 @@ mod tests {
                 "role": "tool",
                 "tool_call_id": "call_abc",
                 "content": "Error: unknown tool: `write_the_file_at_the_path`"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_input_is_rejected_without_preparing_or_executing_the_tool() {
+        // Arrange
+        let server = MockServer::start().await;
+        let malformed_input = "{\"path\": unclosed";
+        mount_turns(
+            &server,
+            vec![
+                malformed_tool_call_turn("call_bad", "read_file", malformed_input),
+                text_turn("I need to retry that call."),
+            ],
+        )
+        .await;
+
+        // Act
+        let events = run_agent("Read the file", &server).await;
+        let messages = nth_request_messages(&server, 1).await;
+
+        // Assert
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolRejected { name, error }
+                if name == "read_file" && error.contains("arguments are not valid JSON")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            malformed_input
+        );
+        assert_eq!(
+            messages[2],
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_bad",
+                "content": format!(
+                    "Error: invalid input for tool `read_file`: arguments are not valid JSON: {malformed_input}"
+                )
             })
         );
     }
