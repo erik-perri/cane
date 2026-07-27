@@ -1,38 +1,96 @@
 use crate::{Message, ModelUsage, ReportedCost, StopReason, ToolDefinition};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
+use std::str::FromStr;
+use thiserror::Error;
+use ulid::{DecodeError, Ulid};
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 
+#[derive(Debug, Error)]
+pub enum IdParseError {
+    #[error("ID '{value}' must start with '{expected_prefix}'")]
+    InvalidPrefix {
+        expected_prefix: &'static str,
+        value: String,
+    },
+
+    #[error("ID '{value}' does not contain a valid ULID: {source}")]
+    InvalidUlid {
+        #[source]
+        source: DecodeError,
+        value: String,
+    },
+}
+
 macro_rules! string_id {
-    ($name:ident) => {
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(String);
+    ($name:ident, $prefix:literal) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(Ulid);
 
         impl $name {
-            pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
+            pub fn from_ulid(value: Ulid) -> Self {
+                Self(value)
             }
 
-            pub fn as_str(&self) -> &str {
-                &self.0
+            pub fn generate() -> Self {
+                Self(Ulid::generate())
             }
         }
 
         impl Display for $name {
             fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(&self.0)
+                write!(formatter, "{}_{}", $prefix, self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                let expected_prefix = concat!($prefix, "_");
+                let encoded = value.strip_prefix(expected_prefix).ok_or_else(|| {
+                    IdParseError::InvalidPrefix {
+                        expected_prefix,
+                        value: value.to_string(),
+                    }
+                })?;
+                let ulid =
+                    Ulid::from_string(encoded).map_err(|source| IdParseError::InvalidUlid {
+                        source,
+                        value: value.to_string(),
+                    })?;
+
+                Ok(Self(ulid))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
             }
         }
     };
 }
 
-string_id!(SessionId);
-string_id!(RunId);
-string_id!(TurnId);
-string_id!(ProviderRoundId);
-string_id!(ApprovalId);
+string_id!(SessionId, "sess");
+string_id!(RunId, "run");
+string_id!(TurnId, "turn");
+string_id!(ProviderRoundId, "round");
+string_id!(ApprovalId, "appr");
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JournalRecord {
@@ -297,15 +355,15 @@ mod tests {
     use serde_json::json;
 
     fn session_id() -> SessionId {
-        SessionId::new("01K1SESSION")
+        "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
     }
 
     fn run_id() -> RunId {
-        RunId::new("01K1RUN")
+        "run_01ARZ3NDEKTSV4RRFFQ69G5FAW".parse().unwrap()
     }
 
     fn turn_id() -> TurnId {
-        TurnId::new("01K1TURN")
+        "turn_01ARZ3NDEKTSV4RRFFQ69G5FAX".parse().unwrap()
     }
 
     #[test]
@@ -341,11 +399,11 @@ mod tests {
                 "schema_version": 1,
                 "sequence": 3,
                 "recorded_at": "2026-07-26T18:42:00.123Z",
-                "session_id": "01K1SESSION",
+                "session_id": "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 "type": "message_added",
                 "data": {
-                    "run_id": "01K1RUN",
-                    "turn_id": "01K1TURN",
+                    "run_id": "run_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                    "turn_id": "turn_01ARZ3NDEKTSV4RRFFQ69G5FAX",
                     "message": {
                         "role": "assistant",
                         "content": [{
@@ -373,7 +431,7 @@ mod tests {
             JournalEntry::ProviderRoundCompleted(ProviderRoundCompleted {
                 run_id: run_id(),
                 turn_id: turn_id(),
-                provider_round_id: ProviderRoundId::new("01K1ROUND"),
+                provider_round_id: "round_01ARZ3NDEKTSV4RRFFQ69G5FAY".parse().unwrap(),
                 latency_ms: 1250,
                 stop_reason: StopReason::EndTurn,
                 usage: Some(ModelUsage {
@@ -398,5 +456,43 @@ mod tests {
 
         // Assert
         assert_eq!(unserialized, record);
+    }
+
+    #[test]
+    fn prefixed_ids_reject_the_wrong_domain_and_invalid_ulids() {
+        // Arrange
+        let wrong_domain = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let invalid_ulid = "sess_not-a-ulid";
+
+        // Act
+        let wrong_domain_error = wrong_domain.parse::<SessionId>().unwrap_err();
+        let invalid_ulid_error = invalid_ulid.parse::<SessionId>().unwrap_err();
+
+        // Assert
+        assert!(matches!(
+            wrong_domain_error,
+            IdParseError::InvalidPrefix {
+                expected_prefix: "sess_",
+                ..
+            }
+        ));
+        assert!(matches!(
+            invalid_ulid_error,
+            IdParseError::InvalidUlid { .. }
+        ));
+    }
+
+    #[test]
+    fn generated_ids_use_the_domain_prefix_and_round_trip() {
+        // Arrange
+        let generated = ApprovalId::generate();
+
+        // Act
+        let serialized = serde_json::to_string(&generated).unwrap();
+        let unserialized: ApprovalId = serde_json::from_str(&serialized).unwrap();
+
+        // Assert
+        assert!(serialized.starts_with("\"appr_"));
+        assert_eq!(unserialized, generated);
     }
 }
