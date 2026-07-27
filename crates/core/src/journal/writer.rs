@@ -1,4 +1,5 @@
 use super::{JournalEntry, JournalRecord, SessionId};
+use jiff::Timestamp;
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -78,12 +79,17 @@ impl SessionJournal {
         })
     }
 
-    pub async fn append(
+    pub async fn append(&mut self, entry: JournalEntry) -> Result<JournalRecord, JournalError> {
+        self.writer.append_at(Timestamp::now(), entry).await
+    }
+
+    #[cfg(test)]
+    async fn append_at(
         &mut self,
-        recorded_at: impl Into<String>,
+        recorded_at: Timestamp,
         entry: JournalEntry,
     ) -> Result<JournalRecord, JournalError> {
-        self.writer.append(recorded_at, entry).await
+        self.writer.append_at(recorded_at, entry).await
     }
 
     pub fn path(&self) -> &Path {
@@ -99,9 +105,9 @@ impl<W> JournalWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    async fn append(
+    async fn append_at(
         &mut self,
-        recorded_at: impl Into<String>,
+        recorded_at: Timestamp,
         entry: JournalEntry,
     ) -> Result<JournalRecord, JournalError> {
         if self.poisoned {
@@ -228,7 +234,10 @@ mod tests {
 
         // Act
         let record = journal
-            .append("2026-07-27T12:00:00.123Z", session_started())
+            .append_at(
+                "2026-07-27T12:00:00.123Z".parse().unwrap(),
+                session_started(),
+            )
             .await
             .unwrap();
         let contents = fs::read_to_string(journal.path()).await.unwrap();
@@ -258,12 +267,15 @@ mod tests {
 
         // Act
         let first = journal
-            .append("2026-07-27T12:00:00.123Z", session_started())
+            .append_at(
+                "2026-07-27T12:00:00.123Z".parse().unwrap(),
+                session_started(),
+            )
             .await
             .unwrap();
         let second = journal
-            .append(
-                "2026-07-27T12:00:01.456Z",
+            .append_at(
+                "2026-07-27T12:00:01.456Z".parse().unwrap(),
                 JournalEntry::RunEnded(RunEnded {
                     reason: RunEndReason::UserQuit,
                     run_id: "run_01ARZ3NDEKTSV4RRFFQ69G5FAW".parse().unwrap(),
@@ -322,11 +334,17 @@ mod tests {
 
         // Act
         let first_error = writer
-            .append("2026-07-27T12:00:00.123Z", session_started())
+            .append_at(
+                "2026-07-27T12:00:00.123Z".parse().unwrap(),
+                session_started(),
+            )
             .await
             .unwrap_err();
         let retry_error = writer
-            .append("2026-07-27T12:00:01.456Z", session_started())
+            .append_at(
+                "2026-07-27T12:00:01.456Z".parse().unwrap(),
+                session_started(),
+            )
             .await
             .unwrap_err();
 

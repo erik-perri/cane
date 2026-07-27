@@ -1,4 +1,5 @@
 use crate::{Message, ModelUsage, ReportedCost, StopReason, ToolDefinition};
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -96,7 +97,7 @@ string_id!(ApprovalId, "appr");
 pub struct JournalRecord {
     #[serde(flatten)]
     pub entry: JournalEntry,
-    pub recorded_at: String,
+    pub recorded_at: Timestamp,
     pub schema_version: u32,
     pub sequence: u64,
     pub session_id: SessionId,
@@ -105,13 +106,13 @@ pub struct JournalRecord {
 impl JournalRecord {
     pub fn new(
         sequence: u64,
-        recorded_at: impl Into<String>,
+        recorded_at: Timestamp,
         session_id: SessionId,
         entry: JournalEntry,
     ) -> Self {
         Self {
             entry,
-            recorded_at: recorded_at.into(),
+            recorded_at,
             schema_version: JOURNAL_SCHEMA_VERSION,
             sequence,
             session_id,
@@ -371,7 +372,7 @@ mod tests {
         // Arrange
         let record = JournalRecord::new(
             3,
-            "2026-07-26T18:42:00.123Z",
+            "2026-07-26T18:42:00.123Z".parse().unwrap(),
             session_id(),
             JournalEntry::MessageAdded(MessageAdded {
                 run_id: run_id(),
@@ -426,7 +427,7 @@ mod tests {
         // Arrange
         let record = JournalRecord::new(
             5,
-            "2026-07-26T18:42:01Z",
+            "2026-07-26T18:42:01Z".parse().unwrap(),
             session_id(),
             JournalEntry::ProviderRoundCompleted(ProviderRoundCompleted {
                 run_id: run_id(),
