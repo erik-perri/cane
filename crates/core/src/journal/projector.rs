@@ -558,7 +558,7 @@ fn authorize_tool_start(
                 ));
             }
         }
-        ToolAuthorization::NotRequired => return Ok(()),
+        ToolAuthorization::NotRequired => {}
     }
     Ok(())
 }
