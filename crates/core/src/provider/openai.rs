@@ -1,9 +1,10 @@
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::AgentEvent;
 use crate::provider::sse::SseParser;
-use crate::provider::{ModelTurn, ProviderAdapter, ProviderDescriptor, ProviderError};
+use crate::provider::{ModelTurn, ModelUsage, ProviderAdapter, ProviderDescriptor, ProviderError};
 use crate::tools::ToolDefinition;
 use futures_util::stream::StreamExt;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -17,8 +18,14 @@ struct OpenAiRequest {
     messages: Vec<OpenAiRequestMessage>,
     model: String,
     stream: bool,
+    stream_options: OpenAiStreamOptions,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiRequestTool>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct OpenAiStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -77,6 +84,27 @@ pub(crate) struct OpenAiClient {
 #[derive(Debug, Deserialize)]
 struct OpenAiStreamChunk {
     choices: Vec<StreamChoice>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    completion_tokens: Option<u64>,
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+    prompt_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletionTokensDetails {
+    reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    cache_write_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +196,9 @@ impl OpenAiClient {
             messages: to_wire(messages),
             model: self.model.clone(),
             stream: true,
+            stream_options: OpenAiStreamOptions {
+                include_usage: true,
+            },
             tools: openai_tools,
         }
     }
@@ -187,6 +218,7 @@ impl OpenAiClient {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             result = self.post(&body) => result?,
         };
+        let request_id = response_request_id(response.headers());
         let mut stream = response.bytes_stream();
         let mut parser = SseParser::default();
 
@@ -194,6 +226,7 @@ impl OpenAiClient {
         let mut tool_calls: Vec<PartialToolCall> = Vec::new();
         let mut finish = None;
         let mut saw_done = false;
+        let mut usage = None;
 
         loop {
             let chunk = tokio::select! {
@@ -216,6 +249,10 @@ impl OpenAiClient {
                 let parsed_data = serde_json::from_str::<OpenAiStreamChunk>(&event.data);
                 match parsed_data {
                     Ok(data) => {
+                        if let Some(reported_usage) = data.usage {
+                            usage = Some(normalize_usage(reported_usage));
+                        }
+
                         for choice in data.choices {
                             if let Some(delta) = choice.delta.content
                                 && !delta.is_empty()
@@ -314,9 +351,9 @@ impl OpenAiClient {
                     content,
                 },
                 stop_reason: end_reason,
-                usage: None,
-                request_id: None,
                 provider_cost: None,
+                request_id,
+                usage,
             });
         }
 
@@ -351,6 +388,30 @@ impl OpenAiClient {
 
         Ok(response)
     }
+}
+
+fn normalize_usage(usage: OpenAiUsage) -> ModelUsage {
+    ModelUsage {
+        cache_write_input_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_write_tokens),
+        cached_input_tokens: usage
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens),
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .and_then(|details| details.reasoning_tokens),
+        total_tokens: usage.total_tokens,
+    }
+}
+
+fn response_request_id(headers: &HeaderMap) -> Option<String> {
+    ["x-request-id", "x-generation-id"]
+        .into_iter()
+        .find_map(|name| headers.get(name)?.to_str().ok().map(str::to_owned))
 }
 
 fn to_wire(messages: &[Message]) -> Vec<OpenAiRequestMessage> {
@@ -903,6 +964,7 @@ mod tests {
         let body: serde_json::Value = request.body_json().unwrap();
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"], json!({ "include_usage": true }));
         assert!(body["max_tokens"].is_u64(), "max_tokens missing: {body}");
         assert_eq!(
             body["messages"],
@@ -1022,6 +1084,95 @@ mod tests {
             }
         );
         assert_eq!(stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn stream_message_normalizes_usage_and_the_provider_request_id() {
+        // Arrange
+        let server = MockServer::start().await;
+        let body = sse_stream(&[
+            stream_chunk(
+                json!({ "role": "assistant", "content": "Hello" }),
+                Some("stop"),
+            ),
+            json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1751980000,
+                "model": "test-model",
+                "choices": [],
+                "usage": {
+                    "completion_tokens": 30,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 12
+                    },
+                    "prompt_tokens": 120,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 40,
+                        "cache_write_tokens": 20
+                    },
+                    "total_tokens": 150
+                }
+            }),
+        ]);
+        mount_response(
+            &server,
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-request-id", "request-123")
+                .set_body_string(body),
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // Act
+        let turn = test_client(&server)
+            .stream_message(&user_history(), &[], &tx, &cancel)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(turn.provider_cost, None);
+        assert_eq!(turn.request_id.as_deref(), Some("request-123"));
+        assert_eq!(
+            turn.usage,
+            Some(ModelUsage {
+                cache_write_input_tokens: Some(20),
+                cached_input_tokens: Some(40),
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+                reasoning_tokens: Some(12),
+                total_tokens: Some(150),
+            })
+        );
+    }
+
+    #[test]
+    fn response_request_id_falls_back_to_the_generation_header() {
+        // Arrange
+        let mut headers = HeaderMap::new();
+        headers.insert("x-generation-id", "generation-123".parse().unwrap());
+
+        // Act
+        let request_id = response_request_id(&headers);
+
+        // Assert
+        assert_eq!(request_id.as_deref(), Some("generation-123"));
+    }
+
+    #[test]
+    fn response_request_id_prefers_the_request_header() {
+        // Arrange
+        let mut headers = HeaderMap::new();
+        headers.insert("x-generation-id", "generation-123".parse().unwrap());
+        headers.insert("x-request-id", "request-123".parse().unwrap());
+
+        // Act
+        let request_id = response_request_id(&headers);
+
+        // Assert
+        assert_eq!(request_id.as_deref(), Some("request-123"));
     }
 
     #[tokio::test]
