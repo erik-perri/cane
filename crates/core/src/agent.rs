@@ -65,6 +65,41 @@ struct AuthorizedToolCall<'a> {
     turn_id: TurnId,
 }
 
+enum TurnResult {
+    Completed { stop_reason: StopReason },
+    Paused { reason: String },
+    Failed { error: Option<ErrorDetail> },
+    Cancelled,
+}
+
+impl TurnResult {
+    fn outcome(&self) -> TurnOutcome {
+        match self {
+            Self::Completed { stop_reason } => TurnOutcome::Completed {
+                stop_reason: stop_reason.clone(),
+            },
+            Self::Paused { reason } => TurnOutcome::Paused {
+                reason: reason.clone(),
+            },
+            Self::Failed { .. } => TurnOutcome::Failed,
+            Self::Cancelled => TurnOutcome::Cancelled,
+        }
+    }
+
+    fn failed(category: &str, message: impl Into<String>) -> Self {
+        Self::Failed {
+            error: Some(ErrorDetail {
+                category: category.to_string(),
+                message: message.into(),
+            }),
+        }
+    }
+
+    fn unattributed_failure() -> Self {
+        Self::Failed { error: None }
+    }
+}
+
 impl TurnBudget {
     fn begin_provider_round(&mut self) -> Result<(), String> {
         if self.provider_rounds >= MAX_PROVIDER_ROUNDS_PER_TURN {
@@ -225,11 +260,13 @@ impl AgentSession {
                 .run_turn(turn_id, &mut history, &mut approval_gate)
                 .await
             {
-                Ok(outcome) => {
-                    let session_over = matches!(outcome, TurnOutcome::Cancelled);
-                    let needs_rollback = session_over || matches!(outcome, TurnOutcome::Failed);
+                Ok(result) => {
+                    let session_over = matches!(result, TurnResult::Cancelled);
+                    let needs_rollback =
+                        session_over || matches!(result, TurnResult::Failed { .. });
+                    let outcome = result.outcome();
 
-                    self.record_turn_outcome(turn_id, &outcome).await?;
+                    self.record_turn_outcome(turn_id, &result).await?;
 
                     if needs_rollback {
                         // Truncate the history on failure so we don't leave an incomplete
@@ -272,10 +309,10 @@ impl AgentSession {
     async fn record_turn_outcome(
         &mut self,
         turn_id: TurnId,
-        outcome: &TurnOutcome,
+        result: &TurnResult,
     ) -> Result<(), AgentExit> {
-        match outcome {
-            TurnOutcome::Completed { stop_reason } => {
+        match result {
+            TurnResult::Completed { stop_reason } => {
                 self.journal
                     .commit_turn(
                         turn_id,
@@ -285,7 +322,7 @@ impl AgentSession {
                     )
                     .await?;
             }
-            TurnOutcome::Paused { reason } => {
+            TurnResult::Paused { reason } => {
                 self.journal
                     .commit_turn(
                         turn_id,
@@ -295,12 +332,17 @@ impl AgentSession {
                     )
                     .await?;
             }
-            TurnOutcome::Failed => {
+            TurnResult::Failed { error } => {
                 self.journal
-                    .abort_turn(turn_id, TurnAbortOutcome::Failed { error: None })
+                    .abort_turn(
+                        turn_id,
+                        TurnAbortOutcome::Failed {
+                            error: error.clone(),
+                        },
+                    )
                     .await?;
             }
-            TurnOutcome::Cancelled => {
+            TurnResult::Cancelled => {
                 self.journal
                     .abort_turn(turn_id, TurnAbortOutcome::Cancelled)
                     .await?;
@@ -315,12 +357,12 @@ impl AgentSession {
         turn_id: TurnId,
         history: &mut Vec<Message>,
         gate: &mut ApprovalGate,
-    ) -> Result<TurnOutcome, AgentExit> {
+    ) -> Result<TurnResult, AgentExit> {
         let mut budget = TurnBudget::default();
 
         loop {
             if let Err(reason) = budget.begin_provider_round() {
-                return Ok(TurnOutcome::Paused { reason });
+                return Ok(TurnResult::Paused { reason });
             }
 
             let provider_round_id = self.journal.provider_round_started(turn_id).await?;
@@ -365,9 +407,9 @@ impl AgentSession {
                         .await?;
 
                     return if cancelled {
-                        Ok(TurnOutcome::Cancelled)
+                        Ok(TurnResult::Cancelled)
                     } else {
-                        Ok(TurnOutcome::Failed)
+                        Ok(TurnResult::unattributed_failure())
                     };
                 }
             };
@@ -385,14 +427,14 @@ impl AgentSession {
                     .events
                     .emit(AgentEvent::Error(error.to_string()))
                     .await?;
-                return Ok(TurnOutcome::Failed);
+                return Ok(TurnResult::failed("invalid_assistant_message", error));
             }
 
             self.journal.message_added(&assistant_msg, turn_id).await?;
             history.push(assistant_msg);
 
             if stop_reason != StopReason::ToolUse {
-                return Ok(TurnOutcome::Completed { stop_reason });
+                return Ok(TurnResult::Completed { stop_reason });
             }
 
             let mut results = Vec::new();
@@ -446,7 +488,10 @@ impl AgentSession {
                     ))
                     .await?;
 
-                return Ok(TurnOutcome::Failed);
+                return Ok(TurnResult::failed(
+                    "agent_invariant",
+                    "no tool results were generated",
+                ));
             }
 
             let result_message = Message {
@@ -1251,7 +1296,68 @@ mod tests {
         )));
         assert!(matches!(
             records.last().map(|record| &record.entry),
-            Some(JournalEntry::TurnAborted(_))
+            Some(JournalEntry::TurnAborted(crate::journal::TurnAborted {
+                outcome: TurnAbortOutcome::Failed { error: None },
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_agent_validation_failure_is_preserved_on_the_turn_abort() {
+        // Arrange
+        let server = MockServer::start().await;
+        let response = sse_response(&[
+            stream_chunk(
+                json!({
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{}"
+                        }
+                    }]
+                }),
+                None,
+            ),
+            stream_chunk(json!({}), Some("length")),
+        ]);
+        mount_turns(&server, vec![response]).await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Read something".to_string()))
+            .await
+            .unwrap();
+
+        // Act
+        let events = collect_turn(&mut handle.events).await;
+        let (records, projection) = finish_and_project(handle).await;
+
+        // Assert
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete {
+                outcome: TurnOutcome::Failed,
+            })
+        ));
+        assert!(projection.messages.is_empty());
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(&record.entry, JournalEntry::ProviderRoundCompleted(_)))
+        );
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::TurnAborted(crate::journal::TurnAborted {
+                outcome: TurnAbortOutcome::Failed {
+                    error: Some(ErrorDetail { category, message }),
+                },
+                ..
+            })) if category == "invalid_assistant_message"
+                && message == "assistant tool calls do not agree with the provider stop reason"
         ));
     }
 
