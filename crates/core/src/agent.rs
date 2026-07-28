@@ -9,7 +9,8 @@ use crate::journal::{
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{
-    AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, ShutdownReason, TurnOutcome,
+    AgentCommand, AgentEvent, AgentExit, ApprovalLifetime, ApprovalSubject, EventSink, HostHandle,
+    ShutdownReason, TurnOutcome,
 };
 use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
@@ -152,11 +153,13 @@ pub async fn spawn_agent(
 
     journal
         .append(JournalEntry::RunStarted(RunStarted {
+            approval_grants: Vec::new(),
             git: None,
             max_output_tokens: provider.max_tokens,
             model: model.clone(),
             provider: provider_descriptor.clone(),
             run_id,
+            shell_policy: None,
             tool_catalog: tool_set.definitions().to_vec(),
         }))
         .await?;
@@ -576,28 +579,40 @@ impl AgentSession {
             }
         };
 
-        let authorization = match gate.check(invocation.approval_requirement(), name) {
+        let subject = ApprovalSubject::tool_call(id, name);
+        let available_lifetimes = vec![ApprovalLifetime::Invocation, ApprovalLifetime::Run];
+        let authorization = match gate.check(invocation.approval_requirement(), &subject) {
             ApprovalCheck::Authorized(authorization) => authorization,
             ApprovalCheck::RequiresDecision => {
                 let approval_id = ApprovalId::generate();
                 self.journal
-                    .approval_requested(approval_id, id, name, turn_id)
+                    .approval_requested(
+                        approval_id,
+                        available_lifetimes.clone(),
+                        subject.clone(),
+                        turn_id,
+                    )
                     .await?;
                 let decision = request_approval(
-                    name,
-                    id,
+                    available_lifetimes.clone(),
                     input,
+                    subject.clone(),
                     &self.host_handle.events,
                     &self.host_handle.cancel,
                 )
                 .await?;
-                self.journal
-                    .approval_decided(approval_id, journal_approval_decision(&decision))
-                    .await?;
 
-                match gate.apply_decision(name, approval_id, decision) {
-                    ApprovalOutcome::Authorized(authorization) => authorization,
+                match gate.apply_decision(&available_lifetimes, approval_id, &decision, &subject) {
+                    ApprovalOutcome::Authorized(authorization) => {
+                        self.journal
+                            .approval_decided(approval_id, journal_approval_decision(&decision))
+                            .await?;
+                        authorization
+                    }
                     ApprovalOutcome::Denied { reason } => {
+                        self.journal
+                            .approval_decided(approval_id, journal_approval_decision(&decision))
+                            .await?;
                         self.journal
                             .tool_rejected("approval_denied", id, name, turn_id)
                             .await?;
@@ -616,6 +631,20 @@ impl AgentSession {
                             is_error: false,
                             tool_use_id: id.to_string(),
                         });
+                    }
+                    ApprovalOutcome::InvalidGrant { reason } => {
+                        self.journal
+                            .tool_rejected("invalid_approval_grant", id, name, turn_id)
+                            .await?;
+                        self.host_handle
+                            .events
+                            .emit(AgentEvent::ToolRejected {
+                                error: reason.clone(),
+                                name: name.to_string(),
+                            })
+                            .await?;
+
+                        return Ok(failed_tool_result(id, reason));
                     }
                 }
             }
@@ -701,8 +730,9 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 fn journal_approval_decision(decision: &crate::ApprovalDecision) -> JournalApprovalDecision {
     match decision {
-        crate::ApprovalDecision::AllowForRun => JournalApprovalDecision::AllowForRun,
-        crate::ApprovalDecision::AllowOnce => JournalApprovalDecision::AllowOnce,
+        crate::ApprovalDecision::Grant(grant) => JournalApprovalDecision::Grant {
+            grant: grant.clone(),
+        },
         crate::ApprovalDecision::Deny { reason } => JournalApprovalDecision::Deny {
             reason: reason.clone(),
         },
@@ -734,11 +764,8 @@ fn provider_error_detail(error: &ProviderError) -> ErrorDetail {
 
 fn tool_authorization(authorization: ApprovalAuthorization) -> ToolAuthorization {
     match authorization {
-        ApprovalAuthorization::ApprovedForRun { approval_id } => {
-            ToolAuthorization::ApprovedForRun { approval_id }
-        }
-        ApprovalAuthorization::ApprovedOnce { approval_id } => {
-            ToolAuthorization::ApprovedOnce { approval_id }
+        ApprovalAuthorization::Granted { approval_id, grant } => {
+            ToolAuthorization::Granted { approval_id, grant }
         }
         ApprovalAuthorization::NotRequired => ToolAuthorization::NotRequired,
     }
@@ -753,6 +780,7 @@ async fn execute_invocation(
     journal
         .tool_started(
             tool_authorization(call.authorization),
+            None,
             call.id,
             call.name,
             call.turn_id,
@@ -801,7 +829,7 @@ async fn execute_invocation(
     let (content, is_error) = match execution_result {
         Ok(content) => {
             journal
-                .tool_completed(duration_ms, call.id, call.turn_id)
+                .tool_completed(duration_ms, None, call.id, call.turn_id)
                 .await?;
             (content, false)
         }
@@ -1090,11 +1118,13 @@ mod tests {
             .unwrap();
         journal
             .append(JournalEntry::RunStarted(RunStarted {
+                approval_grants: Vec::new(),
                 git: None,
                 max_output_tokens: provider.max_tokens,
                 model: model.clone(),
                 provider: provider_descriptor.clone(),
                 run_id,
+                shell_policy: None,
                 tool_catalog: tool_set.definitions().to_vec(),
             }))
             .await
@@ -2172,15 +2202,16 @@ mod tests {
             .await
             .unwrap();
 
-        let respond_to = loop {
+        let (respond_to, subject) = loop {
             let event = handle.events.recv().await.unwrap();
 
             if let AgentEvent::ApprovalRequest {
                 respond_to: new_respond_to,
+                subject,
                 ..
             } = event
             {
-                break new_respond_to;
+                break (new_respond_to, subject);
             }
         };
 
@@ -2190,7 +2221,11 @@ mod tests {
             .await
             .unwrap();
 
-        respond_to.send(ApprovalDecision::AllowOnce).unwrap();
+        respond_to
+            .send(ApprovalDecision::Grant(
+                subject.grant(ApprovalLifetime::Invocation),
+            ))
+            .unwrap();
 
         let first_turn = collect_turn(&mut handle.events).await;
         let second_turn = collect_turn(&mut handle.events).await;
@@ -2791,17 +2826,25 @@ mod tests {
             .unwrap();
 
         // Act
-        let respond_to = loop {
+        let (respond_to, subject) = loop {
             let event = handle.events.recv().await.unwrap();
             match event {
-                AgentEvent::ApprovalRequest { respond_to, .. } => break respond_to,
+                AgentEvent::ApprovalRequest {
+                    respond_to,
+                    subject,
+                    ..
+                } => break (respond_to, subject),
                 AgentEvent::ToolStarted { .. } => {
                     panic!("tool was reported as started before approval")
                 }
                 _ => {}
             }
         };
-        respond_to.send(ApprovalDecision::AllowOnce).unwrap();
+        respond_to
+            .send(ApprovalDecision::Grant(
+                subject.grant(ApprovalLifetime::Invocation),
+            ))
+            .unwrap();
 
         let events = collect_turn(&mut handle.events).await;
 
@@ -2896,11 +2939,19 @@ mod tests {
 
         assert_eq!(projection.messages.len(), 4);
         assert_eq!(decided.1.approval_id, requested.1);
-        assert_eq!(decided.1.decision, JournalApprovalDecision::AllowOnce);
+        let expected_grant =
+            ApprovalSubject::tool_call("write-1", "write_file").grant(ApprovalLifetime::Invocation);
+        assert_eq!(
+            decided.1.decision,
+            JournalApprovalDecision::Grant {
+                grant: expected_grant.clone(),
+            }
+        );
         assert_eq!(
             started.1.authorization,
-            ToolAuthorization::ApprovedOnce {
+            ToolAuthorization::Granted {
                 approval_id: requested.1,
+                grant: expected_grant,
             }
         );
         assert!(requested.0 < decided.0);
@@ -3016,14 +3067,14 @@ mod tests {
         // Act & Assert
         let write_one_event = handle.events.recv().await.unwrap();
         let AgentEvent::ApprovalRequest {
-            id: write_one_id,
             respond_to,
+            subject: write_one_subject,
             ..
         } = write_one_event
         else {
             panic!("expected first approval request");
         };
-        assert_eq!("write-1", write_one_id);
+        assert_eq!("write-1", write_one_subject.tool_call_id());
 
         respond_to
             .send(ApprovalDecision::Deny {
@@ -3034,16 +3085,20 @@ mod tests {
 
         let write_two_event = handle.events.recv().await.unwrap();
         let AgentEvent::ApprovalRequest {
-            id: write_two_id,
             respond_to,
+            subject: write_two_subject,
             ..
         } = write_two_event
         else {
             panic!("expected second approval request");
         };
-        assert_eq!("write-2", write_two_id);
+        assert_eq!("write-2", write_two_subject.tool_call_id());
 
-        respond_to.send(ApprovalDecision::AllowOnce).unwrap();
+        respond_to
+            .send(ApprovalDecision::Grant(
+                write_two_subject.grant(ApprovalLifetime::Invocation),
+            ))
+            .unwrap();
 
         let events = collect_turn(&mut handle.events).await;
 

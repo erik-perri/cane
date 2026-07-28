@@ -1,8 +1,13 @@
 use super::{
-    ApprovalId, JournalApprovalDecision, JournalEntry, JournalRecord, ProviderRoundId, RunId,
-    SessionId, ToolAuthorization, TurnAbortOutcome, TurnCommitOutcome, TurnId,
+    ApprovalId, BoundaryEnforcement, CapabilityAuthorizationSource, ExecutionCapability,
+    JournalApprovalDecision, JournalEntry, JournalRecord, ProviderRoundId, RunId, SessionId,
+    ShellMode, ShellPolicy, ToolAuthorization, ToolExecutionCompleted, ToolExecutionStarted,
+    TurnAbortOutcome, TurnCommitOutcome, TurnId,
 };
-use crate::{ContentBlock, Message, Role, StopReason};
+use crate::{
+    ApprovalGrant, ApprovalLifetime, ApprovalSubject, ContentBlock, Message, NamedCapability, Role,
+    StopReason,
+};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -27,10 +32,9 @@ pub struct ProjectionError {
     pub sequence: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ApprovalDecision {
-    AllowForRun,
-    AllowOnce,
+    Granted(ApprovalGrant),
     Deny,
 }
 
@@ -42,14 +46,15 @@ enum ToolState {
 }
 
 struct ToolCallState {
+    execution: Option<ToolExecutionStarted>,
     name: String,
     state: ToolState,
 }
 
 struct ApprovalState {
+    available_lifetimes: Vec<ApprovalLifetime>,
     decision: Option<ApprovalDecision>,
-    tool_call_id: String,
-    tool_name: String,
+    subject: ApprovalSubject,
 }
 
 struct TurnState {
@@ -64,8 +69,9 @@ struct TurnState {
 }
 
 struct RunState {
+    configured_grants: Vec<ApprovalGrant>,
     id: RunId,
-    run_approvals: HashMap<ApprovalId, String>,
+    run_approvals: HashMap<ApprovalId, ApprovalGrant>,
     turn: Option<TurnState>,
 }
 
@@ -98,7 +104,16 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                         "run_started appears while another run is active",
                     ));
                 }
+                if let Some(policy) = &started.shell_policy {
+                    validate_shell_policy(policy, record.sequence)?;
+                }
+                validate_effective_grants(&started.approval_grants, record.sequence)?;
                 active_run = Some(RunState {
+                    configured_grants: started
+                        .approval_grants
+                        .iter()
+                        .map(|record| record.grant.clone())
+                        .collect(),
                     id: started.run_id,
                     run_approvals: HashMap::new(),
                     turn: None,
@@ -196,16 +211,31 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
             JournalEntry::ApprovalRequested(requested) => {
                 let turn =
                     require_active_turn(&mut active_run, requested.turn_id, record.sequence)?;
-                let Some(tool) = turn.tool_calls.get(&requested.tool_call_id) else {
+                validate_available_lifetimes(&requested.available_lifetimes, record.sequence)?;
+                let Some(tool) = turn.tool_calls.get(requested.subject.tool_call_id()) else {
                     return Err(invalid(
                         record.sequence,
                         "approval refers to an unknown tool call",
                     ));
                 };
-                if tool.name != requested.tool_name {
+                if tool.name != requested.subject.tool_name() {
                     return Err(invalid(
                         record.sequence,
                         "approval tool name does not match its tool call",
+                    ));
+                }
+                if tool.state != ToolState::Pending {
+                    return Err(invalid(
+                        record.sequence,
+                        "approval refers to a tool call that is already started or resolved",
+                    ));
+                }
+                if let ApprovalSubject::Capability { capability, .. } = &requested.subject
+                    && (capability.name.trim().is_empty() || capability.resource.trim().is_empty())
+                {
+                    return Err(invalid(
+                        record.sequence,
+                        "approval capability name or resource is empty",
                     ));
                 }
                 if turn
@@ -213,9 +243,9 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     .insert(
                         requested.approval_id,
                         ApprovalState {
+                            available_lifetimes: requested.available_lifetimes.clone(),
                             decision: None,
-                            tool_call_id: requested.tool_call_id.clone(),
-                            tool_name: requested.tool_name.clone(),
+                            subject: requested.subject.clone(),
                         },
                     )
                     .is_some()
@@ -241,16 +271,44 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                             "approval is decided more than once",
                         ));
                     }
-                    let decision = match decided.decision {
-                        JournalApprovalDecision::AllowForRun => ApprovalDecision::AllowForRun,
-                        JournalApprovalDecision::AllowOnce => ApprovalDecision::AllowOnce,
+                    let decision = match &decided.decision {
+                        JournalApprovalDecision::AllowForRun => {
+                            ApprovalDecision::Granted(current.subject.grant(ApprovalLifetime::Run))
+                        }
+                        JournalApprovalDecision::AllowOnce => ApprovalDecision::Granted(
+                            current.subject.grant(ApprovalLifetime::Invocation),
+                        ),
                         JournalApprovalDecision::Deny { .. } => ApprovalDecision::Deny,
+                        JournalApprovalDecision::Grant { grant } => {
+                            ApprovalDecision::Granted(grant.clone())
+                        }
                     };
-                    current.decision = Some(decision);
-                    (decision == ApprovalDecision::AllowForRun).then(|| current.tool_name.clone())
+                    if let ApprovalDecision::Granted(grant) = &decision {
+                        if !current.available_lifetimes.contains(&grant.lifetime()) {
+                            return Err(invalid(
+                                record.sequence,
+                                "approval grant uses a lifetime that was not offered",
+                            ));
+                        }
+                        if !grant.authorizes(&current.subject) {
+                            return Err(invalid(
+                                record.sequence,
+                                "approval grant does not authorize the requested subject",
+                            ));
+                        }
+                    }
+                    current.decision = Some(decision.clone());
+                    match decision {
+                        ApprovalDecision::Granted(grant)
+                            if grant.lifetime() != ApprovalLifetime::Invocation =>
+                        {
+                            Some(grant)
+                        }
+                        ApprovalDecision::Granted(_) | ApprovalDecision::Deny => None,
+                    }
                 };
-                if let Some(tool_name) = run_approval {
-                    run.run_approvals.insert(decided.approval_id, tool_name);
+                if let Some(grant) = run_approval {
+                    run.run_approvals.insert(decided.approval_id, grant);
                 }
             }
             JournalEntry::ToolStarted(started) => {
@@ -272,6 +330,13 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     &started.tool_name,
                     record.sequence,
                 )?;
+                validate_execution_start(
+                    &run.configured_grants,
+                    &run.run_approvals,
+                    turn,
+                    started,
+                    record.sequence,
+                )?;
                 let tool = require_tool_call(
                     turn,
                     &started.tool_call_id,
@@ -284,9 +349,11 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                         "tool call is started more than once",
                     ));
                 }
+                tool.execution = started.execution.clone();
                 tool.state = ToolState::Started;
             }
             JournalEntry::ToolCompleted(completed) => {
+                validate_execution_completion(&mut active_run, completed, record.sequence)?;
                 finish_tool(
                     &mut active_run,
                     completed.turn_id,
@@ -446,6 +513,7 @@ fn add_assistant_message(
                     .insert(
                         id.clone(),
                         ToolCallState {
+                            execution: None,
                             name: name.clone(),
                             state: ToolState::Pending,
                         },
@@ -525,7 +593,7 @@ fn add_tool_results(
 }
 
 fn authorize_tool_start(
-    run_approvals: &HashMap<ApprovalId, String>,
+    run_approvals: &HashMap<ApprovalId, ApprovalGrant>,
     turn: &TurnState,
     authorization: &ToolAuthorization,
     tool_call_id: &str,
@@ -534,7 +602,11 @@ fn authorize_tool_start(
 ) -> Result<(), ProjectionError> {
     match authorization {
         ToolAuthorization::ApprovedForRun { approval_id } => {
-            if run_approvals.get(approval_id).map(String::as_str) != Some(tool_name) {
+            let subject = ApprovalSubject::tool_call(tool_call_id, tool_name);
+            if !run_approvals
+                .get(approval_id)
+                .is_some_and(|grant| grant.authorizes(&subject))
+            {
                 return Err(invalid(
                     sequence,
                     "run approval does not authorize this tool",
@@ -548,19 +620,239 @@ fn authorize_tool_start(
                     "tool authorization has no matching approval decision",
                 ));
             };
-            if approval.decision != Some(ApprovalDecision::AllowOnce)
-                || approval.tool_call_id != tool_call_id
-                || approval.tool_name != tool_name
-            {
+            let expected = ApprovalSubject::tool_call(tool_call_id, tool_name)
+                .grant(ApprovalLifetime::Invocation);
+            if approval.decision != Some(ApprovalDecision::Granted(expected)) {
                 return Err(invalid(
                     sequence,
                     "one-time approval does not authorize this tool call",
                 ));
             }
         }
+        ToolAuthorization::Granted { approval_id, grant } => {
+            let subject = ApprovalSubject::tool_call(tool_call_id, tool_name);
+            if !grant.authorizes(&subject) {
+                return Err(invalid(
+                    sequence,
+                    "approval grant does not authorize this tool call",
+                ));
+            }
+
+            let matches_decision = if grant.lifetime() == ApprovalLifetime::Invocation {
+                turn.approvals.get(approval_id).is_some_and(|approval| {
+                    approval.decision == Some(ApprovalDecision::Granted(grant.clone()))
+                })
+            } else {
+                run_approvals.get(approval_id) == Some(grant)
+            };
+            if !matches_decision {
+                return Err(invalid(
+                    sequence,
+                    "tool authorization has no matching approval grant",
+                ));
+            }
+        }
         ToolAuthorization::NotRequired => {}
     }
     Ok(())
+}
+
+fn validate_available_lifetimes(
+    available_lifetimes: &[ApprovalLifetime],
+    sequence: u64,
+) -> Result<(), ProjectionError> {
+    if available_lifetimes.is_empty() {
+        return Err(invalid(
+            sequence,
+            "approval request offers no grant lifetimes",
+        ));
+    }
+    let unique: HashSet<_> = available_lifetimes.iter().collect();
+    if unique.len() != available_lifetimes.len() {
+        return Err(invalid(
+            sequence,
+            "approval request repeats a grant lifetime",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shell_policy(policy: &ShellPolicy, sequence: u64) -> Result<(), ProjectionError> {
+    if policy
+        .backend
+        .as_ref()
+        .is_some_and(|backend| backend.name.trim().is_empty())
+    {
+        return Err(invalid(sequence, "shell backend name is empty"));
+    }
+    if policy.mode == ShellMode::Sandboxed && policy.backend.is_none() {
+        return Err(invalid(sequence, "sandboxed shell policy has no backend"));
+    }
+    let boundaries = [
+        &policy.boundaries.environment,
+        &policy.boundaries.filesystem,
+        &policy.boundaries.network,
+        &policy.boundaries.process,
+    ];
+    if boundaries.iter().any(|boundary| {
+        matches!(
+            boundary,
+            BoundaryEnforcement::Enforced { mechanism } if mechanism.trim().is_empty()
+        )
+    }) {
+        return Err(invalid(
+            sequence,
+            "shell boundary enforcement mechanism is empty",
+        ));
+    }
+
+    let mut roots = HashSet::new();
+    for root in &policy.exposed_roots {
+        if root.path.trim().is_empty() {
+            return Err(invalid(sequence, "shell exposed root path is empty"));
+        }
+        if !roots.insert(root.path.as_str()) {
+            return Err(invalid(sequence, "shell exposed root path is repeated"));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_effective_grants(
+    grants: &[super::EffectiveApprovalGrant],
+    sequence: u64,
+) -> Result<(), ProjectionError> {
+    let mut seen = HashSet::new();
+    for record in grants {
+        if record.grant.lifetime() != ApprovalLifetime::Workspace {
+            return Err(invalid(
+                sequence,
+                "configured approval grant has an invalid scope",
+            ));
+        }
+        if !seen.insert(&record.grant) {
+            return Err(invalid(sequence, "configured approval grant is repeated"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_start(
+    configured_grants: &[ApprovalGrant],
+    run_approvals: &HashMap<ApprovalId, ApprovalGrant>,
+    turn: &TurnState,
+    started: &super::ToolStarted,
+    sequence: u64,
+) -> Result<(), ProjectionError> {
+    let Some(ToolExecutionStarted::Shell { capabilities }) = &started.execution else {
+        return Ok(());
+    };
+    if started.tool_name != "shell" {
+        return Err(invalid(
+            sequence,
+            "shell execution details belong to a non-shell tool",
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    for execution_capability in capabilities {
+        let ExecutionCapability { capability, source } = execution_capability;
+        if capability.name.trim().is_empty() || capability.resource.trim().is_empty() {
+            return Err(invalid(
+                sequence,
+                "execution capability name or resource is empty",
+            ));
+        }
+        if !seen.insert(capability) {
+            return Err(invalid(
+                sequence,
+                "execution capability is recorded more than once",
+            ));
+        }
+        match source {
+            CapabilityAuthorizationSource::Approval { approval_id } => {
+                validate_capability_approval(
+                    run_approvals,
+                    turn,
+                    *approval_id,
+                    capability,
+                    &started.tool_call_id,
+                    &started.tool_name,
+                    sequence,
+                )?;
+            }
+            CapabilityAuthorizationSource::WorkspaceConfiguration => {
+                let subject = ApprovalSubject::capability(
+                    capability.clone(),
+                    &started.tool_call_id,
+                    &started.tool_name,
+                );
+                if !configured_grants
+                    .iter()
+                    .any(|grant| grant.authorizes(&subject))
+                {
+                    return Err(invalid(
+                        sequence,
+                        "execution capability has no matching configured grant",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_capability_approval(
+    run_approvals: &HashMap<ApprovalId, ApprovalGrant>,
+    turn: &TurnState,
+    approval_id: ApprovalId,
+    capability: &NamedCapability,
+    tool_call_id: &str,
+    tool_name: &str,
+    sequence: u64,
+) -> Result<(), ProjectionError> {
+    let subject = ApprovalSubject::capability(capability.clone(), tool_call_id, tool_name);
+    let invocation_grant = turn.approvals.get(&approval_id).and_then(|approval| {
+        let ApprovalDecision::Granted(grant) = approval.decision.as_ref()? else {
+            return None;
+        };
+        (grant.lifetime() == ApprovalLifetime::Invocation).then_some(grant)
+    });
+    let grant = invocation_grant.or_else(|| run_approvals.get(&approval_id));
+    if !grant.is_some_and(|grant| grant.authorizes(&subject)) {
+        return Err(invalid(
+            sequence,
+            "execution capability has no matching approval grant",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_completion(
+    active_run: &mut Option<RunState>,
+    completed: &super::ToolCompleted,
+    sequence: u64,
+) -> Result<(), ProjectionError> {
+    let turn = require_active_turn(active_run, completed.turn_id, sequence)?;
+    let Some(tool) = turn.tool_calls.get(&completed.tool_call_id) else {
+        return Err(invalid(
+            sequence,
+            "tool terminal record refers to an unknown tool call",
+        ));
+    };
+    match (&tool.execution, &completed.execution) {
+        (Some(ToolExecutionStarted::Shell { .. }), Some(ToolExecutionCompleted::Shell { .. }))
+        | (None, None) => Ok(()),
+        (Some(_), None) => Err(invalid(
+            sequence,
+            "completed shell execution has no completion diagnostics",
+        )),
+        (None, Some(_)) => Err(invalid(
+            sequence,
+            "shell completion diagnostics have no matching execution start",
+        )),
+    }
 }
 
 fn finish_provider_round(
@@ -734,11 +1026,14 @@ fn invalid(sequence: u64, detail: impl Into<String>) -> ProjectionError {
 mod tests {
     use super::*;
     use crate::journal::{
-        ErrorDetail, MessageAdded, ProviderRoundCompleted, ProviderRoundFailed,
-        ProviderRoundStarted, RunEndReason, RunEnded, RunStarted, SessionStarted, ToolCompleted,
+        CapturedStream, CommandTermination, ErrorDetail, MessageAdded, ProviderRoundCompleted,
+        ProviderRoundFailed, ProviderRoundStarted, RunEndReason, RunEnded, RunStarted,
+        SessionStarted, ShellBoundaries, ShellExposedRoot, ShellSandboxBackend, ToolCompleted,
         ToolStarted, TurnAborted, TurnCommitted, TurnStarted,
     };
-    use crate::{ProviderAdapter, ProviderDescriptor, ToolInput, ToolResultData};
+    use crate::{
+        ProviderAdapter, ProviderDescriptor, ToolInput, ToolResultData, journal::FilesystemAccess,
+    };
 
     fn session_id() -> SessionId {
         "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
@@ -781,11 +1076,13 @@ mod tests {
 
     fn run_started() -> JournalEntry {
         JournalEntry::RunStarted(RunStarted {
+            approval_grants: Vec::new(),
             git: None,
             max_output_tokens: 32_000,
             model: "test-model".to_string(),
             provider: provider(),
             run_id: run_id(),
+            shell_policy: None,
             tool_catalog: Vec::new(),
         })
     }
@@ -922,13 +1219,120 @@ mod tests {
             message_added(assistant.clone()),
             JournalEntry::ToolStarted(ToolStarted {
                 authorization: ToolAuthorization::NotRequired,
+                execution: None,
                 tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 turn_id: turn_id(),
             }),
             JournalEntry::ToolCompleted(ToolCompleted {
                 duration_ms: 5,
+                execution: None,
                 tool_call_id: "call-1".to_string(),
+                turn_id: turn_id(),
+            }),
+            message_added(result.clone()),
+            JournalEntry::TurnCommitted(TurnCommitted {
+                outcome: TurnCommitOutcome::Paused {
+                    reason: "provider round limit".to_string(),
+                },
+                turn_id: turn_id(),
+            }),
+            run_ended(),
+        ]);
+
+        // Act
+        let projection = project_journal(&journal).unwrap();
+
+        // Assert
+        assert_eq!(projection.messages, vec![user, assistant, result]);
+        assert!(projection.warnings.is_empty());
+    }
+
+    #[test]
+    fn observational_shell_details_do_not_change_projected_messages() {
+        // Arrange
+        let user = user_text("Run the tests");
+        let assistant = Message {
+            content: vec![ContentBlock::ToolUse {
+                id: "shell-1".to_string(),
+                input: ToolInput::Valid(serde_json::json!({ "command": "cargo test" })),
+                name: "shell".to_string(),
+            }],
+            role: Role::Assistant,
+        };
+        let result = Message {
+            content: vec![ContentBlock::ToolResult(ToolResultData {
+                content: "Process exited with code 0".to_string(),
+                is_error: false,
+                tool_use_id: "shell-1".to_string(),
+            })],
+            role: Role::User,
+        };
+        let policy = ShellPolicy {
+            backend: Some(ShellSandboxBackend {
+                name: "bubblewrap".to_string(),
+                version: Some("1.0.0".to_string()),
+            }),
+            boundaries: ShellBoundaries {
+                environment: BoundaryEnforcement::Enforced {
+                    mechanism: "allowlist".to_string(),
+                },
+                filesystem: BoundaryEnforcement::Enforced {
+                    mechanism: "mount_namespace".to_string(),
+                },
+                network: BoundaryEnforcement::Enforced {
+                    mechanism: "network_namespace".to_string(),
+                },
+                process: BoundaryEnforcement::Enforced {
+                    mechanism: "pid_namespace".to_string(),
+                },
+            },
+            exposed_roots: vec![ShellExposedRoot {
+                access: FilesystemAccess::ReadWrite,
+                path: "/workspace".to_string(),
+            }],
+            mode: ShellMode::Sandboxed,
+        };
+        let journal = records(vec![
+            session_started(),
+            JournalEntry::RunStarted(RunStarted {
+                approval_grants: Vec::new(),
+                git: None,
+                max_output_tokens: 32_000,
+                model: "test-model".to_string(),
+                provider: provider(),
+                run_id: run_id(),
+                shell_policy: Some(policy),
+                tool_catalog: Vec::new(),
+            }),
+            turn_started(),
+            message_added(user.clone()),
+            provider_started(),
+            provider_completed(StopReason::ToolUse),
+            message_added(assistant.clone()),
+            JournalEntry::ToolStarted(ToolStarted {
+                authorization: ToolAuthorization::NotRequired,
+                execution: Some(ToolExecutionStarted::Shell {
+                    capabilities: Vec::new(),
+                }),
+                tool_call_id: "shell-1".to_string(),
+                tool_name: "shell".to_string(),
+                turn_id: turn_id(),
+            }),
+            JournalEntry::ToolCompleted(ToolCompleted {
+                duration_ms: 5,
+                execution: Some(ToolExecutionCompleted::Shell {
+                    stderr: CapturedStream {
+                        bytes: 0,
+                        truncated: false,
+                    },
+                    stdout: CapturedStream {
+                        bytes: 26,
+                        truncated: false,
+                    },
+                    termination: CommandTermination::Exited { code: 0 },
+                }),
+                tool_call_id: "shell-1".to_string(),
                 turn_id: turn_id(),
             }),
             message_added(result.clone()),
@@ -1040,14 +1444,17 @@ mod tests {
     fn run_approvals_cross_turns_but_one_time_approvals_remain_call_specific() {
         // Arrange
         let approval_id: ApprovalId = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().unwrap();
-        let run_approvals = HashMap::from([(approval_id, "write_file".to_string())]);
+        let approved_subject = ApprovalSubject::tool_call("call-1", "write_file");
+        let once_grant = approved_subject.grant(ApprovalLifetime::Invocation);
+        let run_grant = approved_subject.grant(ApprovalLifetime::Run);
+        let run_approvals = HashMap::from([(approval_id, run_grant)]);
         let turn = TurnState {
             approvals: HashMap::from([(
                 approval_id,
                 ApprovalState {
-                    decision: Some(ApprovalDecision::AllowOnce),
-                    tool_call_id: "call-1".to_string(),
-                    tool_name: "write_file".to_string(),
+                    available_lifetimes: vec![ApprovalLifetime::Invocation, ApprovalLifetime::Run],
+                    decision: Some(ApprovalDecision::Granted(once_grant)),
+                    subject: approved_subject,
                 },
             )]),
             awaiting_assistant: None,
@@ -1080,5 +1487,203 @@ mod tests {
         // Assert
         assert!(run_approval_result.is_ok());
         assert!(reused_once_result.is_err());
+    }
+
+    #[test]
+    fn typed_tool_authorization_requires_the_exact_recorded_grant() {
+        // Arrange
+        let approval_id: ApprovalId = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().unwrap();
+        let approved_subject = ApprovalSubject::tool_call("call-1", "write_file");
+        let recorded_grant = approved_subject.grant(ApprovalLifetime::Invocation);
+        let presented_grant =
+            ApprovalSubject::tool_call("call-2", "write_file").grant(ApprovalLifetime::Invocation);
+        let turn = TurnState {
+            approvals: HashMap::from([(
+                approval_id,
+                ApprovalState {
+                    available_lifetimes: vec![ApprovalLifetime::Invocation],
+                    decision: Some(ApprovalDecision::Granted(recorded_grant)),
+                    subject: approved_subject,
+                },
+            )]),
+            awaiting_assistant: None,
+            id: turn_id(),
+            last_assistant_stop: None,
+            messages: Vec::new(),
+            provider_round: None,
+            provider_rounds: HashSet::new(),
+            tool_calls: HashMap::new(),
+        };
+
+        // Act
+        let result = authorize_tool_start(
+            &HashMap::new(),
+            &turn,
+            &ToolAuthorization::Granted {
+                approval_id,
+                grant: presented_grant,
+            },
+            "call-2",
+            "write_file",
+            1,
+        );
+
+        // Assert
+        assert_eq!(
+            result.unwrap_err().detail,
+            "tool authorization has no matching approval grant"
+        );
+    }
+
+    #[test]
+    fn shell_execution_capabilities_require_a_correlated_approval() {
+        // Arrange
+        let approval_id: ApprovalId = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().unwrap();
+        let capability = NamedCapability {
+            name: "docker_daemon".to_string(),
+            resource: "unix:///var/run/docker.sock".to_string(),
+        };
+        let turn = TurnState {
+            approvals: HashMap::new(),
+            awaiting_assistant: None,
+            id: turn_id(),
+            last_assistant_stop: None,
+            messages: Vec::new(),
+            provider_round: None,
+            provider_rounds: HashSet::new(),
+            tool_calls: HashMap::from([(
+                "shell-1".to_string(),
+                ToolCallState {
+                    execution: None,
+                    name: "shell".to_string(),
+                    state: ToolState::Pending,
+                },
+            )]),
+        };
+        let started = ToolStarted {
+            authorization: ToolAuthorization::NotRequired,
+            execution: Some(ToolExecutionStarted::Shell {
+                capabilities: vec![ExecutionCapability {
+                    capability,
+                    source: CapabilityAuthorizationSource::Approval { approval_id },
+                }],
+            }),
+            tool_call_id: "shell-1".to_string(),
+            tool_name: "shell".to_string(),
+            turn_id: turn_id(),
+        };
+
+        // Act
+        let result = validate_execution_start(&[], &HashMap::new(), &turn, &started, 1);
+
+        // Assert
+        assert_eq!(
+            result.unwrap_err().detail,
+            "execution capability has no matching approval grant"
+        );
+    }
+
+    #[test]
+    fn workspace_configured_capabilities_require_an_effective_run_grant() {
+        // Arrange
+        let capability = NamedCapability {
+            name: "docker_daemon".to_string(),
+            resource: "unix:///var/run/docker.sock".to_string(),
+        };
+        let subject = ApprovalSubject::capability(capability.clone(), "shell-1", "shell");
+        let configured_grants = vec![subject.grant(ApprovalLifetime::Workspace)];
+        let turn = TurnState {
+            approvals: HashMap::new(),
+            awaiting_assistant: None,
+            id: turn_id(),
+            last_assistant_stop: None,
+            messages: Vec::new(),
+            provider_round: None,
+            provider_rounds: HashSet::new(),
+            tool_calls: HashMap::from([(
+                "shell-1".to_string(),
+                ToolCallState {
+                    execution: None,
+                    name: "shell".to_string(),
+                    state: ToolState::Pending,
+                },
+            )]),
+        };
+        let started = ToolStarted {
+            authorization: ToolAuthorization::NotRequired,
+            execution: Some(ToolExecutionStarted::Shell {
+                capabilities: vec![ExecutionCapability {
+                    capability,
+                    source: CapabilityAuthorizationSource::WorkspaceConfiguration,
+                }],
+            }),
+            tool_call_id: "shell-1".to_string(),
+            tool_name: "shell".to_string(),
+            turn_id: turn_id(),
+        };
+
+        // Act
+        let missing = validate_execution_start(&[], &HashMap::new(), &turn, &started, 1);
+        let matching =
+            validate_execution_start(&configured_grants, &HashMap::new(), &turn, &started, 2);
+
+        // Assert
+        assert_eq!(
+            missing.unwrap_err().detail,
+            "execution capability has no matching configured grant"
+        );
+        assert!(matching.is_ok());
+    }
+
+    #[test]
+    fn shell_completion_diagnostics_require_matching_start_diagnostics() {
+        // Arrange
+        let mut active_run = Some(RunState {
+            configured_grants: Vec::new(),
+            id: run_id(),
+            run_approvals: HashMap::new(),
+            turn: Some(TurnState {
+                approvals: HashMap::new(),
+                awaiting_assistant: None,
+                id: turn_id(),
+                last_assistant_stop: None,
+                messages: Vec::new(),
+                provider_round: None,
+                provider_rounds: HashSet::new(),
+                tool_calls: HashMap::from([(
+                    "shell-1".to_string(),
+                    ToolCallState {
+                        execution: None,
+                        name: "shell".to_string(),
+                        state: ToolState::Started,
+                    },
+                )]),
+            }),
+        });
+        let completed = ToolCompleted {
+            duration_ms: 5,
+            execution: Some(ToolExecutionCompleted::Shell {
+                stderr: CapturedStream {
+                    bytes: 0,
+                    truncated: false,
+                },
+                stdout: CapturedStream {
+                    bytes: 0,
+                    truncated: false,
+                },
+                termination: CommandTermination::Exited { code: 0 },
+            }),
+            tool_call_id: "shell-1".to_string(),
+            turn_id: turn_id(),
+        };
+
+        // Act
+        let result = validate_execution_completion(&mut active_run, &completed, 1);
+
+        // Assert
+        assert_eq!(
+            result.unwrap_err().detail,
+            "shell completion diagnostics have no matching execution start"
+        );
     }
 }

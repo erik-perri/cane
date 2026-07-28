@@ -1,4 +1,5 @@
 use crate::StopReason;
+use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -7,10 +8,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug)]
 pub enum AgentEvent {
     ApprovalRequest {
-        id: String,
+        available_lifetimes: Vec<ApprovalLifetime>,
         input: serde_json::Value,
-        name: String,
         respond_to: oneshot::Sender<ApprovalDecision>,
+        subject: ApprovalSubject,
     },
     TextDelta(String),
     ToolStarted {
@@ -117,10 +118,157 @@ pub enum ShutdownReason {
     UserQuit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalLifetime {
+    Invocation,
+    Run,
+    Workspace,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct NamedCapability {
+    pub name: String,
+    pub resource: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ApprovalSubject {
+    Capability {
+        capability: NamedCapability,
+        tool_call_id: String,
+        tool_name: String,
+    },
+    ToolCall {
+        tool_call_id: String,
+        tool_name: String,
+    },
+}
+
+impl ApprovalSubject {
+    pub fn capability(
+        capability: NamedCapability,
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+    ) -> Self {
+        Self::Capability {
+            capability,
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+        }
+    }
+
+    pub fn tool_call(tool_call_id: impl Into<String>, tool_name: impl Into<String>) -> Self {
+        Self::ToolCall {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+        }
+    }
+
+    pub fn tool_call_id(&self) -> &str {
+        match self {
+            Self::Capability { tool_call_id, .. } | Self::ToolCall { tool_call_id, .. } => {
+                tool_call_id
+            }
+        }
+    }
+
+    pub fn tool_name(&self) -> &str {
+        match self {
+            Self::Capability { tool_name, .. } | Self::ToolCall { tool_name, .. } => tool_name,
+        }
+    }
+
+    pub fn grant(&self, lifetime: ApprovalLifetime) -> ApprovalGrant {
+        let matcher = self.matcher();
+        let scope = match lifetime {
+            ApprovalLifetime::Invocation => ApprovalScope::Invocation {
+                tool_call_id: self.tool_call_id().to_string(),
+                tool_name: self.tool_name().to_string(),
+            },
+            ApprovalLifetime::Run => ApprovalScope::Run,
+            ApprovalLifetime::Workspace => ApprovalScope::Workspace,
+        };
+
+        ApprovalGrant { matcher, scope }
+    }
+
+    fn matcher(&self) -> ApprovalMatcher {
+        match self {
+            Self::Capability { capability, .. } => ApprovalMatcher::Capability {
+                capability: capability.clone(),
+            },
+            Self::ToolCall { tool_name, .. } => ApprovalMatcher::Tool {
+                tool_name: tool_name.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalMatcher {
+    Capability { capability: NamedCapability },
+    Tool { tool_name: String },
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalGrant {
+    pub matcher: ApprovalMatcher,
+    pub scope: ApprovalScope,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalScope {
+    Invocation {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    Run,
+    Workspace,
+}
+
+impl ApprovalGrant {
+    pub fn authorizes(&self, subject: &ApprovalSubject) -> bool {
+        self.matcher.matches(subject) && self.scope.includes(subject)
+    }
+
+    pub fn lifetime(&self) -> ApprovalLifetime {
+        self.scope.lifetime()
+    }
+}
+
+impl ApprovalMatcher {
+    fn matches(&self, subject: &ApprovalSubject) -> bool {
+        self == &subject.matcher()
+    }
+}
+
+impl ApprovalScope {
+    fn includes(&self, subject: &ApprovalSubject) -> bool {
+        match self {
+            Self::Invocation {
+                tool_call_id,
+                tool_name,
+            } => tool_call_id == subject.tool_call_id() && tool_name == subject.tool_name(),
+            Self::Run | Self::Workspace => true,
+        }
+    }
+
+    pub fn lifetime(&self) -> ApprovalLifetime {
+        match self {
+            Self::Invocation { .. } => ApprovalLifetime::Invocation,
+            Self::Run => ApprovalLifetime::Run,
+            Self::Workspace => ApprovalLifetime::Workspace,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ApprovalDecision {
-    AllowForRun,
-    AllowOnce,
+    Grant(ApprovalGrant),
     Deny { reason: String },
 }
 

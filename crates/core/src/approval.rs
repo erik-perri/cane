@@ -1,21 +1,22 @@
 use crate::journal::ApprovalId;
 use crate::protocol::{AgentExit, ApprovalRequirement, EventSink};
-use crate::{AgentEvent, ApprovalDecision};
-use std::collections::HashMap;
+use crate::{AgentEvent, ApprovalDecision, ApprovalGrant, ApprovalLifetime, ApprovalSubject};
 use tokio::sync::oneshot;
 
 pub struct ApprovalGate {
-    run_approvals: HashMap<String, ApprovalId>,
+    run_approvals: Vec<ApprovalAuthorization>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApprovalAuthorization {
-    ApprovedForRun { approval_id: ApprovalId },
-    ApprovedOnce { approval_id: ApprovalId },
+    Granted {
+        approval_id: ApprovalId,
+        grant: ApprovalGrant,
+    },
     NotRequired,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApprovalCheck {
     Authorized(ApprovalAuthorization),
     RequiresDecision,
@@ -25,55 +26,76 @@ pub enum ApprovalCheck {
 pub enum ApprovalOutcome {
     Authorized(ApprovalAuthorization),
     Denied { reason: String },
+    InvalidGrant { reason: String },
 }
 
 impl ApprovalGate {
     pub fn new() -> Self {
         Self {
-            run_approvals: HashMap::new(),
+            run_approvals: Vec::new(),
         }
     }
 
-    pub fn check(&self, requirement: ApprovalRequirement, tool_name: &str) -> ApprovalCheck {
+    pub fn check(
+        &self,
+        requirement: ApprovalRequirement,
+        subject: &ApprovalSubject,
+    ) -> ApprovalCheck {
         if requirement == ApprovalRequirement::None {
             return ApprovalCheck::Authorized(ApprovalAuthorization::NotRequired);
         }
 
-        match self.run_approvals.get(tool_name) {
-            Some(approval_id) => ApprovalCheck::Authorized(ApprovalAuthorization::ApprovedForRun {
-                approval_id: *approval_id,
-            }),
-            None => ApprovalCheck::RequiresDecision,
-        }
-    }
-
-    pub fn record_run_approval(&mut self, tool_name: String, approval_id: ApprovalId) {
-        self.run_approvals.insert(tool_name, approval_id);
+        self.run_approvals
+            .iter()
+            .find(|authorization| match authorization {
+                ApprovalAuthorization::Granted { grant, .. } => grant.authorizes(subject),
+                ApprovalAuthorization::NotRequired => false,
+            })
+            .cloned()
+            .map_or(ApprovalCheck::RequiresDecision, ApprovalCheck::Authorized)
     }
 
     pub fn apply_decision(
         &mut self,
-        tool_name: &str,
+        available_lifetimes: &[ApprovalLifetime],
         approval_id: ApprovalId,
-        decision: ApprovalDecision,
+        decision: &ApprovalDecision,
+        subject: &ApprovalSubject,
     ) -> ApprovalOutcome {
         match decision {
-            ApprovalDecision::AllowOnce => {
-                ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedOnce { approval_id })
+            ApprovalDecision::Grant(grant) => {
+                if !available_lifetimes.contains(&grant.lifetime()) {
+                    return ApprovalOutcome::InvalidGrant {
+                        reason: "approval grant uses a lifetime that was not offered".to_string(),
+                    };
+                }
+                if !grant.authorizes(subject) {
+                    return ApprovalOutcome::InvalidGrant {
+                        reason: "approval grant does not authorize the requested subject"
+                            .to_string(),
+                    };
+                }
+
+                let authorization = ApprovalAuthorization::Granted {
+                    approval_id,
+                    grant: grant.clone(),
+                };
+                if grant.lifetime() != ApprovalLifetime::Invocation {
+                    self.run_approvals.push(authorization.clone());
+                }
+                ApprovalOutcome::Authorized(authorization)
             }
-            ApprovalDecision::AllowForRun => {
-                self.record_run_approval(tool_name.to_string(), approval_id);
-                ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedForRun { approval_id })
-            }
-            ApprovalDecision::Deny { reason } => ApprovalOutcome::Denied { reason },
+            ApprovalDecision::Deny { reason } => ApprovalOutcome::Denied {
+                reason: reason.clone(),
+            },
         }
     }
 }
 
 pub async fn request_approval(
-    tool_name: &str,
-    call_id: &str,
+    available_lifetimes: Vec<ApprovalLifetime>,
     input: &serde_json::Value,
+    subject: ApprovalSubject,
     events: &EventSink,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<ApprovalDecision, AgentExit> {
@@ -81,10 +103,10 @@ pub async fn request_approval(
 
     events
         .emit(AgentEvent::ApprovalRequest {
-            id: call_id.to_string(),
+            available_lifetimes,
             input: input.clone(),
-            name: tool_name.to_string(),
             respond_to: decision_tx,
+            subject,
         })
         .await?;
 
@@ -113,13 +135,22 @@ mod tests {
         "appr_01ARZ3NDEKTSV4RRFFQ69G5FAY".parse().unwrap()
     }
 
+    fn offered_lifetimes() -> Vec<ApprovalLifetime> {
+        vec![ApprovalLifetime::Invocation, ApprovalLifetime::Run]
+    }
+
+    fn subject(call_id: &str, tool_name: &str) -> ApprovalSubject {
+        ApprovalSubject::tool_call(call_id, tool_name)
+    }
+
     #[test]
     fn check_returns_not_required_for_tools_that_do_not_require_approval() {
         // Arrange
         let gate = ApprovalGate::new();
+        let subject = subject("read-1", "read_file");
 
         // Act
-        let result = gate.check(ApprovalRequirement::None, "read_file");
+        let result = gate.check(ApprovalRequirement::None, &subject);
 
         // Assert
         assert_eq!(
@@ -132,9 +163,10 @@ mod tests {
     fn check_requires_a_decision_when_the_tool_has_no_run_approval() {
         // Arrange
         let gate = ApprovalGate::new();
+        let subject = subject("write-1", "write_file");
 
         // Act
-        let result = gate.check(ApprovalRequirement::Required, "write_file");
+        let result = gate.check(ApprovalRequirement::Required, &subject);
 
         // Assert
         assert_eq!(result, ApprovalCheck::RequiresDecision);
@@ -144,17 +176,35 @@ mod tests {
     fn run_approvals_authorize_only_the_matching_tool() {
         // Arrange
         let mut gate = ApprovalGate::new();
-        gate.record_run_approval("write_file".to_string(), approval_id());
+        let approved_subject = subject("write-1", "write_file");
+        let run_grant = approved_subject.grant(ApprovalLifetime::Run);
+        let decision = ApprovalDecision::Grant(run_grant.clone());
+        let outcome = gate.apply_decision(
+            &offered_lifetimes(),
+            approval_id(),
+            &decision,
+            &approved_subject,
+        );
+        let matching_subject = subject("write-2", "write_file");
+        let other_subject = subject("edit-1", "edit_file");
 
         // Act
-        let matching = gate.check(ApprovalRequirement::Required, "write_file");
-        let other = gate.check(ApprovalRequirement::Required, "edit_file");
+        let matching = gate.check(ApprovalRequirement::Required, &matching_subject);
+        let other = gate.check(ApprovalRequirement::Required, &other_subject);
 
         // Assert
         assert_eq!(
+            outcome,
+            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
+                approval_id: approval_id(),
+                grant: run_grant.clone(),
+            })
+        );
+        assert_eq!(
             matching,
-            ApprovalCheck::Authorized(ApprovalAuthorization::ApprovedForRun {
-                approval_id: approval_id()
+            ApprovalCheck::Authorized(ApprovalAuthorization::Granted {
+                approval_id: approval_id(),
+                grant: run_grant,
             })
         );
         assert_eq!(other, ApprovalCheck::RequiresDecision);
@@ -164,35 +214,47 @@ mod tests {
     fn applying_decisions_preserves_the_authorizing_approval() {
         // Arrange
         let mut gate = ApprovalGate::new();
+        let lifetimes = offered_lifetimes();
+        let once_subject = subject("write-1", "write_file");
+        let run_subject = subject("edit-1", "edit_file");
+        let denied_subject = subject("glob-1", "glob");
+        let once_grant = once_subject.grant(ApprovalLifetime::Invocation);
+        let run_grant = run_subject.grant(ApprovalLifetime::Run);
+        let once_decision = ApprovalDecision::Grant(once_grant.clone());
+        let run_decision = ApprovalDecision::Grant(run_grant.clone());
+        let deny_decision = ApprovalDecision::Deny {
+            reason: "not now".to_string(),
+        };
 
         // Act
-        let once = gate.apply_decision("write_file", approval_id(), ApprovalDecision::AllowOnce);
-        let run = gate.apply_decision("edit_file", approval_id(), ApprovalDecision::AllowForRun);
-        let denied = gate.apply_decision(
-            "glob",
-            approval_id(),
-            ApprovalDecision::Deny {
-                reason: "not now".to_string(),
-            },
-        );
+        let once = gate.apply_decision(&lifetimes, approval_id(), &once_decision, &once_subject);
+        let run = gate.apply_decision(&lifetimes, approval_id(), &run_decision, &run_subject);
+        let denied =
+            gate.apply_decision(&lifetimes, approval_id(), &deny_decision, &denied_subject);
 
         // Assert
         assert_eq!(
             once,
-            ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedOnce {
+            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
                 approval_id: approval_id(),
+                grant: once_grant,
             })
         );
         assert_eq!(
             run,
-            ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedForRun {
+            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
                 approval_id: approval_id(),
+                grant: run_grant.clone(),
             })
         );
         assert_eq!(
-            gate.check(ApprovalRequirement::Required, "edit_file"),
-            ApprovalCheck::Authorized(ApprovalAuthorization::ApprovedForRun {
+            gate.check(
+                ApprovalRequirement::Required,
+                &subject("edit-2", "edit_file")
+            ),
+            ApprovalCheck::Authorized(ApprovalAuthorization::Granted {
                 approval_id: approval_id(),
+                grant: run_grant,
             })
         );
         assert_eq!(
@@ -203,6 +265,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn applying_a_grant_rejects_unoffered_lifetimes_and_mismatched_subjects() {
+        // Arrange
+        let mut gate = ApprovalGate::new();
+        let requested = subject("write-1", "write_file");
+        let other = subject("edit-1", "edit_file");
+        let workspace_decision =
+            ApprovalDecision::Grant(requested.grant(ApprovalLifetime::Workspace));
+        let other_decision = ApprovalDecision::Grant(other.grant(ApprovalLifetime::Invocation));
+
+        // Act
+        let unavailable = gate.apply_decision(
+            &offered_lifetimes(),
+            approval_id(),
+            &workspace_decision,
+            &requested,
+        );
+        let mismatched = gate.apply_decision(
+            &offered_lifetimes(),
+            approval_id(),
+            &other_decision,
+            &requested,
+        );
+
+        // Assert
+        assert!(matches!(
+            unavailable,
+            ApprovalOutcome::InvalidGrant { reason }
+                if reason.contains("lifetime")
+        ));
+        assert!(matches!(
+            mismatched,
+            ApprovalOutcome::InvalidGrant { reason }
+                if reason.contains("subject")
+        ));
+    }
+
     #[tokio::test]
     async fn request_emits_the_call_details_and_returns_the_decision() {
         // Arrange
@@ -210,26 +309,34 @@ mod tests {
         let sink = EventSink::new(events_tx);
         let cancel = CancellationToken::new();
         let payload = json!({ "file": "test.txt", "contents": "test" });
+        let offered_lifetimes = offered_lifetimes();
+        let subject = subject("write-1", "write_file");
 
         // Act
         let (request_result, ()) = tokio::join!(
-            request_approval("write_file", "write-1", &payload, &sink, &cancel),
+            request_approval(
+                offered_lifetimes.clone(),
+                &payload,
+                subject.clone(),
+                &sink,
+                &cancel,
+            ),
             async {
                 let event = events_rx.recv().await.unwrap();
 
                 let AgentEvent::ApprovalRequest {
-                    id,
+                    available_lifetimes,
                     input,
-                    name,
                     respond_to,
+                    subject: emitted_subject,
                 } = event
                 else {
                     panic!("expected ApprovalRequest");
                 };
 
-                assert_eq!(id, "write-1");
+                assert_eq!(available_lifetimes, offered_lifetimes);
                 assert_eq!(input, payload);
-                assert_eq!(name, "write_file");
+                assert_eq!(emitted_subject, subject);
 
                 respond_to
                     .send(ApprovalDecision::Deny {
@@ -258,9 +365,9 @@ mod tests {
 
         // Act
         let result = request_approval(
-            "write_file",
-            "write-1",
+            offered_lifetimes(),
             &json!({ "path": "test.txt" }),
+            subject("write-1", "write_file"),
             &sink,
             &cancel,
         )
@@ -280,7 +387,13 @@ mod tests {
 
         // Act
         let (request_result, ()) = tokio::join!(
-            request_approval("write_file", "write-1", &payload, &sink, &cancel),
+            request_approval(
+                offered_lifetimes(),
+                &payload,
+                subject("write-1", "write_file"),
+                &sink,
+                &cancel,
+            ),
             async {
                 let event = events_rx.recv().await.unwrap();
                 let AgentEvent::ApprovalRequest { respond_to, .. } = event else {
@@ -304,9 +417,9 @@ mod tests {
 
         // Act
         let result = request_approval(
-            "write_file",
-            "write-1",
+            offered_lifetimes(),
             &json!({ "path": "test.txt" }),
+            subject("write-1", "write_file"),
             &sink,
             &cancel,
         )

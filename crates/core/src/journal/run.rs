@@ -6,7 +6,7 @@ use super::{
     ToolRejected, ToolStarted, TurnAbortOutcome, TurnAborted, TurnCommitOutcome, TurnCommitted,
     TurnId, TurnStarted,
 };
-use crate::{Message, ModelTurn, ProviderDescriptor};
+use crate::{ApprovalLifetime, ApprovalSubject, Message, ModelTurn, ProviderDescriptor};
 use std::path::Path;
 
 pub struct RunJournal {
@@ -59,15 +59,15 @@ impl RunJournal {
     pub async fn approval_requested(
         &mut self,
         approval_id: ApprovalId,
-        tool_call_id: &str,
-        tool_name: &str,
+        available_lifetimes: Vec<ApprovalLifetime>,
+        subject: ApprovalSubject,
         turn_id: TurnId,
     ) -> Result<(), JournalError> {
         self.journal
             .append(JournalEntry::ApprovalRequested(ApprovalRequested {
                 approval_id,
-                tool_call_id: tool_call_id.to_string(),
-                tool_name: tool_name.to_string(),
+                available_lifetimes,
+                subject,
                 turn_id,
             }))
             .await?;
@@ -238,12 +238,14 @@ impl RunJournal {
     pub async fn tool_completed(
         &mut self,
         duration_ms: u64,
+        execution: Option<super::ToolExecutionCompleted>,
         tool_call_id: &str,
         turn_id: TurnId,
     ) -> Result<(), JournalError> {
         self.journal
             .append(JournalEntry::ToolCompleted(ToolCompleted {
                 duration_ms,
+                execution,
                 tool_call_id: tool_call_id.to_string(),
                 turn_id,
             }))
@@ -290,6 +292,7 @@ impl RunJournal {
     pub async fn tool_started(
         &mut self,
         authorization: ToolAuthorization,
+        execution: Option<super::ToolExecutionStarted>,
         tool_call_id: &str,
         tool_name: &str,
         turn_id: TurnId,
@@ -297,6 +300,7 @@ impl RunJournal {
         self.journal
             .append(JournalEntry::ToolStarted(ToolStarted {
                 authorization,
+                execution,
                 tool_call_id: tool_call_id.to_string(),
                 tool_name: tool_name.to_string(),
                 turn_id,

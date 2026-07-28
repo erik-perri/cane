@@ -1,6 +1,7 @@
 use anyhow::Context;
 use cane_core::{
-    AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, ShutdownReason, TurnOutcome,
+    AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, ApprovalLifetime, ApprovalSubject,
+    ShutdownReason, TurnOutcome,
 };
 use std::io::{BufRead, Write};
 use tokio::sync::mpsc;
@@ -193,20 +194,27 @@ async fn run_with_input(
                 AgentEvent::Error(e) => writeln!(output, "\nerror: {e}")?,
 
                 AgentEvent::ApprovalRequest {
+                    available_lifetimes,
                     input: command_input,
-                    name,
                     respond_to,
-                    ..
+                    subject,
                 } => {
+                    let options = approval_options(&available_lifetimes);
                     writeln!(
                         output,
-                        "\n[approval request: {name} {command_input}] [y,n,a]"
+                        "\n[approval request: {} {command_input}] {options}",
+                        subject.tool_name(),
                     )?;
                     output.flush()?;
 
                     let decision = tokio::select! {
                         _ = cancel.cancelled() => None,
-                        decision = read_decision(&mut input, &mut output) => Some(decision?),
+                        decision = read_decision(
+                            &mut input,
+                            &mut output,
+                            &available_lifetimes,
+                            &subject,
+                        ) => Some(decision?),
                     };
 
                     let Some(decision) = decision else {
@@ -228,6 +236,8 @@ async fn run_with_input(
 async fn read_decision(
     input: &mut InputLines,
     output: &mut impl Write,
+    available_lifetimes: &[ApprovalLifetime],
+    subject: &ApprovalSubject,
 ) -> anyhow::Result<ApprovalDecision> {
     loop {
         let Some(line) = read_input(input, output).await? else {
@@ -245,12 +255,36 @@ async fn read_decision(
             };
 
             return Ok(ApprovalDecision::Deny { reason });
-        } else if allow_input == "a" {
-            return Ok(ApprovalDecision::AllowForRun);
-        } else if allow_input == "y" {
-            return Ok(ApprovalDecision::AllowOnce);
+        } else if allow_input == "a" && available_lifetimes.contains(&ApprovalLifetime::Run) {
+            return Ok(ApprovalDecision::Grant(
+                subject.grant(ApprovalLifetime::Run),
+            ));
+        } else if allow_input == "w" && available_lifetimes.contains(&ApprovalLifetime::Workspace) {
+            return Ok(ApprovalDecision::Grant(
+                subject.grant(ApprovalLifetime::Workspace),
+            ));
+        } else if allow_input == "y" && available_lifetimes.contains(&ApprovalLifetime::Invocation)
+        {
+            return Ok(ApprovalDecision::Grant(
+                subject.grant(ApprovalLifetime::Invocation),
+            ));
         }
     }
+}
+
+fn approval_options(available_lifetimes: &[ApprovalLifetime]) -> String {
+    let mut options = Vec::new();
+    if available_lifetimes.contains(&ApprovalLifetime::Invocation) {
+        options.push("y");
+    }
+    options.push("n");
+    if available_lifetimes.contains(&ApprovalLifetime::Run) {
+        options.push("a");
+    }
+    if available_lifetimes.contains(&ApprovalLifetime::Workspace) {
+        options.push("w");
+    }
+    format!("[{}]", options.join(","))
 }
 
 async fn read_input(
@@ -274,6 +308,21 @@ mod tests {
     use std::io::{self, Cursor, Read};
     use std::sync::mpsc as std_mpsc;
     use tokio::sync::{mpsc, oneshot};
+
+    fn offered_tool_lifetimes() -> Vec<ApprovalLifetime> {
+        vec![ApprovalLifetime::Invocation, ApprovalLifetime::Run]
+    }
+
+    fn tool_subject() -> ApprovalSubject {
+        ApprovalSubject::tool_call("call_abc", "write_file")
+    }
+
+    async fn read_tool_decision(
+        input: &mut InputLines,
+        output: &mut impl Write,
+    ) -> anyhow::Result<ApprovalDecision> {
+        read_decision(input, output, &offered_tool_lifetimes(), &tool_subject()).await
+    }
 
     struct GatedEof {
         released: bool,
@@ -392,14 +441,17 @@ mod tests {
             let (respond_to, decision_rx) = oneshot::channel();
             event_tx
                 .send(AgentEvent::ApprovalRequest {
-                    id: "call_abc".to_string(),
+                    available_lifetimes: offered_tool_lifetimes(),
                     input: Default::default(),
-                    name: "write_file".to_string(),
                     respond_to,
+                    subject: tool_subject(),
                 })
                 .await
                 .unwrap();
-            assert_eq!(decision_rx.await.unwrap(), ApprovalDecision::AllowOnce);
+            assert_eq!(
+                decision_rx.await.unwrap(),
+                ApprovalDecision::Grant(tool_subject().grant(ApprovalLifetime::Invocation))
+            );
             event_tx
                 .send(AgentEvent::TurnComplete {
                     outcome: TurnOutcome::Completed {
@@ -649,7 +701,7 @@ mod tests {
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).await.unwrap();
+        let decision = read_tool_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
         assert_eq!(
@@ -661,6 +713,18 @@ mod tests {
         assert_eq!(String::from_utf8(output).unwrap(), "> \nreason:\n> ");
     }
 
+    #[test]
+    fn approval_options_only_list_offered_grant_lifetimes() {
+        // Arrange
+        let available_lifetimes = vec![ApprovalLifetime::Run, ApprovalLifetime::Workspace];
+
+        // Act
+        let options = approval_options(&available_lifetimes);
+
+        // Assert
+        assert_eq!(options, "[n,a,w]");
+    }
+
     #[tokio::test]
     async fn read_decision_treats_an_empty_decision_as_deny() {
         // Arrange
@@ -668,7 +732,7 @@ mod tests {
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).await.unwrap();
+        let decision = read_tool_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
         assert_eq!(
@@ -686,10 +750,13 @@ mod tests {
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).await.unwrap();
+        let decision = read_tool_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
-        assert_eq!(decision, ApprovalDecision::AllowForRun);
+        assert_eq!(
+            decision,
+            ApprovalDecision::Grant(tool_subject().grant(ApprovalLifetime::Run))
+        );
     }
 
     #[tokio::test]
@@ -699,10 +766,13 @@ mod tests {
         let mut output = Vec::new();
 
         // Act
-        let decision = read_decision(&mut input, &mut output).await.unwrap();
+        let decision = read_tool_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
-        assert_eq!(decision, ApprovalDecision::AllowOnce);
+        assert_eq!(
+            decision,
+            ApprovalDecision::Grant(tool_subject().grant(ApprovalLifetime::Invocation))
+        );
         let output = String::from_utf8(output).unwrap();
         assert_eq!(
             output.matches("> ").count(),
@@ -718,7 +788,7 @@ mod tests {
         let mut output = Vec::new();
 
         // Act
-        let result = read_decision(&mut input, &mut output).await;
+        let result = read_tool_decision(&mut input, &mut output).await;
 
         // Assert
         assert_eq!(result.unwrap_err().to_string(), "eof");
@@ -731,7 +801,7 @@ mod tests {
         let mut output = Vec::new();
 
         // Act
-        let result = read_decision(&mut input, &mut output).await;
+        let result = read_tool_decision(&mut input, &mut output).await;
 
         // Assert
         assert_eq!(result.unwrap_err().to_string(), "eof");
