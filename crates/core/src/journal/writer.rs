@@ -36,7 +36,16 @@ pub struct SessionJournal {
     writer: JournalWriter<File>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum InjectedFlushFailure {
+    ToolCompleted,
+    ToolStarted,
+}
+
 struct JournalWriter<W> {
+    #[cfg(test)]
+    injected_flush_failure: Option<InjectedFlushFailure>,
     next_sequence: u64,
     path: PathBuf,
     poisoned: bool,
@@ -70,6 +79,8 @@ impl SessionJournal {
 
         Ok(Self {
             writer: JournalWriter {
+                #[cfg(test)]
+                injected_flush_failure: None,
                 next_sequence: 1,
                 path,
                 poisoned: false,
@@ -99,6 +110,11 @@ impl SessionJournal {
     pub fn session_id(&self) -> &SessionId {
         &self.writer.session_id
     }
+
+    #[cfg(test)]
+    pub(crate) fn inject_flush_failure(&mut self, failure: InjectedFlushFailure) {
+        self.writer.injected_flush_failure = Some(failure);
+    }
 }
 
 impl<W> JournalWriter<W>
@@ -115,6 +131,11 @@ where
                 path: self.path.clone(),
             });
         }
+
+        #[cfg(test)]
+        let inject_flush_failure = self
+            .injected_flush_failure
+            .is_some_and(|failure| failure.matches(&entry));
 
         let record = JournalRecord::new(self.next_sequence, recorded_at, self.session_id, entry);
         let mut encoded = serde_json::to_vec(&record).map_err(|source| {
@@ -135,6 +156,16 @@ where
             });
         }
 
+        #[cfg(test)]
+        if inject_flush_failure {
+            self.poisoned = true;
+            return Err(JournalError::Io {
+                operation: "flush session journal",
+                path: self.path.clone(),
+                source: io::Error::other("injected flush failure"),
+            });
+        }
+
         if let Err(source) = self.sink.flush().await {
             self.poisoned = true;
             return Err(JournalError::Io {
@@ -146,6 +177,17 @@ where
 
         self.next_sequence += 1;
         Ok(record)
+    }
+}
+
+#[cfg(test)]
+impl InjectedFlushFailure {
+    fn matches(self, entry: &JournalEntry) -> bool {
+        matches!(
+            (self, entry),
+            (Self::ToolCompleted, JournalEntry::ToolCompleted(_))
+                | (Self::ToolStarted, JournalEntry::ToolStarted(_))
+        )
     }
 }
 
@@ -327,6 +369,7 @@ mod tests {
     async fn a_failed_flush_poisons_the_writer_against_retries() {
         // Arrange
         let mut writer = JournalWriter {
+            injected_flush_failure: None,
             next_sequence: 1,
             path: PathBuf::from("journal.jsonl"),
             poisoned: false,

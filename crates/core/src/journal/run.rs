@@ -113,6 +113,11 @@ impl RunJournal {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_flush_failure(&mut self, failure: super::InjectedFlushFailure) {
+        self.journal.inject_flush_failure(failure);
+    }
+
     pub fn path(&self) -> &Path {
         self.journal.path()
     }

@@ -182,13 +182,7 @@ pub async fn spawn_agent(
             tool_set,
         };
 
-        if let Err(AgentExit::JournalFailed(message)) = session.run().await {
-            let _ = events
-                .emit(AgentEvent::Error(format!(
-                    "session journal failed: {message}"
-                )))
-                .await;
-        }
+        run_and_report(session, &events).await;
     });
 
     Ok(AgentHandle {
@@ -199,6 +193,16 @@ pub async fn spawn_agent(
         session_id,
         task,
     })
+}
+
+async fn run_and_report(session: AgentSession, events: &EventSink) {
+    if let Err(AgentExit::JournalFailed(message)) = session.run().await {
+        let _ = events
+            .emit(AgentEvent::Error(format!(
+                "session journal failed: {message}"
+            )))
+            .await;
+    }
 }
 
 impl AgentHandle {
@@ -835,18 +839,72 @@ async fn execute_invocation(
 mod tests {
     use super::*;
     use crate::ApprovalDecision;
-    use crate::journal::{JournalRecord, SessionProjection, parse_journal, project_journal};
+    use crate::journal::{
+        InjectedFlushFailure, JournalRecord, SessionProjection, parse_journal, project_journal,
+    };
     use crate::protocol::ApprovalRequirement;
     use crate::tools::{Tool, ToolDefinition};
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::Notify;
     use tokio::time::timeout;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct FaultInjectedSession {
+        commands: mpsc::Sender<AgentCommand>,
+        events: mpsc::Receiver<AgentEvent>,
+        journal_path: PathBuf,
+        sessions: TempDir,
+        task: JoinHandle<()>,
+    }
+
+    struct CountingInvocation {
+        executions: Arc<AtomicUsize>,
+    }
+
+    struct CountingTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PreparedInvocation for CountingInvocation {
+        fn approval_requirement(&self) -> ApprovalRequirement {
+            ApprovalRequirement::None
+        }
+
+        async fn execute(
+            self: Box<Self>,
+            _cancel: CancellationToken,
+        ) -> Result<String, ToolExecutionError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok("executed".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                description: "Counts executions".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                }),
+                name: "counting_tool".to_string(),
+            }
+        }
+
+        async fn prepare(&self, _input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
+            Ok(Box::new(CountingInvocation {
+                executions: Arc::clone(&self.executions),
+            }))
+        }
+    }
 
     fn stream_chunk(delta: Value, finish_reason: Option<&str>) -> Value {
         json!({
@@ -1062,6 +1120,39 @@ mod tests {
             .unwrap();
 
         (handle, sessions)
+    }
+
+    async fn spawn_fault_injected_session(
+        server: &MockServer,
+        failure: InjectedFlushFailure,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> FaultInjectedSession {
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (commands_tx, commands_rx) = mpsc::channel(64);
+        let events = EventSink::new(events_tx);
+        let (mut session, sessions) = test_session(
+            server,
+            HostHandle {
+                cancel: CancellationToken::new(),
+                commands: commands_rx,
+                events: events.clone(),
+            },
+            tools,
+        )
+        .await;
+        session.journal.inject_flush_failure(failure);
+        let journal_path = session.journal.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_and_report(session, &events).await;
+        });
+
+        FaultInjectedSession {
+            commands: commands_tx,
+            events: events_rx,
+            journal_path,
+            sessions,
+            task,
+        }
     }
 
     async fn run_agent(prompt: &str, server: &MockServer) -> Vec<AgentEvent> {
@@ -1445,6 +1536,146 @@ mod tests {
             })) if category == "invalid_assistant_message"
                 && message == "assistant tool calls do not agree with the provider stop reason"
         ));
+    }
+
+    #[tokio::test]
+    async fn a_flush_failure_before_tool_start_prevents_execution_and_stops_the_run() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![tool_call_turn(&[("call-1", "counting_tool", json!({}))])],
+        )
+        .await;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let FaultInjectedSession {
+            commands,
+            mut events,
+            journal_path,
+            sessions: _sessions,
+            task,
+        } = spawn_fault_injected_session(
+            &server,
+            InjectedFlushFailure::ToolStarted,
+            vec![Box::new(CountingTool {
+                executions: Arc::clone(&executions),
+            })],
+        )
+        .await;
+
+        // Act
+        commands
+            .send(AgentCommand::UserInput("Run the tool".to_string()))
+            .await
+            .unwrap();
+        commands
+            .send(AgentCommand::UserInput(
+                "This turn must not start".to_string(),
+            ))
+            .await
+            .unwrap();
+        let observed_events = collect_until_events_close(&mut events).await;
+        task.await.unwrap();
+        let records = read_journal_records(&journal_path).await;
+        let projection = project_journal(&records).unwrap();
+        let requests = server.received_requests().await.unwrap();
+
+        // Assert
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            observed_events.as_slice(),
+            [AgentEvent::Error(error)]
+                if error.contains("session journal failed")
+                    && error.contains("injected flush failure")
+        ));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(&record.entry, JournalEntry::TurnStarted(_)))
+                .count(),
+            1,
+            "a queued user input must not start after the journal failure"
+        );
+        assert!(projection.messages.is_empty());
+        assert_eq!(projection.warnings.len(), 2);
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::ToolStarted(_))
+        ));
+        assert!(!records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::ToolCompleted(_) | JournalEntry::RunEnded(_)
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_flush_failure_after_tool_execution_stops_without_retrying_the_tool() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![tool_call_turn(&[("call-1", "counting_tool", json!({}))])],
+        )
+        .await;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let FaultInjectedSession {
+            commands,
+            mut events,
+            journal_path,
+            sessions: _sessions,
+            task,
+        } = spawn_fault_injected_session(
+            &server,
+            InjectedFlushFailure::ToolCompleted,
+            vec![Box::new(CountingTool {
+                executions: Arc::clone(&executions),
+            })],
+        )
+        .await;
+
+        // Act
+        commands
+            .send(AgentCommand::UserInput("Run the tool".to_string()))
+            .await
+            .unwrap();
+        let observed_events = collect_until_events_close(&mut events).await;
+        task.await.unwrap();
+        let records = read_journal_records(&journal_path).await;
+        let projection = project_journal(&records).unwrap();
+        let requests = server.received_requests().await.unwrap();
+
+        // Assert
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            observed_events.as_slice(),
+            [
+                AgentEvent::ToolStarted { name, .. },
+                AgentEvent::Error(error),
+            ] if name == "counting_tool"
+                && error.contains("session journal failed")
+                && error.contains("injected flush failure")
+        ));
+        assert_eq!(requests.len(), 1);
+        assert!(projection.messages.is_empty());
+        assert_eq!(projection.warnings.len(), 2);
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::ToolCompleted(_))
+        ));
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(&record.entry, JournalEntry::RunEnded(_)))
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(&record.entry, JournalEntry::MessageAdded(_)))
+                .count(),
+            2,
+            "the failed tool terminal write must not be followed by a tool-result message"
+        );
     }
 
     #[tokio::test]
@@ -2334,7 +2565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_tool_input_is_rejected_without_preparing_or_executing_the_tool() {
+    async fn malformed_tool_input_is_rejected_without_starting_the_tool() {
         // Arrange
         let server = MockServer::start().await;
         let malformed_input = "{\"path\": unclosed";
