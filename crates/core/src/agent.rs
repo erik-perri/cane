@@ -1,8 +1,11 @@
 use crate::Workspace;
-use crate::approval::{ApprovalCheck, ApprovalGate, ApprovalOutcome, request_approval};
+use crate::approval::{
+    ApprovalAuthorization, ApprovalCheck, ApprovalGate, ApprovalOutcome, request_approval,
+};
 use crate::journal::{
-    ApprovalId, JournalEntry, JournalError, RunId, RunStarted, SessionId, SessionJournal,
-    SessionStarted,
+    ApprovalId, ErrorDetail, JournalApprovalDecision, JournalEntry, JournalError, RunId,
+    RunJournal, RunStarted, SessionId, SessionJournal, SessionStarted, ToolAuthorization,
+    TurnAbortOutcome, TurnCommitOutcome, TurnId,
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
@@ -10,8 +13,10 @@ use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
 use crate::tools::{PreparedInvocation, ToolExecutionError, ToolSet};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -22,7 +27,7 @@ const MAX_PROVIDER_ROUNDS_PER_TURN: usize = 24;
 pub struct AgentSession {
     client: OpenAiClient,
     host_handle: HostHandle,
-    journal: SessionJournal,
+    journal: RunJournal,
     tool_set: ToolSet,
 }
 
@@ -50,6 +55,14 @@ pub enum AgentStartError {
 #[derive(Default)]
 struct TurnBudget {
     provider_rounds: usize,
+}
+
+struct AuthorizedToolCall<'a> {
+    authorization: ApprovalAuthorization,
+    id: &'a str,
+    input: &'a Value,
+    name: &'a str,
+    turn_id: TurnId,
 }
 
 impl TurnBudget {
@@ -97,17 +110,21 @@ pub async fn spawn_agent(
         }))
         .await?;
 
+    let model = provider.model;
+    let provider_descriptor = client.provider_descriptor();
+
     journal
         .append(JournalEntry::RunStarted(RunStarted {
             git: None,
             max_output_tokens: provider.max_tokens,
-            model: provider.model,
-            provider: client.provider_descriptor(),
+            model: model.clone(),
+            provider: provider_descriptor.clone(),
             run_id,
             tool_catalog: tool_set.definitions().to_vec(),
         }))
         .await?;
 
+    let journal = RunJournal::new(journal, model, provider_descriptor, run_id);
     let journal_path = journal.path().to_path_buf();
     let (events_tx, events_rx) = mpsc::channel(64);
     let (commands_tx, commands_rx) = mpsc::channel(64);
@@ -128,7 +145,13 @@ pub async fn spawn_agent(
             tool_set,
         };
 
-        let _ = session.run().await;
+        if let Err(AgentExit::JournalFailed(message)) = session.run().await {
+            let _ = events
+                .emit(AgentEvent::Error(format!(
+                    "session journal failed: {message}"
+                )))
+                .await;
+        }
     });
 
     Ok(AgentHandle {
@@ -189,20 +212,24 @@ impl AgentSession {
             };
 
             let turn_start = history.len();
+            let user_message = match command {
+                AgentCommand::UserInput(prompt) => Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: prompt }],
+                },
+            };
+            let turn_id = self.journal.start_turn(&user_message).await?;
+            history.push(user_message);
 
-            match command {
-                AgentCommand::UserInput(prompt) => {
-                    history.push(Message {
-                        role: Role::User,
-                        content: vec![ContentBlock::Text { text: prompt }],
-                    });
-                }
-            }
-
-            match self.run_turn(&mut history, &mut approval_gate).await {
+            match self
+                .run_turn(turn_id, &mut history, &mut approval_gate)
+                .await
+            {
                 Ok(outcome) => {
                     let session_over = matches!(outcome, TurnOutcome::Cancelled);
                     let needs_rollback = session_over || matches!(outcome, TurnOutcome::Failed);
+
+                    self.record_turn_outcome(turn_id, &outcome).await?;
 
                     if needs_rollback {
                         // Truncate the history on failure so we don't leave an incomplete
@@ -220,6 +247,10 @@ impl AgentSession {
                     }
                 }
                 Err(AgentExit::Cancelled) => {
+                    self.journal
+                        .abort_turn(turn_id, TurnAbortOutcome::Cancelled)
+                        .await?;
+
                     // If a cancel is tripped mid-approval, the turn still gets
                     // its one marker before the session ends.
                     let _ = self
@@ -232,13 +263,56 @@ impl AgentSession {
 
                     return Err(AgentExit::Cancelled);
                 }
+                Err(exit @ AgentExit::JournalFailed(_)) => return Err(exit),
                 Err(exit) => return Err(exit),
             }
         }
     }
 
+    async fn record_turn_outcome(
+        &mut self,
+        turn_id: TurnId,
+        outcome: &TurnOutcome,
+    ) -> Result<(), AgentExit> {
+        match outcome {
+            TurnOutcome::Completed { stop_reason } => {
+                self.journal
+                    .commit_turn(
+                        turn_id,
+                        TurnCommitOutcome::Completed {
+                            stop_reason: stop_reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            TurnOutcome::Paused { reason } => {
+                self.journal
+                    .commit_turn(
+                        turn_id,
+                        TurnCommitOutcome::Paused {
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            TurnOutcome::Failed => {
+                self.journal
+                    .abort_turn(turn_id, TurnAbortOutcome::Failed { error: None })
+                    .await?;
+            }
+            TurnOutcome::Cancelled => {
+                self.journal
+                    .abort_turn(turn_id, TurnAbortOutcome::Cancelled)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn run_turn(
         &mut self,
+        turn_id: TurnId,
         history: &mut Vec<Message>,
         gate: &mut ApprovalGate,
     ) -> Result<TurnOutcome, AgentExit> {
@@ -249,21 +323,41 @@ impl AgentSession {
                 return Ok(TurnOutcome::Paused { reason });
             }
 
+            let provider_round_id = self.journal.provider_round_started(turn_id).await?;
+            let provider_started = Instant::now();
             let stream_result = tokio::select! {
                 _ = self.host_handle.events.closed() => return Err(AgentExit::Disconnected),
                 result = self.client.stream_message(history, self.tool_set.definitions(), self.host_handle.events.sender(), &self.host_handle.cancel) => {
                     result
                 }
             };
+            let latency_ms = elapsed_ms(provider_started);
 
-            let ModelTurn {
-                message: assistant_msg,
-                stop_reason,
-                ..
-            } = match stream_result {
-                Ok(result) => result,
+            let model_turn = match stream_result {
+                Ok(result) => {
+                    self.journal
+                        .provider_round_completed(latency_ms, provider_round_id, &result, turn_id)
+                        .await?;
+                    result
+                }
                 Err(error) => {
                     let cancelled = matches!(&error, ProviderError::Cancelled);
+
+                    if cancelled {
+                        self.journal
+                            .provider_round_cancelled(latency_ms, provider_round_id, turn_id)
+                            .await?;
+                    } else {
+                        self.journal
+                            .provider_round_failed(
+                                provider_error_detail(&error),
+                                latency_ms,
+                                provider_round_id,
+                                None,
+                                turn_id,
+                            )
+                            .await?;
+                    }
 
                     self.host_handle
                         .events
@@ -278,8 +372,23 @@ impl AgentSession {
                 }
             };
 
+            let ModelTurn {
+                message: assistant_msg,
+                stop_reason,
+                ..
+            } = model_turn;
+
             tracing::debug!(history_len = history.len(), ?stop_reason);
 
+            if let Err(error) = validate_assistant_message(&assistant_msg, &stop_reason) {
+                self.host_handle
+                    .events
+                    .emit(AgentEvent::Error(error.to_string()))
+                    .await?;
+                return Ok(TurnOutcome::Failed);
+            }
+
+            self.journal.message_added(&assistant_msg, turn_id).await?;
             history.push(assistant_msg);
 
             if stop_reason != StopReason::ToolUse {
@@ -295,13 +404,17 @@ impl AgentSession {
                     } => {
                         let tool_result = match input {
                             ToolInput::Valid(input) => {
-                                self.execute_tool_call(id, name, input, gate).await?
+                                self.execute_tool_call(turn_id, id, name, input, gate)
+                                    .await?
                             }
                             ToolInput::Invalid(raw) => {
                                 let error = format!(
                                     "invalid input for tool `{name}`: arguments are not valid JSON: {raw}"
                                 );
 
+                                self.journal
+                                    .tool_rejected("invalid_input", id, name, turn_id)
+                                    .await?;
                                 self.host_handle
                                     .events
                                     .emit(AgentEvent::ToolRejected {
@@ -336,15 +449,18 @@ impl AgentSession {
                 return Ok(TurnOutcome::Failed);
             }
 
-            history.push(Message {
+            let result_message = Message {
                 role: Role::User,
                 content: results,
-            });
+            };
+            self.journal.message_added(&result_message, turn_id).await?;
+            history.push(result_message);
         }
     }
 
     async fn execute_tool_call(
         &mut self,
+        turn_id: TurnId,
         id: &str,
         name: &str,
         input: &Value,
@@ -353,6 +469,9 @@ impl AgentSession {
         let invocation = match prepare_tool_call(&self.tool_set, id, name, input).await {
             Ok(invocation) => invocation,
             Err(result) => {
+                self.journal
+                    .tool_rejected("preparation_failed", id, name, turn_id)
+                    .await?;
                 self.host_handle
                     .events
                     .emit(AgentEvent::ToolRejected {
@@ -368,6 +487,9 @@ impl AgentSession {
             ApprovalCheck::Authorized(authorization) => authorization,
             ApprovalCheck::RequiresDecision => {
                 let approval_id = ApprovalId::generate();
+                self.journal
+                    .approval_requested(approval_id, id, name, turn_id)
+                    .await?;
                 let decision = request_approval(
                     name,
                     id,
@@ -376,10 +498,16 @@ impl AgentSession {
                     &self.host_handle.cancel,
                 )
                 .await?;
+                self.journal
+                    .approval_decided(approval_id, journal_approval_decision(&decision))
+                    .await?;
 
                 match gate.apply_decision(name, approval_id, decision) {
                     ApprovalOutcome::Authorized(authorization) => authorization,
                     ApprovalOutcome::Denied { reason } => {
+                        self.journal
+                            .tool_rejected("approval_denied", id, name, turn_id)
+                            .await?;
                         self.host_handle
                             .events
                             .emit(AgentEvent::ToolDenied {
@@ -407,7 +535,19 @@ impl AgentSession {
             "tool call authorized"
         );
 
-        execute_invocation(&self.host_handle, id, name, input, invocation).await
+        execute_invocation(
+            &self.host_handle,
+            &mut self.journal,
+            AuthorizedToolCall {
+                authorization,
+                id,
+                input,
+                name,
+                turn_id,
+            },
+            invocation,
+        )
+        .await
     }
 }
 
@@ -433,40 +573,148 @@ fn failed_tool_result(id: &str, error: String) -> ToolResultData {
     }
 }
 
+fn validate_assistant_message(
+    message: &Message,
+    stop_reason: &StopReason,
+) -> Result<(), &'static str> {
+    let mut has_tool_use = false;
+    let mut tool_call_ids = HashSet::new();
+
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { .. } => {}
+            ContentBlock::ToolUse { id, .. } => {
+                has_tool_use = true;
+                if !tool_call_ids.insert(id) {
+                    return Err("assistant message repeats a tool call ID");
+                }
+            }
+            ContentBlock::ToolResult { .. } => {
+                return Err("assistant message contains a tool result");
+            }
+        }
+    }
+
+    if has_tool_use != (*stop_reason == StopReason::ToolUse) {
+        return Err("assistant tool calls do not agree with the provider stop reason");
+    }
+
+    Ok(())
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn journal_approval_decision(decision: &crate::ApprovalDecision) -> JournalApprovalDecision {
+    match decision {
+        crate::ApprovalDecision::AllowForRun => JournalApprovalDecision::AllowForRun,
+        crate::ApprovalDecision::AllowOnce => JournalApprovalDecision::AllowOnce,
+        crate::ApprovalDecision::Deny { reason } => JournalApprovalDecision::Deny {
+            reason: reason.clone(),
+        },
+    }
+}
+
+fn provider_error_detail(error: &ProviderError) -> ErrorDetail {
+    let category = match error {
+        ProviderError::Api { .. } => "api",
+        ProviderError::Cancelled => "cancelled",
+        ProviderError::InvalidBaseUrl { .. } => "invalid_base_url",
+        ProviderError::Network(_) => "network",
+        ProviderError::Parsing(_) => "parsing",
+        ProviderError::Protocol { .. } => "protocol",
+    };
+
+    ErrorDetail {
+        category: category.to_string(),
+        message: error.to_string(),
+    }
+}
+
+fn tool_authorization(authorization: ApprovalAuthorization) -> ToolAuthorization {
+    match authorization {
+        ApprovalAuthorization::ApprovedForRun { approval_id } => {
+            ToolAuthorization::ApprovedForRun { approval_id }
+        }
+        ApprovalAuthorization::ApprovedOnce { approval_id } => {
+            ToolAuthorization::ApprovedOnce { approval_id }
+        }
+        ApprovalAuthorization::NotRequired => ToolAuthorization::NotRequired,
+    }
+}
+
 async fn execute_invocation(
     host_handle: &HostHandle,
-    id: &str,
-    name: &str,
-    input: &Value,
+    journal: &mut RunJournal,
+    call: AuthorizedToolCall<'_>,
     invocation: Box<dyn PreparedInvocation>,
 ) -> Result<ToolResultData, AgentExit> {
+    journal
+        .tool_started(
+            tool_authorization(call.authorization),
+            call.id,
+            call.name,
+            call.turn_id,
+        )
+        .await?;
+
     host_handle
         .events
         .emit(AgentEvent::ToolStarted {
-            input: input.clone(),
-            name: name.to_string(),
+            input: call.input.clone(),
+            name: call.name.to_string(),
         })
         .await?;
 
     let execution_cancel = host_handle.cancel.child_token();
+    let execution_started = Instant::now();
     let tool_future = invocation.execute(execution_cancel.clone());
 
     let execution_result = tokio::select! {
         _ = host_handle.events.closed() => {
             execution_cancel.cancel();
+            journal
+                .tool_cancelled(
+                    elapsed_ms(execution_started),
+                    call.id,
+                    call.turn_id,
+                )
+                .await?;
             return Err(AgentExit::Disconnected);
         }
         _ = host_handle.cancel.cancelled() => {
             execution_cancel.cancel();
+            journal
+                .tool_cancelled(
+                    elapsed_ms(execution_started),
+                    call.id,
+                    call.turn_id,
+                )
+                .await?;
             return Err(AgentExit::Cancelled);
         }
         result = tool_future => result,
     };
+    let duration_ms = elapsed_ms(execution_started);
 
     let (content, is_error) = match execution_result {
-        Ok(content) => (content, false),
-        Err(ToolExecutionError::ToolError(error)) => (error, true),
+        Ok(content) => {
+            journal
+                .tool_completed(duration_ms, call.id, call.turn_id)
+                .await?;
+            (content, false)
+        }
+        Err(ToolExecutionError::ToolError(error)) => {
+            journal
+                .tool_failed(duration_ms, "tool_error", call.id, call.turn_id)
+                .await?;
+            (error, true)
+        }
         Err(ToolExecutionError::Cancelled) => {
+            journal
+                .tool_cancelled(duration_ms, call.id, call.turn_id)
+                .await?;
             return Err(AgentExit::Cancelled);
         }
     };
@@ -475,7 +723,7 @@ async fn execute_invocation(
         .events
         .emit(AgentEvent::ToolFinished {
             is_error,
-            name: name.to_string(),
+            name: call.name.to_string(),
             output: content.clone(),
         })
         .await?;
@@ -483,7 +731,7 @@ async fn execute_invocation(
     Ok(ToolResultData {
         content,
         is_error,
-        tool_use_id: id.to_string(),
+        tool_use_id: call.id.to_string(),
     })
 }
 
@@ -491,7 +739,7 @@ async fn execute_invocation(
 mod tests {
     use super::*;
     use crate::ApprovalDecision;
-    use crate::journal::parse_journal;
+    use crate::journal::{JournalRecord, SessionProjection, parse_journal, project_journal};
     use crate::protocol::ApprovalRequirement;
     use crate::tools::{Tool, ToolDefinition};
     use async_trait::async_trait;
@@ -571,6 +819,47 @@ mod tests {
         ])
     }
 
+    fn assistant_tool_call(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            input: ToolInput::Valid(json!({})),
+            name: "test_tool".to_string(),
+        }
+    }
+
+    #[test]
+    fn assistant_tool_calls_require_a_tool_use_stop_reason() {
+        // Arrange
+        let message = Message {
+            content: vec![assistant_tool_call("call_1")],
+            role: Role::Assistant,
+        };
+
+        // Act
+        let result = validate_assistant_message(&message, &StopReason::MaxTokens);
+
+        // Assert
+        assert_eq!(
+            result,
+            Err("assistant tool calls do not agree with the provider stop reason")
+        );
+    }
+
+    #[test]
+    fn assistant_tool_call_ids_must_be_unique_within_a_message() {
+        // Arrange
+        let message = Message {
+            content: vec![assistant_tool_call("call_1"), assistant_tool_call("call_1")],
+            role: Role::Assistant,
+        };
+
+        // Act
+        let result = validate_assistant_message(&message, &StopReason::ToolUse);
+
+        // Assert
+        assert_eq!(result, Err("assistant message repeats a tool call ID"));
+    }
+
     async fn mount_turns(server: &MockServer, turns: Vec<ResponseTemplate>) {
         for (i, turn) in turns.into_iter().enumerate() {
             Mock::given(method("POST"))
@@ -597,12 +886,31 @@ mod tests {
         Workspace::new(std::env::temp_dir()).unwrap()
     }
 
+    async fn test_run_journal() -> (RunJournal, TempDir) {
+        let sessions = TempDir::new().unwrap();
+        let journal = SessionJournal::create(sessions.path(), SessionId::generate())
+            .await
+            .unwrap();
+        let journal = RunJournal::new(
+            journal,
+            "test-model".to_string(),
+            crate::ProviderDescriptor {
+                adapter: crate::ProviderAdapter::OpenAiCompatible,
+                endpoint: "https://example.test/chat/completions".to_string(),
+            },
+            RunId::generate(),
+        );
+
+        (journal, sessions)
+    }
+
     async fn test_session(
         server: &MockServer,
         host_handle: HostHandle,
         tools: Vec<Box<dyn Tool>>,
     ) -> (AgentSession, TempDir) {
         let provider = test_provider(server);
+        let model = provider.model.clone();
         let client = OpenAiClient::new(
             provider.base_url,
             provider.api_key,
@@ -614,6 +922,12 @@ mod tests {
         let journal = SessionJournal::create(sessions.path(), SessionId::generate())
             .await
             .unwrap();
+        let journal = RunJournal::new(
+            journal,
+            model,
+            client.provider_descriptor(),
+            RunId::generate(),
+        );
 
         (
             AgentSession {
@@ -679,6 +993,18 @@ mod tests {
         })
         .await
         .expect("agent turn never completed")
+    }
+
+    async fn finish_and_project(handle: AgentHandle) -> (Vec<JournalRecord>, SessionProjection) {
+        let journal_path = handle.journal_path().to_path_buf();
+        timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("agent task did not join")
+            .expect("agent task panicked");
+        let contents = tokio::fs::read(journal_path).await.unwrap();
+        let records = parse_journal(&contents).unwrap();
+        let projection = project_journal(&records).unwrap();
+        (records, projection)
     }
 
     #[tokio::test]
@@ -831,6 +1157,102 @@ mod tests {
             body["messages"],
             json!([{ "role": "user", "content": "Say hi" }])
         );
+    }
+
+    #[tokio::test]
+    async fn a_completed_text_turn_is_committed_to_the_projected_history() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(&server, vec![text_turn("Hello world")]).await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Say hi".to_string()))
+            .await
+            .unwrap();
+
+        // Act
+        let events = collect_turn(&mut handle.events).await;
+        let (records, projection) = finish_and_project(handle).await;
+
+        // Assert
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete {
+                outcome: TurnOutcome::Completed {
+                    stop_reason: StopReason::EndTurn,
+                },
+            })
+        ));
+        assert_eq!(
+            projection.messages,
+            vec![
+                Message {
+                    content: vec![ContentBlock::Text {
+                        text: "Say hi".to_string(),
+                    }],
+                    role: Role::User,
+                },
+                Message {
+                    content: vec![ContentBlock::Text {
+                        text: "Hello world".to_string(),
+                    }],
+                    role: Role::Assistant,
+                },
+            ]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| { matches!(&record.entry, JournalEntry::ProviderRoundStarted(_)) })
+                .count(),
+            1
+        );
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::TurnCommitted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_provider_round_aborts_without_projecting_the_user_message() {
+        // Arrange
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("provider unavailable"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Say hi".to_string()))
+            .await
+            .unwrap();
+
+        // Act
+        let events = collect_turn(&mut handle.events).await;
+        let (records, projection) = finish_and_project(handle).await;
+
+        // Assert
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete {
+                outcome: TurnOutcome::Failed,
+            })
+        ));
+        assert!(projection.messages.is_empty());
+        assert!(records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::ProviderRoundFailed(failed)
+                if failed.error.category == "api"
+                    && failed.error.message.contains("provider unavailable")
+        )));
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::TurnAborted(_))
+        ));
     }
 
     #[tokio::test]
@@ -1911,6 +2333,48 @@ mod tests {
         );
 
         assert_eq!(std::fs::read_to_string(file_path).unwrap(), "changed");
+
+        let (records, projection) = finish_and_project(handle).await;
+        let requested = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ApprovalRequested(requested) => {
+                    Some((record.sequence, requested.approval_id))
+                }
+                _ => None,
+            })
+            .expect("approval request was not journaled");
+        let decided = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ApprovalDecided(decided) => Some((record.sequence, decided)),
+                _ => None,
+            })
+            .expect("approval decision was not journaled");
+        let started = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ToolStarted(started) => Some((record.sequence, started)),
+                _ => None,
+            })
+            .expect("tool start was not journaled");
+
+        assert_eq!(projection.messages.len(), 4);
+        assert_eq!(decided.1.approval_id, requested.1);
+        assert_eq!(decided.1.decision, JournalApprovalDecision::AllowOnce);
+        assert_eq!(
+            started.1.authorization,
+            ToolAuthorization::ApprovedOnce {
+                approval_id: requested.1,
+            }
+        );
+        assert!(requested.0 < decided.0);
+        assert!(decided.0 < started.0);
+        assert!(records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::ToolCompleted(completed)
+                if completed.tool_call_id == "write-1"
+        )));
     }
 
     #[tokio::test]
@@ -2314,13 +2778,19 @@ mod tests {
 
         let mock_error = "Mock error".to_string();
         let mock_id = "call-1".to_string();
+        let (mut journal, _sessions) = test_run_journal().await;
 
         // Act
         let result = execute_invocation(
             &host_handle,
-            mock_id.as_str(),
-            "test",
-            &json!({}),
+            &mut journal,
+            AuthorizedToolCall {
+                authorization: ApprovalAuthorization::NotRequired,
+                id: mock_id.as_str(),
+                input: &json!({}),
+                name: "test",
+                turn_id: TurnId::generate(),
+            },
             Box::new(TestInvocation {
                 execution: TestExecution::Fail(mock_error.clone()),
             }),
@@ -2350,13 +2820,19 @@ mod tests {
             commands: commands_rx,
             events: event_sink,
         };
+        let (mut journal, _sessions) = test_run_journal().await;
 
         // Act
         let result = execute_invocation(
             &host_handle,
-            "call-1",
-            "test",
-            &json!({}),
+            &mut journal,
+            AuthorizedToolCall {
+                authorization: ApprovalAuthorization::NotRequired,
+                id: "call-1",
+                input: &json!({}),
+                name: "test",
+                turn_id: TurnId::generate(),
+            },
             Box::new(TestInvocation {
                 execution: TestExecution::Cancel,
             }),
@@ -2397,13 +2873,20 @@ mod tests {
 
         let started = Arc::new(Notify::new());
         let invocation_started = Arc::clone(&started);
+        let (mut journal, _sessions) = test_run_journal().await;
+        let turn_id = TurnId::generate();
 
         let execution = tokio::spawn(async move {
             execute_invocation(
                 &host_handle,
-                "call-1",
-                "test",
-                &json!({}),
+                &mut journal,
+                AuthorizedToolCall {
+                    authorization: ApprovalAuthorization::NotRequired,
+                    id: "call-1",
+                    input: &json!({}),
+                    name: "test",
+                    turn_id,
+                },
                 Box::new(TestInvocation {
                     execution: TestExecution::Block {
                         started: invocation_started,
@@ -2458,13 +2941,20 @@ mod tests {
 
         let started = Arc::new(Notify::new());
         let invocation_started = Arc::clone(&started);
+        let (mut journal, _sessions) = test_run_journal().await;
+        let turn_id = TurnId::generate();
 
         let execution = tokio::spawn(async move {
             execute_invocation(
                 &host_handle,
-                "call-1",
-                "test",
-                &json!({}),
+                &mut journal,
+                AuthorizedToolCall {
+                    authorization: ApprovalAuthorization::NotRequired,
+                    id: "call-1",
+                    input: &json!({}),
+                    name: "test",
+                    turn_id,
+                },
                 Box::new(TestInvocation {
                     execution: TestExecution::Block {
                         started: invocation_started,

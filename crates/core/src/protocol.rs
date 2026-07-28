@@ -77,6 +77,8 @@ pub struct HostHandle {
 pub enum AgentExit {
     /// Command channel or event channel closed; clean shutdown.
     Disconnected,
+    /// The authoritative journal could no longer be written.
+    JournalFailed(String),
     /// Cancellation token tripped while a turn was active.
     Cancelled,
 }
@@ -85,6 +87,7 @@ impl Display for AgentExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AgentExit::Disconnected => write!(f, "Command channel or event channel closed"),
+            AgentExit::JournalFailed(message) => write!(f, "Session journal failed: {message}"),
             AgentExit::Cancelled => write!(f, "Cancellation token tripped"),
         }
     }
@@ -93,6 +96,12 @@ impl Display for AgentExit {
 impl From<FrontendGone> for AgentExit {
     fn from(_: FrontendGone) -> Self {
         AgentExit::Disconnected
+    }
+}
+
+impl From<crate::journal::JournalError> for AgentExit {
+    fn from(error: crate::journal::JournalError) -> Self {
+        Self::JournalFailed(error.to_string())
     }
 }
 
