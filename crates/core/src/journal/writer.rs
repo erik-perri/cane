@@ -299,10 +299,12 @@ mod tests {
     async fn create_never_overwrites_an_existing_session() {
         // Arrange
         let temporary = TempDir::new().unwrap();
-        let first = SessionJournal::create(temporary.path(), session_id())
+        let mut first = SessionJournal::create(temporary.path(), session_id())
             .await
             .unwrap();
         let path = first.path().to_path_buf();
+        first.append(session_started()).await.unwrap();
+        let original_contents = fs::read(&path).await.unwrap();
 
         // Act
         let error = SessionJournal::create(temporary.path(), session_id())
@@ -318,7 +320,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(path.exists());
+        assert_eq!(fs::read(path).await.unwrap(), original_contents);
     }
 
     #[tokio::test]

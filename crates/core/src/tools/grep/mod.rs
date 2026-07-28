@@ -836,7 +836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_before_execution_does_no_filesystem_work() {
+    async fn pre_cancelled_execution_returns_cancellation() {
         // Arrange
         let (root, tool) = grep_tool();
         fs::write(root.path().join("main.rs"), "needle\n").unwrap();
@@ -1178,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_explicit_file_fails_without_being_read() {
+    async fn an_oversized_explicit_file_returns_a_path_specific_size_error() {
         // Arrange
         let (root, tool) = grep_tool();
         let path = root.path().join("large.txt");

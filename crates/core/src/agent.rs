@@ -1482,11 +1482,14 @@ mod tests {
         let journal_path = handle.journal_path().to_path_buf();
 
         // Act
+        tokio::task::yield_now().await;
+        let waited_for_input = !handle.task.is_finished();
         drop(handle.commands);
         let events = collect_until_events_close(&mut handle.events).await;
         let records = read_journal_records(&journal_path).await;
 
         // Assert
+        assert!(waited_for_input, "agent exited while its frontend was live");
         assert!(
             events.is_empty(),
             "idle session emitted unexpected events: {events:?}"
@@ -2934,6 +2937,13 @@ mod tests {
             "expected an Error followed by a cancelled TurnComplete, got {events:?}"
         );
         assert!(matches!(
+            records.iter().rev().nth(1).map(|record| &record.entry),
+            Some(JournalEntry::TurnAborted(crate::journal::TurnAborted {
+                outcome: TurnAbortOutcome::Cancelled,
+                ..
+            }))
+        ));
+        assert!(matches!(
             records.last().map(|record| &record.entry),
             Some(JournalEntry::RunEnded(crate::journal::RunEnded {
                 reason: RunEndReason::ActiveTurnCancelled,
@@ -3001,7 +3011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_during_tool_execution_completes_turn_once_without_finishing_tool() {
+    async fn session_cancellation_completes_the_turn_once_without_tool_finished() {
         // Arrange
         let server = MockServer::start().await;
 
@@ -3236,7 +3246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_cancellation_during_tool_execution_returns_cancelled_without_finishing() {
+    async fn session_cancellation_returns_cancelled_without_tool_finished() {
         // Arrange
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let (_commands_tx, commands_rx) = mpsc::channel(64);

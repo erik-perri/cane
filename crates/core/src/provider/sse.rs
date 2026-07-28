@@ -284,7 +284,6 @@ mod tests {
         let ProviderError::Parsing(first_utf8_error) = first_error else {
             panic!("expected parsing error, got {first_error:?}")
         };
-        matches!(first_utf8_error, std::str::Utf8Error { .. });
 
         let events = parser.feed(&[]).unwrap_err();
         let ProviderError::Parsing(second_utf8_error) = events else {

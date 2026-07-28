@@ -518,26 +518,31 @@ mod tests {
             events,
         };
         let frontend = tokio::spawn(async move {
-            command_rx.recv().await.unwrap();
+            let first_command = command_rx.recv().await.unwrap();
             event_tx
                 .send(AgentEvent::TurnComplete {
                     outcome: TurnOutcome::Cancelled,
                 })
                 .await
                 .unwrap();
+            let next_command = command_rx.recv().await;
+            (first_command, next_command)
         });
         let input = Cursor::new("start something\nnever read\n");
         let mut output = Vec::new();
 
         // Act
         run(agent, input, &mut output).await.unwrap();
-        frontend.await.unwrap();
+        let (first_command, next_command) = frontend.await.unwrap();
 
         // Assert
-        // One prompt, then the turn's closing newline. The second input line
-        // was never processed as another user turn.
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output, "> \n");
+        assert_eq!(
+            first_command,
+            AgentCommand::UserInput("start something".to_string())
+        );
+        assert_eq!(next_command, None);
     }
 
     #[tokio::test]
