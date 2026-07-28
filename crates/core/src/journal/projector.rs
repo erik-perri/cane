@@ -738,7 +738,7 @@ mod tests {
         ProviderRoundStarted, RunEndReason, RunEnded, RunStarted, SessionStarted, ToolCompleted,
         ToolStarted, TurnAborted, TurnCommitted, TurnStarted,
     };
-    use crate::{ToolInput, ToolResultData};
+    use crate::{ProviderAdapter, ProviderDescriptor, ToolInput, ToolResultData};
 
     fn session_id() -> SessionId {
         "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
@@ -784,7 +784,7 @@ mod tests {
             git: None,
             max_output_tokens: 32_000,
             model: "test-model".to_string(),
-            provider: "openai-compatible".to_string(),
+            provider: provider(),
             run_id: run_id(),
             tool_catalog: Vec::new(),
         })
@@ -826,11 +826,18 @@ mod tests {
     fn provider_started() -> JournalEntry {
         JournalEntry::ProviderRoundStarted(ProviderRoundStarted {
             model: "test-model".to_string(),
-            provider: "openai-compatible".to_string(),
+            provider: provider(),
             provider_round_id: round_id(),
             run_id: run_id(),
             turn_id: turn_id(),
         })
+    }
+
+    fn provider() -> ProviderDescriptor {
+        ProviderDescriptor {
+            adapter: ProviderAdapter::OpenAiCompatible,
+            endpoint: "https://example.test/v1/chat/completions".to_string(),
+        }
     }
 
     fn provider_completed(stop_reason: StopReason) -> JournalEntry {

@@ -1,7 +1,7 @@
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::AgentEvent;
 use crate::provider::sse::SseParser;
-use crate::provider::{ModelTurn, ProviderError};
+use crate::provider::{ModelTurn, ProviderAdapter, ProviderDescriptor, ProviderError};
 use crate::tools::ToolDefinition;
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,23 @@ impl OpenAiClient {
             max_tokens,
             model,
         })
+    }
+
+    pub(crate) fn provider_descriptor(&self) -> ProviderDescriptor {
+        let mut endpoint = self.endpoint.clone();
+        endpoint
+            .set_password(None)
+            .expect("a validated hierarchical endpoint accepts password removal");
+        endpoint
+            .set_username("")
+            .expect("a validated hierarchical endpoint accepts user removal");
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+
+        ProviderDescriptor {
+            adapter: ProviderAdapter::OpenAiCompatible,
+            endpoint: endpoint.to_string(),
+        }
     }
 
     fn build_request(&self, messages: &[Message], tools: &[ToolDefinition]) -> OpenAiRequest {
@@ -683,6 +700,30 @@ mod tests {
         assert_eq!(
             endpoint.as_str(),
             "https://example.test/openai/v1/chat/completions?api-version=preview"
+        );
+    }
+
+    #[test]
+    fn provider_descriptor_uses_the_effective_endpoint_without_credentials_or_query() {
+        // Arrange
+        let client = OpenAiClient::new(
+            "https://user:password@example.test/openai/v1?api-key=secret".to_string(),
+            "authorization-secret".to_string(),
+            "test-model".to_string(),
+            1024,
+        )
+        .unwrap();
+
+        // Act
+        let descriptor = client.provider_descriptor();
+
+        // Assert
+        assert_eq!(
+            descriptor,
+            ProviderDescriptor {
+                adapter: ProviderAdapter::OpenAiCompatible,
+                endpoint: "https://example.test/openai/v1/chat/completions".to_string(),
+            }
         );
     }
 

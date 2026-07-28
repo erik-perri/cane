@@ -15,6 +15,19 @@ pub struct ProviderConfig {
     pub max_tokens: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAdapter {
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderDescriptor {
+    pub adapter: ProviderAdapter,
+    pub endpoint: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]

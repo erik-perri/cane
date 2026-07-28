@@ -1,12 +1,19 @@
 use crate::Workspace;
 use crate::approval::{ApprovalAuthorization, ApprovalGate};
+use crate::journal::{
+    JournalEntry, JournalError, RunId, RunStarted, SessionId, SessionJournal, SessionStarted,
+};
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
 use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
+use crate::session::SessionConfig;
 use crate::tools::{PreparedInvocation, ToolExecutionError, ToolSet};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const MAX_PROVIDER_ROUNDS_PER_TURN: usize = 24;
@@ -14,6 +21,7 @@ const MAX_PROVIDER_ROUNDS_PER_TURN: usize = 24;
 pub struct AgentSession {
     client: OpenAiClient,
     host_handle: HostHandle,
+    journal: SessionJournal,
     tool_set: ToolSet,
 }
 
@@ -21,6 +29,21 @@ pub struct AgentHandle {
     pub cancel: CancellationToken,
     pub commands: mpsc::Sender<AgentCommand>,
     pub events: mpsc::Receiver<AgentEvent>,
+    journal_path: PathBuf,
+    session_id: SessionId,
+    task: JoinHandle<()>,
+}
+
+#[derive(Debug, Error)]
+pub enum AgentStartError {
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+
+    #[error("workspace path is not valid UTF-8: '{}'", path.display())]
+    WorkspacePath { path: PathBuf },
 }
 
 #[derive(Default)]
@@ -41,69 +64,114 @@ impl TurnBudget {
     }
 }
 
-pub fn spawn_agent(provider: ProviderConfig, workspace: Workspace) -> AgentHandle {
+pub async fn spawn_agent(
+    provider: ProviderConfig,
+    workspace: Workspace,
+    sessions: SessionConfig,
+) -> Result<AgentHandle, AgentStartError> {
+    let workspace_path = workspace
+        .root()
+        .to_str()
+        .ok_or_else(|| AgentStartError::WorkspacePath {
+            path: workspace.root().to_path_buf(),
+        })?
+        .to_string();
+
+    let client = OpenAiClient::new(
+        provider.base_url,
+        provider.api_key,
+        provider.model.clone(),
+        provider.max_tokens,
+    )?;
+    let tool_set = ToolSet::new(Arc::new(workspace));
+    let session_id = SessionId::generate();
+    let run_id = RunId::generate();
+    let mut journal = SessionJournal::create(sessions.sessions_directory(), session_id).await?;
+
+    journal
+        .append(JournalEntry::SessionStarted(SessionStarted {
+            cane_version: sessions.cane_version().to_string(),
+            instructions: sessions.instructions().to_string(),
+            workspace: workspace_path,
+        }))
+        .await?;
+
+    journal
+        .append(JournalEntry::RunStarted(RunStarted {
+            git: None,
+            max_output_tokens: provider.max_tokens,
+            model: provider.model,
+            provider: client.provider_descriptor(),
+            run_id,
+            tool_catalog: tool_set.definitions().to_vec(),
+        }))
+        .await?;
+
+    let journal_path = journal.path().to_path_buf();
     let (events_tx, events_rx) = mpsc::channel(64);
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
-
     let task_cancel = cancel.clone();
-
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let events = EventSink::new(events_tx.clone());
-
         let host_handle = HostHandle {
             cancel: task_cancel,
             commands: commands_rx,
             events: events.clone(),
         };
 
-        let session = match AgentSession::new(host_handle, provider, workspace) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = events.emit(AgentEvent::Error(e.to_string())).await;
-                return;
-            }
+        let session = AgentSession {
+            client,
+            host_handle,
+            journal,
+            tool_set,
         };
 
-        match session.run().await {
-            Ok(()) | Err(AgentExit::Disconnected) => {
-                // Clean shutdown; the frontend is already gone.
-            }
-            Err(AgentExit::Cancelled) => {
-                // Already surfaced as Error + TurnComplete inside the loop.
-            }
-        }
+        let _ = session.run().await;
     });
 
-    AgentHandle {
+    Ok(AgentHandle {
         cancel,
         commands: commands_tx,
         events: events_rx,
+        journal_path,
+        session_id,
+        task,
+    })
+}
+
+impl AgentHandle {
+    pub fn journal_path(&self) -> &Path {
+        &self.journal_path
+    }
+
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        let Self {
+            cancel: _,
+            commands,
+            events,
+            journal_path: _,
+            session_id: _,
+            task,
+        } = self;
+
+        drop(commands);
+        drop(events);
+        task.await
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
     }
 }
 
 impl AgentSession {
-    fn new(
-        host_handle: HostHandle,
-        provider: ProviderConfig,
-        workspace: Workspace,
-    ) -> Result<AgentSession, ProviderError> {
-        let workspace = Arc::new(workspace);
-        let client = OpenAiClient::new(
-            provider.base_url,
-            provider.api_key,
-            provider.model,
-            provider.max_tokens,
-        )?;
-
-        Ok(AgentSession {
-            host_handle,
-            client,
-            tool_set: ToolSet::new(workspace),
-        })
-    }
-
     async fn run(mut self) -> Result<(), AgentExit> {
+        tracing::debug!(
+            journal_path = %self.journal.path().display(),
+            session_id = %self.journal.session_id(),
+            "agent run started"
+        );
         let mut history = Vec::new();
         let mut approval_gate = ApprovalGate::new();
 
@@ -411,13 +479,14 @@ async fn execute_invocation(
 mod tests {
     use super::*;
     use crate::ApprovalDecision;
+    use crate::journal::parse_journal;
     use crate::protocol::ApprovalRequirement;
     use crate::tools::{Tool, ToolDefinition};
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::io::Write;
     use std::time::Duration;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::Notify;
     use tokio::time::timeout;
     use wiremock::matchers::{method, path};
@@ -516,13 +585,12 @@ mod tests {
         Workspace::new(std::env::temp_dir()).unwrap()
     }
 
-    fn test_session(
+    async fn test_session(
         server: &MockServer,
         host_handle: HostHandle,
         tools: Vec<Box<dyn Tool>>,
-    ) -> AgentSession {
+    ) -> (AgentSession, TempDir) {
         let provider = test_provider(server);
-
         let client = OpenAiClient::new(
             provider.base_url,
             provider.api_key,
@@ -530,16 +598,34 @@ mod tests {
             provider.max_tokens,
         )
         .unwrap();
+        let sessions = TempDir::new().unwrap();
+        let journal = SessionJournal::create(sessions.path(), SessionId::generate())
+            .await
+            .unwrap();
 
-        AgentSession {
-            host_handle,
-            client,
-            tool_set: ToolSet::from_tools(tools),
-        }
+        (
+            AgentSession {
+                client,
+                host_handle,
+                journal,
+                tool_set: ToolSet::from_tools(tools),
+            },
+            sessions,
+        )
+    }
+
+    async fn spawn_test_agent(server: &MockServer) -> (AgentHandle, TempDir) {
+        let sessions = TempDir::new().unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path());
+        let handle = spawn_agent(test_provider(server), test_workspace(), config)
+            .await
+            .unwrap();
+
+        (handle, sessions)
     }
 
     async fn run_agent(prompt: &str, server: &MockServer) -> Vec<AgentEvent> {
-        let mut handle = spawn_agent(test_provider(server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(server).await;
         handle
             .commands
             .send(AgentCommand::UserInput(prompt.to_string()))
@@ -581,6 +667,110 @@ mod tests {
         })
         .await
         .expect("agent turn never completed")
+    }
+
+    #[tokio::test]
+    async fn startup_flushes_session_and_run_metadata_before_returning() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions = TempDir::new().unwrap();
+        let workspace_directory = TempDir::new().unwrap();
+        let workspace = Workspace::new(workspace_directory.path().to_path_buf()).unwrap();
+        let expected_workspace = workspace.root().to_str().unwrap().to_string();
+        let config = SessionConfig::new("test-cane-version", "Be precise.", sessions.path());
+
+        // Act
+        let handle = spawn_agent(test_provider(&server), workspace, config)
+            .await
+            .unwrap();
+        let contents = tokio::fs::read(handle.journal_path()).await.unwrap();
+        let records = parse_journal(&contents).unwrap();
+
+        // Assert
+        assert_eq!(records.len(), 2);
+        assert_eq!(handle.session_id(), records[0].session_id);
+        assert_eq!(
+            handle.journal_path(),
+            sessions
+                .path()
+                .join(format!("{}.jsonl", handle.session_id()))
+        );
+
+        let JournalEntry::SessionStarted(started) = &records[0].entry else {
+            panic!("expected session_started");
+        };
+        assert_eq!(started.cane_version, "test-cane-version");
+        assert_eq!(started.instructions, "Be precise.");
+        assert_eq!(started.workspace, expected_workspace);
+
+        let JournalEntry::RunStarted(started) = &records[1].entry else {
+            panic!("expected run_started");
+        };
+        assert_eq!(started.max_output_tokens, 1234);
+        assert_eq!(started.model, "test-model");
+        assert_eq!(
+            started.provider,
+            crate::ProviderDescriptor {
+                adapter: crate::ProviderAdapter::OpenAiCompatible,
+                endpoint: format!("{}/chat/completions", server.uri()),
+            }
+        );
+        assert_eq!(
+            started
+                .tool_catalog
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["edit_file", "glob", "grep", "read_file", "write_file"]
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "startup made a provider request"
+        );
+
+        timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("agent task did not join")
+            .expect("agent task panicked");
+    }
+
+    #[tokio::test]
+    async fn journal_creation_failure_prevents_agent_startup() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions_file = NamedTempFile::new().unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions_file.path());
+
+        // Act
+        let result = spawn_agent(test_provider(&server), test_workspace(), config).await;
+
+        // Assert
+        assert!(matches!(result, Err(AgentStartError::Journal(_))));
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "failed startup made a provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_validation_failure_does_not_create_a_journal() {
+        // Arrange
+        let parent = TempDir::new().unwrap();
+        let sessions_directory = parent.path().join("sessions");
+        let config = SessionConfig::new("test-cane-version", "", &sessions_directory);
+        let provider = ProviderConfig {
+            base_url: "not a URL".to_string(),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: 1234,
+        };
+
+        // Act
+        let result = spawn_agent(provider, test_workspace(), config).await;
+
+        // Assert
+        assert!(matches!(result, Err(AgentStartError::Provider(_))));
+        assert!(!sessions_directory.exists());
     }
 
     fn temp_file_with(contents: &[u8]) -> NamedTempFile {
@@ -662,7 +852,7 @@ mod tests {
     async fn agent_waits_for_input_and_exits_when_command_channel_closes() {
         // Arrange
         let server = MockServer::start().await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         // Act
         drop(handle.commands);
@@ -686,7 +876,7 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let (_commands_tx, commands_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let session = test_session(
+        let (session, _sessions) = test_session(
             &server,
             HostHandle {
                 cancel: cancel.clone(),
@@ -694,7 +884,8 @@ mod tests {
                 events: EventSink::new(events_tx),
             },
             Vec::new(),
-        );
+        )
+        .await;
         let session_task = tokio::spawn(session.run());
 
         // Act
@@ -721,11 +912,12 @@ mod tests {
     async fn dropping_events_stops_agent_even_when_command_sender_remains_alive() {
         // Arrange
         let server = MockServer::start().await;
-        let handle = spawn_agent(test_provider(&server), test_workspace());
+        let (handle, _sessions) = spawn_test_agent(&server).await;
         let AgentHandle {
             cancel: _cancel,
             commands,
             events,
+            ..
         } = handle;
 
         // Act
@@ -750,7 +942,7 @@ mod tests {
             vec![text_turn("Hello!"), text_turn("Yes, I remember.")],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         // Act
         handle
@@ -837,7 +1029,7 @@ mod tests {
         }
         turns.push(text_turn("Finished after continuing."));
         mount_turns(&server, turns).await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         // Act
         handle
@@ -914,7 +1106,7 @@ mod tests {
             ],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         // Act
         handle
@@ -1002,7 +1194,7 @@ mod tests {
         )
         .await;
 
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         // Act
         handle
@@ -1118,7 +1310,7 @@ mod tests {
             ],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
         handle
             .commands
             .send(AgentCommand::UserInput("Change the file.".to_string()))
@@ -1544,7 +1736,7 @@ mod tests {
             ],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         // Act
         handle
@@ -1622,7 +1814,7 @@ mod tests {
             ],
         )
         .await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
         handle
             .commands
             .send(AgentCommand::UserInput("Change the file.".to_string()))
@@ -1731,7 +1923,7 @@ mod tests {
         )
         .await;
 
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         handle
             .commands
@@ -1802,7 +1994,7 @@ mod tests {
         )
         .await;
 
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         handle
             .commands
@@ -1890,7 +2082,7 @@ mod tests {
         )
         .await;
 
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         handle
             .commands
@@ -1935,7 +2127,7 @@ mod tests {
             .expect(1)
             .mount_as_scoped(&server)
             .await;
-        let mut handle = spawn_agent(test_provider(&server), test_workspace());
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
 
         // Act
         handle
@@ -2045,13 +2237,14 @@ mod tests {
 
         let started = Arc::new(Notify::new());
 
-        let session = test_session(
+        let (session, _sessions) = test_session(
             &server,
             host_handle,
             vec![Box::new(BlockingTestTool {
                 started: Arc::clone(&started),
             })],
-        );
+        )
+        .await;
 
         let session_task = tokio::spawn(session.run());
 

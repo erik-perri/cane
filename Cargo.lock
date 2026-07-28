@@ -115,6 +115,7 @@ dependencies = [
  "anyhow",
  "cane-core",
  "tokio",
+ "tokio-util",
  "tracing-subscriber",
 ]
 

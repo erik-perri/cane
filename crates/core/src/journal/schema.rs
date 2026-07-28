@@ -1,4 +1,4 @@
-use crate::{Message, ModelUsage, ReportedCost, StopReason, ToolDefinition};
+use crate::{Message, ModelUsage, ProviderDescriptor, ReportedCost, StopReason, ToolDefinition};
 use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
@@ -156,7 +156,7 @@ pub struct RunStarted {
     pub git: Option<GitContext>,
     pub max_output_tokens: u32,
     pub model: String,
-    pub provider: String,
+    pub provider: ProviderDescriptor,
     pub run_id: RunId,
     pub tool_catalog: Vec<ToolDefinition>,
 }
@@ -189,7 +189,7 @@ pub struct MessageAdded {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderRoundStarted {
     pub model: String,
-    pub provider: String,
+    pub provider: ProviderDescriptor,
     pub provider_round_id: ProviderRoundId,
     pub run_id: RunId,
     pub turn_id: TurnId,
@@ -352,7 +352,7 @@ pub enum RunEndReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentBlock, Role, ToolInput};
+    use crate::{ContentBlock, ProviderAdapter, Role, ToolInput};
     use serde_json::json;
 
     fn session_id() -> SessionId {
@@ -457,6 +457,41 @@ mod tests {
 
         // Assert
         assert_eq!(unserialized, record);
+    }
+
+    #[test]
+    fn run_started_serializes_a_structured_provider_descriptor() {
+        // Arrange
+        let record = JournalRecord::new(
+            2,
+            "2026-07-26T18:42:00.500Z".parse().unwrap(),
+            session_id(),
+            JournalEntry::RunStarted(RunStarted {
+                git: None,
+                max_output_tokens: 32_000,
+                model: "test-model".to_string(),
+                provider: ProviderDescriptor {
+                    adapter: ProviderAdapter::OpenAiCompatible,
+                    endpoint: "https://example.test/v1/chat/completions".to_string(),
+                },
+                run_id: run_id(),
+                tool_catalog: Vec::new(),
+            }),
+        );
+
+        // Act
+        let serialized = serde_json::to_value(&record).unwrap();
+        let unserialized: JournalRecord = serde_json::from_value(serialized.clone()).unwrap();
+
+        // Assert
+        assert_eq!(unserialized, record);
+        assert_eq!(
+            serialized["data"]["provider"],
+            json!({
+                "adapter": "openai_compatible",
+                "endpoint": "https://example.test/v1/chat/completions"
+            })
+        );
     }
 
     #[test]

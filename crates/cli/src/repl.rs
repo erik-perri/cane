@@ -7,6 +7,13 @@ struct InputLines {
     receiver: mpsc::Receiver<std::io::Result<Option<String>>>,
 }
 
+#[cfg(test)]
+struct TestAgent {
+    cancel: tokio_util::sync::CancellationToken,
+    commands: mpsc::Sender<AgentCommand>,
+    events: mpsc::Receiver<AgentEvent>,
+}
+
 impl InputLines {
     #[cfg(test)]
     fn from_reader(reader: impl BufRead + Send + 'static) -> Self {
@@ -51,20 +58,42 @@ fn read_lines(mut reader: impl BufRead, sender: mpsc::Sender<std::io::Result<Opt
 
 #[cfg(test)]
 async fn run(
-    agent: AgentHandle,
+    agent: TestAgent,
     input: impl BufRead + Send + 'static,
     output: impl Write,
 ) -> anyhow::Result<()> {
-    run_with_input(agent, InputLines::from_reader(input), output).await
+    let TestAgent {
+        cancel,
+        commands,
+        mut events,
+    } = agent;
+
+    run_with_input(
+        &cancel,
+        &commands,
+        &mut events,
+        InputLines::from_reader(input),
+        output,
+    )
+    .await
 }
 
-pub(crate) async fn run_stdio(agent: AgentHandle) -> anyhow::Result<()> {
+pub(crate) async fn run_stdio(agent: &mut AgentHandle) -> anyhow::Result<()> {
     let stdout = std::io::stdout();
-    run_with_input(agent, InputLines::stdin(), stdout.lock()).await
+    run_with_input(
+        &agent.cancel,
+        &agent.commands,
+        &mut agent.events,
+        InputLines::stdin(),
+        stdout.lock(),
+    )
+    .await
 }
 
 async fn run_with_input(
-    mut agent: AgentHandle,
+    cancel: &tokio_util::sync::CancellationToken,
+    commands: &mpsc::Sender<AgentCommand>,
+    events: &mut mpsc::Receiver<AgentEvent>,
     mut input: InputLines,
     mut output: impl Write,
 ) -> anyhow::Result<()> {
@@ -72,7 +101,7 @@ async fn run_with_input(
         write_prompt(&mut output)?;
         let line = tokio::select! {
             line = input.recv() => line?,
-            event = agent.events.recv() => {
+            event = events.recv() => {
                 match event {
                     None => break,
                     Some(AgentEvent::Error(error)) => {
@@ -95,19 +124,13 @@ async fn run_with_input(
             break;
         }
 
-        if agent
-            .commands
-            .send(AgentCommand::UserInput(line))
-            .await
-            .is_err()
-        {
+        if commands.send(AgentCommand::UserInput(line)).await.is_err() {
             // Exit cleanly if the agent task disappears.
             break;
         }
 
         loop {
-            let event = agent
-                .events
+            let event = events
                 .recv()
                 .await
                 .context("agent stopped before completing the turn")?;
@@ -174,7 +197,7 @@ async fn run_with_input(
                     output.flush()?;
 
                     let decision = tokio::select! {
-                        _ = agent.cancel.cancelled() => None,
+                        _ = cancel.cancelled() => None,
                         decision = read_decision(&mut input, &mut output) => Some(decision?),
                     };
 
@@ -280,7 +303,7 @@ mod tests {
         // Arrange
         let (commands, mut command_rx) = mpsc::channel(1);
         let (event_tx, events) = mpsc::channel(8);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
@@ -351,7 +374,7 @@ mod tests {
         // Arrange
         let (commands, mut command_rx) = mpsc::channel(1);
         let (event_tx, events) = mpsc::channel(8);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
@@ -398,7 +421,7 @@ mod tests {
         // Arrange
         let (commands, mut command_rx) = mpsc::channel(1);
         let (event_tx, events) = mpsc::channel(8);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
@@ -433,7 +456,7 @@ mod tests {
         // Arrange
         let (commands, mut command_rx) = mpsc::channel(2);
         let (event_tx, events) = mpsc::channel(2);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
@@ -481,7 +504,7 @@ mod tests {
         // Arrange
         let (commands, mut command_rx) = mpsc::channel(1);
         let (event_tx, events) = mpsc::channel(8);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
@@ -514,7 +537,7 @@ mod tests {
         // Arrange
         let (commands, _command_rx) = mpsc::channel(1);
         let (_event_tx, events) = mpsc::channel(1);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
@@ -535,7 +558,7 @@ mod tests {
         let (commands, command_rx) = mpsc::channel(1);
         drop(command_rx);
         let (_event_tx, events) = mpsc::channel(8);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
@@ -557,7 +580,7 @@ mod tests {
         let (commands, _command_rx) = mpsc::channel(1);
         let (event_tx, events) = mpsc::channel(1);
         drop(event_tx);
-        let agent = AgentHandle {
+        let agent = TestAgent {
             cancel: Default::default(),
             commands,
             events,
