@@ -10,7 +10,7 @@ mod workspace;
 
 pub use agent::{AgentHandle, AgentStartError, spawn_agent};
 pub use message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
-pub use protocol::{AgentCommand, AgentEvent, ApprovalDecision, TurnOutcome};
+pub use protocol::{AgentCommand, AgentEvent, ApprovalDecision, ShutdownReason, TurnOutcome};
 pub use provider::{
     ModelTurn, ModelUsage, ProviderAdapter, ProviderConfig, ProviderDescriptor, ReportedCost,
 };

@@ -1,9 +1,10 @@
 use super::{
     ApprovalDecided, ApprovalId, ApprovalRequested, ErrorDetail, JournalApprovalDecision,
     JournalEntry, JournalError, MessageAdded, ProviderRoundCancelled, ProviderRoundCompleted,
-    ProviderRoundFailed, ProviderRoundId, ProviderRoundStarted, RunId, SessionId, SessionJournal,
-    ToolAuthorization, ToolCancelled, ToolCompleted, ToolFailed, ToolRejected, ToolStarted,
-    TurnAbortOutcome, TurnAborted, TurnCommitOutcome, TurnCommitted, TurnId, TurnStarted,
+    ProviderRoundFailed, ProviderRoundId, ProviderRoundStarted, RunEndReason, RunEnded, RunId,
+    SessionId, SessionJournal, ToolAuthorization, ToolCancelled, ToolCompleted, ToolFailed,
+    ToolRejected, ToolStarted, TurnAbortOutcome, TurnAborted, TurnCommitOutcome, TurnCommitted,
+    TurnId, TurnStarted,
 };
 use crate::{Message, ModelTurn, ProviderDescriptor};
 use std::path::Path;
@@ -82,6 +83,16 @@ impl RunJournal {
             .append(JournalEntry::TurnCommitted(TurnCommitted {
                 outcome,
                 turn_id,
+            }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn end_run(&mut self, reason: RunEndReason) -> Result<(), JournalError> {
+        self.journal
+            .append(JournalEntry::RunEnded(RunEnded {
+                reason,
+                run_id: self.run_id,
             }))
             .await?;
         Ok(())

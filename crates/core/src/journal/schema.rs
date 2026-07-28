@@ -342,11 +342,10 @@ pub struct RunEnded {
 #[serde(rename_all = "snake_case")]
 pub enum RunEndReason {
     ActiveTurnCancelled,
-    IdleCancelled,
-    UserQuit,
-    InputClosed,
     FrontendDisconnected,
-    JournalFailed,
+    IdleCancelled,
+    InputClosed,
+    UserQuit,
 }
 
 #[cfg(test)]

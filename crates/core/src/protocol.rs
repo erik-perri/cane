@@ -107,7 +107,14 @@ impl From<crate::journal::JournalError> for AgentExit {
 
 #[derive(Debug, PartialEq)]
 pub enum AgentCommand {
+    Shutdown(ShutdownReason),
     UserInput(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownReason {
+    InputClosed,
+    UserQuit,
 }
 
 #[derive(Debug, PartialEq)]

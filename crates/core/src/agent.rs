@@ -3,12 +3,14 @@ use crate::approval::{
     ApprovalAuthorization, ApprovalCheck, ApprovalGate, ApprovalOutcome, request_approval,
 };
 use crate::journal::{
-    ApprovalId, ErrorDetail, JournalApprovalDecision, JournalEntry, JournalError, RunId,
-    RunJournal, RunStarted, SessionId, SessionJournal, SessionStarted, ToolAuthorization,
+    ApprovalId, ErrorDetail, JournalApprovalDecision, JournalEntry, JournalError, RunEndReason,
+    RunId, RunJournal, RunStarted, SessionId, SessionJournal, SessionStarted, ToolAuthorization,
     TurnAbortOutcome, TurnCommitOutcome, TurnId,
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
-use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
+use crate::protocol::{
+    AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, ShutdownReason, TurnOutcome,
+};
 use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
 use crate::tools::{PreparedInvocation, ToolExecutionError, ToolSet};
@@ -231,27 +233,56 @@ impl AgentSession {
             session_id = %self.journal.session_id(),
             "agent run started"
         );
+
+        match self.run_until_end().await {
+            Ok(reason) => {
+                self.journal.end_run(reason).await?;
+                Ok(())
+            }
+            Err(exit @ AgentExit::Cancelled) => {
+                self.journal
+                    .end_run(RunEndReason::ActiveTurnCancelled)
+                    .await?;
+                Err(exit)
+            }
+            Err(exit @ AgentExit::Disconnected) => {
+                self.journal
+                    .end_run(RunEndReason::FrontendDisconnected)
+                    .await?;
+                Err(exit)
+            }
+            Err(exit @ AgentExit::JournalFailed(_)) => Err(exit),
+        }
+    }
+
+    async fn run_until_end(&mut self) -> Result<RunEndReason, AgentExit> {
         let mut history = Vec::new();
         let mut approval_gate = ApprovalGate::new();
 
         loop {
-            let command = tokio::select! {
-                _ = self.host_handle.cancel.cancelled() => return Ok(()),
-                _ = self.host_handle.events.closed() => return Ok(()),
+            let prompt = tokio::select! {
+                biased;
+                _ = self.host_handle.cancel.cancelled() => {
+                    return Ok(RunEndReason::IdleCancelled);
+                }
                 command = self.host_handle.commands.recv() => {
                     match command {
-                        Some(command) => command,
-                        None => return Ok(()),
+                        Some(AgentCommand::Shutdown(reason)) => {
+                            return Ok(shutdown_reason(reason));
+                        }
+                        Some(AgentCommand::UserInput(prompt)) => prompt,
+                        None => return Err(AgentExit::Disconnected),
                     }
+                }
+                _ = self.host_handle.events.closed() => {
+                    return Err(AgentExit::Disconnected);
                 }
             };
 
             let turn_start = history.len();
-            let user_message = match command {
-                AgentCommand::UserInput(prompt) => Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: prompt }],
-                },
+            let user_message = Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: prompt }],
             };
             let turn_id = self.journal.start_turn(&user_message).await?;
             history.push(user_message);
@@ -274,14 +305,19 @@ impl AgentSession {
                         history.truncate(turn_start);
                     }
 
+                    if session_over {
+                        let _ = self
+                            .host_handle
+                            .events
+                            .emit(AgentEvent::TurnComplete { outcome })
+                            .await;
+                        return Err(AgentExit::Cancelled);
+                    }
+
                     self.host_handle
                         .events
                         .emit(AgentEvent::TurnComplete { outcome })
                         .await?;
-
-                    if session_over {
-                        return Err(AgentExit::Cancelled);
-                    }
                 }
                 Err(AgentExit::Cancelled) => {
                     self.journal
@@ -300,8 +336,16 @@ impl AgentSession {
 
                     return Err(AgentExit::Cancelled);
                 }
+                Err(AgentExit::Disconnected) => {
+                    let result = TurnResult::failed(
+                        "frontend_disconnected",
+                        "frontend disconnected during the active turn",
+                    );
+                    self.record_turn_outcome(turn_id, &result).await?;
+                    history.truncate(turn_start);
+                    return Err(AgentExit::Disconnected);
+                }
                 Err(exit @ AgentExit::JournalFailed(_)) => return Err(exit),
-                Err(exit) => return Err(exit),
             }
         }
     }
@@ -661,6 +705,13 @@ fn journal_approval_decision(decision: &crate::ApprovalDecision) -> JournalAppro
     }
 }
 
+fn shutdown_reason(reason: ShutdownReason) -> RunEndReason {
+    match reason {
+        ShutdownReason::InputClosed => RunEndReason::InputClosed,
+        ShutdownReason::UserQuit => RunEndReason::UserQuit,
+    }
+}
+
 fn provider_error_detail(error: &ProviderError) -> ErrorDetail {
     let category = match error {
         ProviderError::Api { .. } => "api",
@@ -963,23 +1014,41 @@ mod tests {
             provider.max_tokens,
         )
         .unwrap();
+        let provider_descriptor = client.provider_descriptor();
+        let tool_set = ToolSet::from_tools(tools);
         let sessions = TempDir::new().unwrap();
-        let journal = SessionJournal::create(sessions.path(), SessionId::generate())
+        let session_id = SessionId::generate();
+        let run_id = RunId::generate();
+        let mut journal = SessionJournal::create(sessions.path(), session_id)
             .await
             .unwrap();
-        let journal = RunJournal::new(
-            journal,
-            model,
-            client.provider_descriptor(),
-            RunId::generate(),
-        );
+        journal
+            .append(JournalEntry::SessionStarted(SessionStarted {
+                cane_version: "test-cane-version".to_string(),
+                instructions: String::new(),
+                workspace: std::env::temp_dir().to_string_lossy().into_owned(),
+            }))
+            .await
+            .unwrap();
+        journal
+            .append(JournalEntry::RunStarted(RunStarted {
+                git: None,
+                max_output_tokens: provider.max_tokens,
+                model: model.clone(),
+                provider: provider_descriptor.clone(),
+                run_id,
+                tool_catalog: tool_set.definitions().to_vec(),
+            }))
+            .await
+            .unwrap();
+        let journal = RunJournal::new(journal, model, provider_descriptor, run_id);
 
         (
             AgentSession {
                 client,
                 host_handle,
                 journal,
-                tool_set: ToolSet::from_tools(tools),
+                tool_set,
             },
             sessions,
         )
@@ -1042,14 +1111,23 @@ mod tests {
 
     async fn finish_and_project(handle: AgentHandle) -> (Vec<JournalRecord>, SessionProjection) {
         let journal_path = handle.journal_path().to_path_buf();
+        handle
+            .commands
+            .send(AgentCommand::Shutdown(ShutdownReason::InputClosed))
+            .await
+            .unwrap();
         timeout(Duration::from_secs(1), handle.join())
             .await
             .expect("agent task did not join")
             .expect("agent task panicked");
-        let contents = tokio::fs::read(journal_path).await.unwrap();
-        let records = parse_journal(&contents).unwrap();
+        let records = read_journal_records(&journal_path).await;
         let projection = project_journal(&records).unwrap();
         (records, projection)
+    }
+
+    async fn read_journal_records(path: &Path) -> Vec<JournalRecord> {
+        let contents = tokio::fs::read(path).await.unwrap();
+        parse_journal(&contents).unwrap()
     }
 
     #[tokio::test]
@@ -1253,9 +1331,17 @@ mod tests {
                 .count(),
             1
         );
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(&record.entry, JournalEntry::TurnCommitted(_)))
+        );
         assert!(matches!(
             records.last().map(|record| &record.entry),
-            Some(JournalEntry::TurnCommitted(_))
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::InputClosed,
+                ..
+            }))
         ));
     }
 
@@ -1295,7 +1381,7 @@ mod tests {
                     && failed.error.message.contains("provider unavailable")
         )));
         assert!(matches!(
-            records.last().map(|record| &record.entry),
+            records.iter().rev().nth(1).map(|record| &record.entry),
             Some(JournalEntry::TurnAborted(crate::journal::TurnAborted {
                 outcome: TurnAbortOutcome::Failed { error: None },
                 ..
@@ -1350,7 +1436,7 @@ mod tests {
                 .any(|record| matches!(&record.entry, JournalEntry::ProviderRoundCompleted(_)))
         );
         assert!(matches!(
-            records.last().map(|record| &record.entry),
+            records.iter().rev().nth(1).map(|record| &record.entry),
             Some(JournalEntry::TurnAborted(crate::journal::TurnAborted {
                 outcome: TurnAbortOutcome::Failed {
                     error: Some(ErrorDetail { category, message }),
@@ -1393,10 +1479,12 @@ mod tests {
         // Arrange
         let server = MockServer::start().await;
         let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        let journal_path = handle.journal_path().to_path_buf();
 
         // Act
         drop(handle.commands);
         let events = collect_until_events_close(&mut handle.events).await;
+        let records = read_journal_records(&journal_path).await;
 
         // Assert
         assert!(
@@ -1407,6 +1495,42 @@ mod tests {
             server.received_requests().await.unwrap().is_empty(),
             "idle session made a provider request"
         );
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::FrontendDisconnected,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_user_quit_ends_the_run_cleanly() {
+        // Arrange
+        let server = MockServer::start().await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        let journal_path = handle.journal_path().to_path_buf();
+
+        // Act
+        handle
+            .commands
+            .send(AgentCommand::Shutdown(ShutdownReason::UserQuit))
+            .await
+            .unwrap();
+        let events = collect_until_events_close(&mut handle.events).await;
+        let records = read_journal_records(&journal_path).await;
+        let projection = project_journal(&records).unwrap();
+
+        // Assert
+        assert!(events.is_empty());
+        assert!(projection.warnings.is_empty());
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::UserQuit,
+                ..
+            }))
+        ));
     }
 
     #[tokio::test]
@@ -1426,6 +1550,7 @@ mod tests {
             Vec::new(),
         )
         .await;
+        let journal_path = session.journal.path().to_path_buf();
         let session_task = tokio::spawn(session.run());
 
         // Act
@@ -1435,6 +1560,7 @@ mod tests {
             .expect("idle session did not stop promptly")
             .expect("session task panicked");
         let events = collect_until_events_close(&mut events_rx).await;
+        let records = read_journal_records(&journal_path).await;
 
         // Assert
         assert_eq!(session_result, Ok(()));
@@ -1446,6 +1572,13 @@ mod tests {
             server.received_requests().await.unwrap().is_empty(),
             "idle session made a provider request"
         );
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::IdleCancelled,
+                ..
+            }))
+        ));
     }
 
     #[tokio::test]
@@ -1453,6 +1586,7 @@ mod tests {
         // Arrange
         let server = MockServer::start().await;
         let (handle, _sessions) = spawn_test_agent(&server).await;
+        let journal_path = handle.journal_path().to_path_buf();
         let AgentHandle {
             cancel: _cancel,
             commands,
@@ -1467,10 +1601,71 @@ mod tests {
         timeout(Duration::from_secs(5), commands.closed())
             .await
             .expect("agent remained alive after its event receiver was dropped");
+        let records = read_journal_records(&journal_path).await;
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "idle session made a provider request"
         );
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::FrontendDisconnected,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn frontend_disconnection_aborts_an_active_turn_before_ending_the_run() {
+        // Arrange
+        let server = MockServer::start().await;
+        let request = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(text_turn("too late").set_delay(Duration::from_secs(30)))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let (handle, _sessions) = spawn_test_agent(&server).await;
+        let journal_path = handle.journal_path().to_path_buf();
+        let AgentHandle {
+            commands, events, ..
+        } = handle;
+        commands
+            .send(AgentCommand::UserInput("Say hi".to_string()))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), request.wait_until_satisfied())
+            .await
+            .expect("agent did not start its provider request promptly");
+
+        // Act
+        drop(events);
+        timeout(Duration::from_secs(5), commands.closed())
+            .await
+            .expect("agent remained alive after its frontend disconnected");
+        let records = read_journal_records(&journal_path).await;
+        let projection = project_journal(&records).unwrap();
+
+        // Assert
+        assert!(projection.messages.is_empty());
+        assert!(projection.warnings.is_empty());
+        assert!(matches!(
+            records.iter().rev().nth(1).map(|record| &record.entry),
+            Some(JournalEntry::TurnAborted(crate::journal::TurnAborted {
+                outcome: TurnAbortOutcome::Failed {
+                    error: Some(ErrorDetail { category, message }),
+                },
+                ..
+            })) if category == "frontend_disconnected"
+                && message == "frontend disconnected during the active turn"
+        ));
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::FrontendDisconnected,
+                ..
+            }))
+        ));
     }
 
     #[tokio::test]
@@ -2710,6 +2905,7 @@ mod tests {
             .mount_as_scoped(&server)
             .await;
         let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        let journal_path = handle.journal_path().to_path_buf();
 
         // Act
         handle
@@ -2722,6 +2918,7 @@ mod tests {
             .expect("agent did not start its provider request promptly");
         handle.cancel.cancel();
         let events = collect_until_events_close(&mut handle.events).await;
+        let records = read_journal_records(&journal_path).await;
 
         // Assert
         assert!(
@@ -2736,6 +2933,13 @@ mod tests {
             ),
             "expected an Error followed by a cancelled TurnComplete, got {events:?}"
         );
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::ActiveTurnCancelled,
+                ..
+            }))
+        ));
     }
 
     enum TestExecution {

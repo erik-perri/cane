@@ -1,5 +1,7 @@
 use anyhow::Context;
-use cane_core::{AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, TurnOutcome};
+use cane_core::{
+    AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, ShutdownReason, TurnOutcome,
+};
 use std::io::{BufRead, Write};
 use tokio::sync::mpsc;
 
@@ -117,10 +119,16 @@ async fn run_with_input(
             }
         };
         let Some(line) = line else {
+            let _ = commands
+                .send(AgentCommand::Shutdown(ShutdownReason::InputClosed))
+                .await;
             break;
         };
 
         if line == "/quit" {
+            let _ = commands
+                .send(AgentCommand::Shutdown(ShutdownReason::UserQuit))
+                .await;
             break;
         }
 
@@ -535,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn run_treats_idle_eof_as_a_clean_exit() {
         // Arrange
-        let (commands, _command_rx) = mpsc::channel(1);
+        let (commands, mut command_rx) = mpsc::channel(1);
         let (_event_tx, events) = mpsc::channel(1);
         let agent = TestAgent {
             cancel: Default::default(),
@@ -550,6 +558,34 @@ mod tests {
         // Assert
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(String::from_utf8(output).unwrap(), "> ");
+        assert_eq!(
+            command_rx.recv().await,
+            Some(AgentCommand::Shutdown(ShutdownReason::InputClosed))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_reports_an_explicit_user_quit() {
+        // Arrange
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, events) = mpsc::channel(1);
+        let agent = TestAgent {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let mut output = Vec::new();
+
+        // Act
+        let result = run(agent, Cursor::new("/quit\n"), &mut output).await;
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(String::from_utf8(output).unwrap(), "> ");
+        assert_eq!(
+            command_rx.recv().await,
+            Some(AgentCommand::Shutdown(ShutdownReason::UserQuit))
+        );
     }
 
     #[tokio::test]
