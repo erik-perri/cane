@@ -103,8 +103,8 @@ pub enum AgentCommand {
 
 #[derive(Debug, PartialEq)]
 pub enum ApprovalDecision {
-    Allow,
-    AlwaysAllowSession,
+    AllowForRun,
+    AllowOnce,
     Deny { reason: String },
 }
 

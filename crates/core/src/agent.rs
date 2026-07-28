@@ -1,7 +1,8 @@
 use crate::Workspace;
-use crate::approval::{ApprovalAuthorization, ApprovalGate};
+use crate::approval::{ApprovalCheck, ApprovalGate, ApprovalOutcome, request_approval};
 use crate::journal::{
-    JournalEntry, JournalError, RunId, RunStarted, SessionId, SessionJournal, SessionStarted,
+    ApprovalId, JournalEntry, JournalError, RunId, RunStarted, SessionId, SessionJournal,
+    SessionStarted,
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{AgentCommand, AgentEvent, AgentExit, EventSink, HostHandle, TurnOutcome};
@@ -363,39 +364,50 @@ impl AgentSession {
             }
         };
 
-        match gate
-            .authorize(
-                invocation.approval_requirement(),
-                name,
-                id,
-                input,
-                &self.host_handle.events,
-                &self.host_handle.cancel,
-            )
-            .await?
-        {
-            ApprovalAuthorization::Denied { reason } => {
-                self.host_handle
-                    .events
-                    .emit(AgentEvent::ToolDenied {
-                        name: name.to_string(),
-                        reason: reason.to_string(),
-                    })
-                    .await?;
+        let authorization = match gate.check(invocation.approval_requirement(), name) {
+            ApprovalCheck::Authorized(authorization) => authorization,
+            ApprovalCheck::RequiresDecision => {
+                let approval_id = ApprovalId::generate();
+                let decision = request_approval(
+                    name,
+                    id,
+                    input,
+                    &self.host_handle.events,
+                    &self.host_handle.cancel,
+                )
+                .await?;
 
-                Ok(ToolResultData {
-                    content: format!(
-                        "The user declined this tool call and said: \"{reason}\". Do not assume the tool ran. Address their feedback, then retry if appropriate."
-                    ),
-                    is_error: false,
-                    tool_use_id: id.to_string(),
-                })
-            }
+                match gate.apply_decision(name, approval_id, decision) {
+                    ApprovalOutcome::Authorized(authorization) => authorization,
+                    ApprovalOutcome::Denied { reason } => {
+                        self.host_handle
+                            .events
+                            .emit(AgentEvent::ToolDenied {
+                                name: name.to_string(),
+                                reason: reason.to_string(),
+                            })
+                            .await?;
 
-            ApprovalAuthorization::Approved => {
-                execute_invocation(&self.host_handle, id, name, input, invocation).await
+                        return Ok(ToolResultData {
+                            content: format!(
+                                "The user declined this tool call and said: \"{reason}\". Do not assume the tool ran. Address their feedback, then retry if appropriate."
+                            ),
+                            is_error: false,
+                            tool_use_id: id.to_string(),
+                        });
+                    }
+                }
             }
-        }
+        };
+
+        tracing::debug!(
+            ?authorization,
+            tool_call_id = id,
+            tool_name = name,
+            "tool call authorized"
+        );
+
+        execute_invocation(&self.host_handle, id, name, input, invocation).await
     }
 }
 
@@ -1221,7 +1233,7 @@ mod tests {
             .await
             .unwrap();
 
-        respond_to.send(ApprovalDecision::Allow).unwrap();
+        respond_to.send(ApprovalDecision::AllowOnce).unwrap();
 
         let first_turn = collect_turn(&mut handle.events).await;
         let second_turn = collect_turn(&mut handle.events).await;
@@ -1832,7 +1844,7 @@ mod tests {
                 _ => {}
             }
         };
-        respond_to.send(ApprovalDecision::Allow).unwrap();
+        respond_to.send(ApprovalDecision::AllowOnce).unwrap();
 
         let events = collect_turn(&mut handle.events).await;
 
@@ -2032,7 +2044,7 @@ mod tests {
         };
         assert_eq!("write-2", write_two_id);
 
-        respond_to.send(ApprovalDecision::Allow).unwrap();
+        respond_to.send(ApprovalDecision::AllowOnce).unwrap();
 
         let events = collect_turn(&mut handle.events).await;
 

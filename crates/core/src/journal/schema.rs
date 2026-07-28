@@ -246,8 +246,8 @@ pub struct ApprovalDecided {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JournalApprovalDecision {
+    AllowForRun,
     AllowOnce,
-    AllowRun,
     Deny { reason: String },
 }
 
@@ -262,9 +262,9 @@ pub struct ToolStarted {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolAuthorization {
+    ApprovedForRun { approval_id: ApprovalId },
+    ApprovedOnce { approval_id: ApprovalId },
     NotRequired,
-    AllowOnce { approval_id: ApprovalId },
-    RunGrant { approval_id: ApprovalId },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

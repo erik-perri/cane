@@ -238,9 +238,9 @@ async fn read_decision(
 
             return Ok(ApprovalDecision::Deny { reason });
         } else if allow_input == "a" {
-            return Ok(ApprovalDecision::AlwaysAllowSession);
+            return Ok(ApprovalDecision::AllowForRun);
         } else if allow_input == "y" {
-            return Ok(ApprovalDecision::Allow);
+            return Ok(ApprovalDecision::AllowOnce);
         }
     }
 }
@@ -391,7 +391,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(decision_rx.await.unwrap(), ApprovalDecision::Allow);
+            assert_eq!(decision_rx.await.unwrap(), ApprovalDecision::AllowOnce);
             event_tx
                 .send(AgentEvent::TurnComplete {
                     outcome: TurnOutcome::Completed {
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_decision_accepts_always_allow_case_insensitively_with_whitespace() {
+    async fn read_decision_accepts_allow_for_run_case_insensitively_with_whitespace() {
         // Arrange
         let mut input = InputLines::from_reader(Cursor::new("  A  \n"));
         let mut output = Vec::new();
@@ -648,7 +648,7 @@ mod tests {
         let decision = read_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
-        assert_eq!(decision, ApprovalDecision::AlwaysAllowSession);
+        assert_eq!(decision, ApprovalDecision::AllowForRun);
     }
 
     #[tokio::test]
@@ -661,7 +661,7 @@ mod tests {
         let decision = read_decision(&mut input, &mut output).await.unwrap();
 
         // Assert
-        assert_eq!(decision, ApprovalDecision::Allow);
+        assert_eq!(decision, ApprovalDecision::AllowOnce);
         let output = String::from_utf8(output).unwrap();
         assert_eq!(
             output.matches("> ").count(),

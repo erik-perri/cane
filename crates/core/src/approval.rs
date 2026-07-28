@@ -1,59 +1,94 @@
+use crate::journal::ApprovalId;
 use crate::protocol::{AgentExit, ApprovalRequirement, EventSink};
 use crate::{AgentEvent, ApprovalDecision};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use tokio::sync::oneshot;
 
 pub struct ApprovalGate {
-    always_allowed: HashSet<String>,
+    run_approvals: HashMap<String, ApprovalId>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalAuthorization {
-    Approved,
+    ApprovedForRun { approval_id: ApprovalId },
+    ApprovedOnce { approval_id: ApprovalId },
+    NotRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalCheck {
+    Authorized(ApprovalAuthorization),
+    RequiresDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovalOutcome {
+    Authorized(ApprovalAuthorization),
     Denied { reason: String },
 }
 
 impl ApprovalGate {
     pub fn new() -> Self {
         Self {
-            always_allowed: HashSet::new(),
+            run_approvals: HashMap::new(),
         }
     }
 
-    pub async fn authorize(
+    pub fn check(&self, requirement: ApprovalRequirement, tool_name: &str) -> ApprovalCheck {
+        if requirement == ApprovalRequirement::None {
+            return ApprovalCheck::Authorized(ApprovalAuthorization::NotRequired);
+        }
+
+        match self.run_approvals.get(tool_name) {
+            Some(approval_id) => ApprovalCheck::Authorized(ApprovalAuthorization::ApprovedForRun {
+                approval_id: *approval_id,
+            }),
+            None => ApprovalCheck::RequiresDecision,
+        }
+    }
+
+    pub fn record_run_approval(&mut self, tool_name: String, approval_id: ApprovalId) {
+        self.run_approvals.insert(tool_name, approval_id);
+    }
+
+    pub fn apply_decision(
         &mut self,
-        requirement: ApprovalRequirement,
         tool_name: &str,
-        call_id: &str,
-        input: &serde_json::Value,
-        events: &EventSink,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<ApprovalAuthorization, AgentExit> {
-        if requirement == ApprovalRequirement::None || self.always_allowed.contains(tool_name) {
-            return Ok(ApprovalAuthorization::Approved);
-        }
-
-        let (decision_tx, decision_rx) = oneshot::channel();
-
-        events
-            .emit(AgentEvent::ApprovalRequest {
-                id: call_id.to_string(),
-                input: input.clone(),
-                name: tool_name.to_string(),
-                respond_to: decision_tx,
-            })
-            .await?;
-
-        match wait_for_response(decision_rx, events, cancel).await? {
-            ApprovalDecision::Allow => Ok(ApprovalAuthorization::Approved),
-            ApprovalDecision::AlwaysAllowSession => {
-                self.always_allowed.insert(tool_name.to_string());
-
-                Ok(ApprovalAuthorization::Approved)
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    ) -> ApprovalOutcome {
+        match decision {
+            ApprovalDecision::AllowOnce => {
+                ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedOnce { approval_id })
             }
-            ApprovalDecision::Deny { reason } => Ok(ApprovalAuthorization::Denied { reason }),
+            ApprovalDecision::AllowForRun => {
+                self.record_run_approval(tool_name.to_string(), approval_id);
+                ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedForRun { approval_id })
+            }
+            ApprovalDecision::Deny { reason } => ApprovalOutcome::Denied { reason },
         }
     }
+}
+
+pub async fn request_approval(
+    tool_name: &str,
+    call_id: &str,
+    input: &serde_json::Value,
+    events: &EventSink,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<ApprovalDecision, AgentExit> {
+    let (decision_tx, decision_rx) = oneshot::channel();
+
+    events
+        .emit(AgentEvent::ApprovalRequest {
+            id: call_id.to_string(),
+            input: input.clone(),
+            name: tool_name.to_string(),
+            respond_to: decision_tx,
+        })
+        .await?;
+
+    wait_for_response(decision_rx, events, cancel).await
 }
 
 async fn wait_for_response(
@@ -74,315 +109,162 @@ mod tests {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
-    #[tokio::test]
-    async fn approval_not_required_returns_approved_without_emitting_a_request() {
-        // Arrange
-        let mut gate = ApprovalGate::new();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
-        let sink = EventSink::new(events_tx);
-        let cancel = CancellationToken::new();
-
-        // Act
-        let result = gate
-            .authorize(
-                ApprovalRequirement::None,
-                "read_file",
-                "read-1",
-                &json!({ "file": "test.txt" }),
-                &sink,
-                &cancel,
-            )
-            .await;
-
-        // Assert
-        assert!(matches!(result, Ok(ApprovalAuthorization::Approved)));
-        assert!(matches!(
-            events_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
+    fn approval_id() -> ApprovalId {
+        "appr_01ARZ3NDEKTSV4RRFFQ69G5FAY".parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn required_approval_emits_the_call_details_and_returns_approved_on_allow() {
+    #[test]
+    fn check_returns_not_required_for_tools_that_do_not_require_approval() {
         // Arrange
-        let mut gate = ApprovalGate::new();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
-        let sink = EventSink::new(events_tx);
-        let cancel = CancellationToken::new();
-        let payload = json!({ "file": "test.txt", "contents": "test" });
+        let gate = ApprovalGate::new();
 
         // Act
-        let (authorize_result, ()) = tokio::join!(
-            gate.authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-1",
-                &payload,
-                &sink,
-                &cancel,
-            ),
-            async {
-                let event = events_rx.recv().await.unwrap();
+        let result = gate.check(ApprovalRequirement::None, "read_file");
 
-                let AgentEvent::ApprovalRequest {
-                    input,
-                    id,
-                    name,
-                    respond_to,
-                } = event
-                else {
-                    panic!("Expected ApprovalRequest event");
-                };
+        // Assert
+        assert_eq!(
+            result,
+            ApprovalCheck::Authorized(ApprovalAuthorization::NotRequired)
+        );
+    }
 
-                assert_eq!(input, payload);
-                assert_eq!(id, "write-1");
-                assert_eq!(name, "write_file");
+    #[test]
+    fn check_requires_a_decision_when_the_tool_has_no_run_approval() {
+        // Arrange
+        let gate = ApprovalGate::new();
 
-                respond_to.send(ApprovalDecision::Allow).unwrap();
-            }
+        // Act
+        let result = gate.check(ApprovalRequirement::Required, "write_file");
+
+        // Assert
+        assert_eq!(result, ApprovalCheck::RequiresDecision);
+    }
+
+    #[test]
+    fn run_approvals_authorize_only_the_matching_tool() {
+        // Arrange
+        let mut gate = ApprovalGate::new();
+        gate.record_run_approval("write_file".to_string(), approval_id());
+
+        // Act
+        let matching = gate.check(ApprovalRequirement::Required, "write_file");
+        let other = gate.check(ApprovalRequirement::Required, "edit_file");
+
+        // Assert
+        assert_eq!(
+            matching,
+            ApprovalCheck::Authorized(ApprovalAuthorization::ApprovedForRun {
+                approval_id: approval_id()
+            })
+        );
+        assert_eq!(other, ApprovalCheck::RequiresDecision);
+    }
+
+    #[test]
+    fn applying_decisions_preserves_the_authorizing_approval() {
+        // Arrange
+        let mut gate = ApprovalGate::new();
+
+        // Act
+        let once = gate.apply_decision("write_file", approval_id(), ApprovalDecision::AllowOnce);
+        let run = gate.apply_decision("edit_file", approval_id(), ApprovalDecision::AllowForRun);
+        let denied = gate.apply_decision(
+            "glob",
+            approval_id(),
+            ApprovalDecision::Deny {
+                reason: "not now".to_string(),
+            },
         );
 
         // Assert
-        assert!(matches!(
-            authorize_result,
-            Ok(ApprovalAuthorization::Approved)
-        ));
+        assert_eq!(
+            once,
+            ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedOnce {
+                approval_id: approval_id(),
+            })
+        );
+        assert_eq!(
+            run,
+            ApprovalOutcome::Authorized(ApprovalAuthorization::ApprovedForRun {
+                approval_id: approval_id(),
+            })
+        );
+        assert_eq!(
+            gate.check(ApprovalRequirement::Required, "edit_file"),
+            ApprovalCheck::Authorized(ApprovalAuthorization::ApprovedForRun {
+                approval_id: approval_id(),
+            })
+        );
+        assert_eq!(
+            denied,
+            ApprovalOutcome::Denied {
+                reason: "not now".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
-    async fn denial_returns_the_supplied_reason() {
+    async fn request_emits_the_call_details_and_returns_the_decision() {
         // Arrange
-        let mut gate = ApprovalGate::new();
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let sink = EventSink::new(events_tx);
         let cancel = CancellationToken::new();
-        let deny_reason = "Mock deny reason".to_string();
         let payload = json!({ "file": "test.txt", "contents": "test" });
 
         // Act
-        let (authorize_result, ()) = tokio::join!(
-            gate.authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-1",
-                &payload,
-                &sink,
-                &cancel,
-            ),
+        let (request_result, ()) = tokio::join!(
+            request_approval("write_file", "write-1", &payload, &sink, &cancel),
             async {
                 let event = events_rx.recv().await.unwrap();
 
                 let AgentEvent::ApprovalRequest {
-                    input,
                     id,
+                    input,
                     name,
                     respond_to,
                 } = event
                 else {
-                    panic!("Expected ApprovalRequest event");
+                    panic!("expected ApprovalRequest");
                 };
 
-                assert_eq!(input, payload);
                 assert_eq!(id, "write-1");
+                assert_eq!(input, payload);
                 assert_eq!(name, "write_file");
 
                 respond_to
                     .send(ApprovalDecision::Deny {
-                        reason: deny_reason.clone(),
+                        reason: "not this file".to_string(),
                     })
                     .unwrap();
             }
         );
 
         // Assert
-        let Ok(ApprovalAuthorization::Denied {
-            reason: provided_reason,
-        }) = authorize_result
-        else {
-            panic!("Expected ApprovalAuthorization::Denied")
-        };
-        assert_eq!(provided_reason, deny_reason);
-    }
-
-    #[tokio::test]
-    async fn always_allow_skips_later_requests_for_the_same_tool() {
-        // Arrange
-        let mut gate = ApprovalGate::new();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
-        let sink = EventSink::new(events_tx);
-        let cancel = CancellationToken::new();
-        let payload_one = json!({ "file": "test.txt", "contents": "test 1" });
-        let payload_two = json!({ "file": "test.txt", "contents": "test 2" });
-
-        // Act
-        let (authorize_result_one, ()) = tokio::join!(
-            gate.authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-1",
-                &payload_one,
-                &sink,
-                &cancel,
-            ),
-            async {
-                let event = events_rx.recv().await.unwrap();
-
-                let AgentEvent::ApprovalRequest {
-                    input,
-                    id,
-                    name,
-                    respond_to,
-                } = event
-                else {
-                    panic!("Expected ApprovalRequest event");
-                };
-
-                assert_eq!(input, payload_one);
-                assert_eq!(id, "write-1");
-                assert_eq!(name, "write_file");
-
-                respond_to
-                    .send(ApprovalDecision::AlwaysAllowSession)
-                    .unwrap();
-            }
+        assert_eq!(
+            request_result,
+            Ok(ApprovalDecision::Deny {
+                reason: "not this file".to_string(),
+            })
         );
-
-        let authorize_result_two = gate
-            .authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-2",
-                &payload_two,
-                &sink,
-                &cancel,
-            )
-            .await;
-
-        // Assert
-        let Ok(ApprovalAuthorization::Approved) = authorize_result_one else {
-            panic!("Expected ApprovalAuthorization::Approved")
-        };
-
-        let Ok(ApprovalAuthorization::Approved) = authorize_result_two else {
-            panic!("Expected ApprovalAuthorization::Approved")
-        };
-
-        assert!(matches!(
-            events_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn always_allow_does_not_skip_requests_for_another_tool() {
-        // Arrange
-        let mut gate = ApprovalGate::new();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
-        let sink = EventSink::new(events_tx);
-        let cancel = CancellationToken::new();
-        let payload_one = json!({ "file": "test.txt", "contents": "test 1" });
-        let payload_two = json!({ "file": "test.txt", "contents": "test 2" });
-
-        // Act
-        let (authorize_result_one, ()) = tokio::join!(
-            gate.authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-1",
-                &payload_one,
-                &sink,
-                &cancel,
-            ),
-            async {
-                let event = events_rx.recv().await.unwrap();
-
-                let AgentEvent::ApprovalRequest {
-                    input,
-                    id,
-                    name,
-                    respond_to,
-                } = event
-                else {
-                    panic!("Expected ApprovalRequest event");
-                };
-
-                assert_eq!(input, payload_one);
-                assert_eq!(id, "write-1");
-                assert_eq!(name, "write_file");
-
-                respond_to
-                    .send(ApprovalDecision::AlwaysAllowSession)
-                    .unwrap();
-            }
-        );
-
-        let (authorize_result_two, ()) = tokio::join!(
-            gate.authorize(
-                ApprovalRequirement::Required,
-                "write_file_copy",
-                "write-2",
-                &payload_two,
-                &sink,
-                &cancel,
-            ),
-            async {
-                let event = events_rx.recv().await.unwrap();
-
-                let AgentEvent::ApprovalRequest {
-                    input,
-                    id,
-                    name,
-                    respond_to,
-                } = event
-                else {
-                    panic!("Expected ApprovalRequest event");
-                };
-
-                assert_eq!(input, payload_two);
-                assert_eq!(id, "write-2");
-                assert_eq!(name, "write_file_copy");
-
-                respond_to.send(ApprovalDecision::Allow).unwrap();
-            }
-        );
-
-        // Assert
-        let Ok(ApprovalAuthorization::Approved) = authorize_result_one else {
-            panic!("Expected ApprovalAuthorization::Approved")
-        };
-
-        let Ok(ApprovalAuthorization::Approved) = authorize_result_two else {
-            panic!("Expected ApprovalAuthorization::Approved")
-        };
-
-        assert!(matches!(
-            events_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
     }
 
     #[tokio::test]
     async fn cancellation_while_waiting_for_approval_returns_cancelled() {
         // Arrange
-        let mut gate = ApprovalGate::new();
         let (events_tx, _events_rx) = tokio::sync::mpsc::channel(64);
         let sink = EventSink::new(events_tx);
         let cancel = CancellationToken::new();
-        let payload = json!({ "file": "test.txt", "contents": "test" });
-
         cancel.cancel();
 
         // Act
-        let result = gate
-            .authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-1",
-                &payload,
-                &sink,
-                &cancel,
-            )
-            .await;
+        let result = request_approval(
+            "write_file",
+            "write-1",
+            &json!({ "path": "test.txt" }),
+            &sink,
+            &cancel,
+        )
+        .await;
 
         // Assert
         assert!(matches!(result, Err(AgentExit::Cancelled)));
@@ -391,67 +273,44 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_approval_responder_returns_disconnected() {
         // Arrange
-        let mut gate = ApprovalGate::new();
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let sink = EventSink::new(events_tx);
         let cancel = CancellationToken::new();
-        let payload = json!({ "file": "test.txt", "contents": "test" });
+        let payload = json!({ "path": "test.txt" });
 
         // Act
-        let (authorize_result, ()) = tokio::join!(
-            gate.authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-1",
-                &payload,
-                &sink,
-                &cancel,
-            ),
+        let (request_result, ()) = tokio::join!(
+            request_approval("write_file", "write-1", &payload, &sink, &cancel),
             async {
                 let event = events_rx.recv().await.unwrap();
-
-                let AgentEvent::ApprovalRequest {
-                    input,
-                    id,
-                    name,
-                    respond_to,
-                } = event
-                else {
-                    panic!("Expected ApprovalRequest event");
+                let AgentEvent::ApprovalRequest { respond_to, .. } = event else {
+                    panic!("expected ApprovalRequest");
                 };
-
-                assert_eq!(input, payload);
-                assert_eq!(id, "write-1");
-                assert_eq!(name, "write_file");
-
                 drop(respond_to);
             }
         );
 
         // Assert
-        assert!(matches!(authorize_result, Err(AgentExit::Disconnected)));
+        assert!(matches!(request_result, Err(AgentExit::Disconnected)));
     }
 
     #[tokio::test]
     async fn dropping_the_event_receiver_returns_disconnected() {
         // Arrange
-        let mut gate = ApprovalGate::new();
-        let (events_tx, _) = tokio::sync::mpsc::channel(64);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
         let sink = EventSink::new(events_tx);
         let cancel = CancellationToken::new();
-        let payload = json!({ "file": "test.txt", "contents": "test" });
+        drop(events_rx);
 
         // Act
-        let result = gate
-            .authorize(
-                ApprovalRequirement::Required,
-                "write_file",
-                "write-1",
-                &payload,
-                &sink,
-                &cancel,
-            )
-            .await;
+        let result = request_approval(
+            "write_file",
+            "write-1",
+            &json!({ "path": "test.txt" }),
+            &sink,
+            &cancel,
+        )
+        .await;
 
         // Assert
         assert!(matches!(result, Err(AgentExit::Disconnected)));

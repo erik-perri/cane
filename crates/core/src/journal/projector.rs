@@ -29,8 +29,8 @@ pub struct ProjectionError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApprovalDecision {
+    AllowForRun,
     AllowOnce,
-    AllowRun,
     Deny,
 }
 
@@ -64,8 +64,8 @@ struct TurnState {
 }
 
 struct RunState {
-    grants: HashMap<ApprovalId, String>,
     id: RunId,
+    run_approvals: HashMap<ApprovalId, String>,
     turn: Option<TurnState>,
 }
 
@@ -99,8 +99,8 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     ));
                 }
                 active_run = Some(RunState {
-                    grants: HashMap::new(),
                     id: started.run_id,
+                    run_approvals: HashMap::new(),
                     turn: None,
                 });
             }
@@ -225,7 +225,7 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
             }
             JournalEntry::ApprovalDecided(decided) => {
                 let run = active_run_mut(&mut active_run, record.sequence)?;
-                let run_grant = {
+                let run_approval = {
                     let Some(turn) = run.turn.as_mut() else {
                         return Err(invalid(record.sequence, "record has no active turn"));
                     };
@@ -242,15 +242,15 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                         ));
                     }
                     let decision = match decided.decision {
+                        JournalApprovalDecision::AllowForRun => ApprovalDecision::AllowForRun,
                         JournalApprovalDecision::AllowOnce => ApprovalDecision::AllowOnce,
-                        JournalApprovalDecision::AllowRun => ApprovalDecision::AllowRun,
                         JournalApprovalDecision::Deny { .. } => ApprovalDecision::Deny,
                     };
                     current.decision = Some(decision);
-                    (decision == ApprovalDecision::AllowRun).then(|| current.tool_name.clone())
+                    (decision == ApprovalDecision::AllowForRun).then(|| current.tool_name.clone())
                 };
-                if let Some(tool_name) = run_grant {
-                    run.grants.insert(decided.approval_id, tool_name);
+                if let Some(tool_name) = run_approval {
+                    run.run_approvals.insert(decided.approval_id, tool_name);
                 }
             }
             JournalEntry::ToolStarted(started) => {
@@ -265,7 +265,7 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     ));
                 }
                 authorize_tool_start(
-                    &run.grants,
+                    &run.run_approvals,
                     turn,
                     &started.authorization,
                     &started.tool_call_id,
@@ -525,7 +525,7 @@ fn add_tool_results(
 }
 
 fn authorize_tool_start(
-    grants: &HashMap<ApprovalId, String>,
+    run_approvals: &HashMap<ApprovalId, String>,
     turn: &TurnState,
     authorization: &ToolAuthorization,
     tool_call_id: &str,
@@ -533,8 +533,15 @@ fn authorize_tool_start(
     sequence: u64,
 ) -> Result<(), ProjectionError> {
     match authorization {
-        ToolAuthorization::NotRequired => return Ok(()),
-        ToolAuthorization::AllowOnce { approval_id } => {
+        ToolAuthorization::ApprovedForRun { approval_id } => {
+            if run_approvals.get(approval_id).map(String::as_str) != Some(tool_name) {
+                return Err(invalid(
+                    sequence,
+                    "run approval does not authorize this tool",
+                ));
+            }
+        }
+        ToolAuthorization::ApprovedOnce { approval_id } => {
             let Some(approval) = turn.approvals.get(approval_id) else {
                 return Err(invalid(
                     sequence,
@@ -551,14 +558,7 @@ fn authorize_tool_start(
                 ));
             }
         }
-        ToolAuthorization::RunGrant { approval_id } => {
-            if grants.get(approval_id).map(String::as_str) != Some(tool_name) {
-                return Err(invalid(
-                    sequence,
-                    "run approval does not authorize this tool",
-                ));
-            }
-        }
+        ToolAuthorization::NotRequired => return Ok(()),
     }
     Ok(())
 }
@@ -1037,10 +1037,10 @@ mod tests {
     }
 
     #[test]
-    fn run_grants_cross_turns_but_one_time_approvals_remain_call_specific() {
+    fn run_approvals_cross_turns_but_one_time_approvals_remain_call_specific() {
         // Arrange
         let approval_id: ApprovalId = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().unwrap();
-        let grants = HashMap::from([(approval_id, "write_file".to_string())]);
+        let run_approvals = HashMap::from([(approval_id, "write_file".to_string())]);
         let turn = TurnState {
             approvals: HashMap::from([(
                 approval_id,
@@ -1060,25 +1060,25 @@ mod tests {
         };
 
         // Act
-        let run_grant_result = authorize_tool_start(
-            &grants,
+        let run_approval_result = authorize_tool_start(
+            &run_approvals,
             &turn,
-            &ToolAuthorization::RunGrant { approval_id },
+            &ToolAuthorization::ApprovedForRun { approval_id },
             "call-2",
             "write_file",
             1,
         );
         let reused_once_result = authorize_tool_start(
-            &grants,
+            &run_approvals,
             &turn,
-            &ToolAuthorization::AllowOnce { approval_id },
+            &ToolAuthorization::ApprovedOnce { approval_id },
             "call-2",
             "write_file",
             2,
         );
 
         // Assert
-        assert!(run_grant_result.is_ok());
+        assert!(run_approval_result.is_ok());
         assert!(reused_once_result.is_err());
     }
 }
