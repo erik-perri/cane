@@ -9,8 +9,8 @@ use crate::journal::{
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{
-    AgentCommand, AgentEvent, AgentExit, ApprovalLifetime, ApprovalSubject, EventSink, HostHandle,
-    ShutdownReason, TurnOutcome,
+    AgentCommand, AgentEvent, AgentExit, ApprovalSubject, EventSink, HostHandle, ShutdownReason,
+    TurnOutcome,
 };
 use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
@@ -135,7 +135,7 @@ pub async fn spawn_agent(
         provider.model.clone(),
         provider.max_tokens,
     )?;
-    let tool_set = ToolSet::new(Arc::new(workspace));
+    let tool_set = ToolSet::new(Arc::new(workspace), None);
     let session_id = SessionId::generate();
     let run_id = RunId::generate();
     let mut journal = SessionJournal::create(sessions.sessions_directory(), session_id).await?;
@@ -580,7 +580,7 @@ impl AgentSession {
         };
 
         let subject = ApprovalSubject::tool_call(id, name);
-        let available_lifetimes = vec![ApprovalLifetime::Invocation, ApprovalLifetime::Run];
+        let available_lifetimes = invocation.available_grant_lifetimes().to_vec();
         let authorization = match gate.check(invocation.approval_requirement(), &subject) {
             ApprovalCheck::Authorized(authorization) => authorization,
             ApprovalCheck::RequiresDecision => {
@@ -624,13 +624,7 @@ impl AgentSession {
                             })
                             .await?;
 
-                        return Ok(ToolResultData {
-                            content: format!(
-                                "The user declined this tool call and said: \"{reason}\". Do not assume the tool ran. Address their feedback, then retry if appropriate."
-                            ),
-                            is_error: false,
-                            tool_use_id: id.to_string(),
-                        });
+                        return Ok(denied_tool_result(id, &reason));
                     }
                     ApprovalOutcome::InvalidGrant { reason } => {
                         self.journal
@@ -691,6 +685,23 @@ fn failed_tool_result(id: &str, error: String) -> ToolResultData {
     ToolResultData {
         content: error,
         is_error: true,
+        tool_use_id: id.to_string(),
+    }
+}
+
+fn denied_tool_result(id: &str, reason: &str) -> ToolResultData {
+    let content = if reason.trim().is_empty() {
+        "The user declined this tool call. Do not assume the tool ran. Continue without it or ask the user what they prefer."
+            .to_string()
+    } else {
+        format!(
+            "The user declined this tool call and said: \"{reason}\". Do not assume the tool ran. Address their feedback, then retry if appropriate."
+        )
+    };
+
+    ToolResultData {
+        content,
+        is_error: false,
         tool_use_id: id.to_string(),
     }
 }
@@ -866,12 +877,12 @@ async fn execute_invocation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ApprovalDecision;
     use crate::journal::{
         InjectedFlushFailure, JournalRecord, SessionProjection, parse_journal, project_journal,
     };
     use crate::protocol::ApprovalRequirement;
     use crate::tools::{Tool, ToolDefinition};
+    use crate::{ApprovalDecision, ApprovalLifetime};
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::io::Write;
@@ -1040,6 +1051,36 @@ mod tests {
 
         // Assert
         assert_eq!(result, Err("assistant message repeats a tool call ID"));
+    }
+
+    #[test]
+    fn denied_tool_results_only_quote_a_nonempty_reason() {
+        // Arrange
+        let tool_call_id = "call_1";
+
+        // Act
+        let unexplained = denied_tool_result(tool_call_id, " \t");
+        let explained = denied_tool_result(tool_call_id, "use the existing build output");
+
+        // Assert
+        assert_eq!(
+            unexplained,
+            ToolResultData {
+                content: "The user declined this tool call. Do not assume the tool ran. Continue without it or ask the user what they prefer."
+                    .to_string(),
+                is_error: false,
+                tool_use_id: tool_call_id.to_string(),
+            }
+        );
+        assert_eq!(
+            explained,
+            ToolResultData {
+                content: "The user declined this tool call and said: \"use the existing build output\". Do not assume the tool ran. Address their feedback, then retry if appropriate."
+                    .to_string(),
+                is_error: false,
+                tool_use_id: tool_call_id.to_string(),
+            }
+        );
     }
 
     async fn mount_turns(server: &MockServer, turns: Vec<ResponseTemplate>) {

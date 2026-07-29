@@ -1229,7 +1229,7 @@ mod tests {
         // Arrange
         let root = tempdir().unwrap();
         let workspace = Workspace::new(root.path().to_path_buf()).unwrap();
-        let tools = crate::tools::ToolSet::new(Arc::new(workspace));
+        let tools = crate::tools::ToolSet::new(Arc::new(workspace), None);
 
         // Act
         let definition = tools.locate("grep").unwrap().definition();

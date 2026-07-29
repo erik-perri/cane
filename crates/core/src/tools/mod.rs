@@ -10,19 +10,27 @@ mod glob;
 mod grep;
 mod path_display;
 mod read_file;
+mod shell;
 mod write_file;
 
 use crate::Workspace;
-use crate::protocol::ApprovalRequirement;
+use crate::command::{CommandEnvironmentConfig, CommandExecutor};
+use crate::protocol::{ApprovalLifetime, ApprovalRequirement};
 use edit_file::EditFileTool;
 use glob::GlobTool;
 use grep::GrepTool;
 use read_file::ReadFileTool;
+use shell::ShellTool;
 use write_file::WriteFileTool;
 
 pub(crate) struct ToolSet {
     tool_definitions: Vec<ToolDefinition>,
     tools: Vec<Box<dyn Tool>>,
+}
+
+pub(crate) struct ShellToolConfig {
+    pub(crate) environment: CommandEnvironmentConfig,
+    pub(crate) executor: Arc<dyn CommandExecutor>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -38,14 +46,21 @@ impl From<String> for ToolExecutionError {
 }
 
 impl ToolSet {
-    pub(crate) fn new(workspace: Arc<Workspace>) -> Self {
-        let tools: Vec<Box<dyn Tool>> = vec![
+    pub(crate) fn new(workspace: Arc<Workspace>, shell: Option<ShellToolConfig>) -> Self {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(EditFileTool::new(Arc::clone(&workspace))),
             Box::new(GlobTool::new(Arc::clone(&workspace))),
             Box::new(GrepTool::new(Arc::clone(&workspace))),
             Box::new(ReadFileTool::new(Arc::clone(&workspace))),
             Box::new(WriteFileTool::new(Arc::clone(&workspace))),
         ];
+        if let Some(shell) = shell {
+            tools.push(Box::new(ShellTool::new(
+                workspace,
+                shell.environment,
+                shell.executor,
+            )));
+        }
 
         let tool_definitions = tools.iter().map(|tool| tool.definition()).collect();
 
@@ -96,6 +111,13 @@ pub(crate) trait Tool: Send + Sync {
 #[async_trait]
 pub(crate) trait PreparedInvocation: Send {
     fn approval_requirement(&self) -> ApprovalRequirement;
+
+    /// Grant lifetimes this invocation may receive.
+    ///
+    /// Denial is always available and may include a user-provided reason.
+    fn available_grant_lifetimes(&self) -> &'static [ApprovalLifetime] {
+        &[ApprovalLifetime::Invocation, ApprovalLifetime::Run]
+    }
 
     async fn execute(
         self: Box<Self>,
@@ -181,7 +203,7 @@ mod tests {
         // Arrange
         let dir = tempdir().unwrap();
         let workspace = Workspace::new(dir.path().into()).unwrap();
-        let tool_set = ToolSet::new(Arc::new(workspace));
+        let tool_set = ToolSet::new(Arc::new(workspace), None);
 
         // Act
         let tool = tool_set.locate("read_file").unwrap();
@@ -195,7 +217,7 @@ mod tests {
         // Arrange
         let dir = tempdir().unwrap();
         let workspace = Workspace::new(dir.path().into()).unwrap();
-        let tool_set = ToolSet::new(Arc::new(workspace));
+        let tool_set = ToolSet::new(Arc::new(workspace), None);
 
         // Act
         let tool = tool_set.locate("what_tool").err().unwrap();
