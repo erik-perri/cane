@@ -150,6 +150,11 @@ async fn run_with_input(
                     output.flush()?;
                 }
 
+                AgentEvent::CommandOutput(chunk) => {
+                    write!(output, "{}", String::from_utf8_lossy(&chunk.bytes))?;
+                    output.flush()?;
+                }
+
                 AgentEvent::ToolStarted { name, input } => {
                     writeln!(output, "\n[tool: {name} {input}]")?;
                     output.flush()?;
@@ -305,6 +310,7 @@ fn write_prompt(output: &mut impl Write) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use cane_core::StopReason;
+    use cane_core::command::CommandOutputChunk;
     use std::io::{self, Cursor, Read};
     use std::sync::mpsc as std_mpsc;
     use tokio::sync::{mpsc, oneshot};
@@ -424,6 +430,68 @@ mod tests {
             "> \n[tool: read_file null]\n\n[tool: read_file null]\n[tool error: access denied]\nI could not read it.\n> "
         );
         assert!(!output.contains("secret successful output"));
+    }
+
+    #[tokio::test]
+    async fn run_displays_live_command_output_in_observed_order() {
+        // Arrange
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (event_tx, events) = mpsc::channel(8);
+        let agent = TestAgent {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let frontend = tokio::spawn(async move {
+            command_rx.recv().await.unwrap();
+            event_tx
+                .send(AgentEvent::ToolStarted {
+                    name: "shell".to_string(),
+                    input: Default::default(),
+                })
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::CommandOutput(CommandOutputChunk::stdout(
+                    b"building ".to_vec(),
+                )))
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::CommandOutput(CommandOutputChunk::stderr(
+                    b"warning\n".to_vec(),
+                )))
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::ToolFinished {
+                    name: "shell".to_string(),
+                    output: "process exited with code 0".to_string(),
+                    is_error: false,
+                })
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                })
+                .await
+                .unwrap();
+        });
+        let input = Cursor::new("build\n/quit\n");
+        let mut output = Vec::new();
+
+        // Act
+        run(agent, input, &mut output).await.unwrap();
+        frontend.await.unwrap();
+
+        // Assert
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "> \n[tool: shell null]\nbuilding warning\n\n> "
+        );
     }
 
     #[tokio::test]

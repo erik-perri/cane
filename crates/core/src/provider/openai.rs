@@ -45,6 +45,9 @@ struct OpenAiRequestFunction {
 #[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 enum OpenAiRequestMessage {
+    System {
+        content: String,
+    },
     User {
         content: String,
     },
@@ -77,6 +80,7 @@ pub(crate) struct OpenAiClient {
     api_key: String,
     endpoint: reqwest::Url,
     http: reqwest::Client,
+    instructions: String,
     max_tokens: u32,
     model: String,
 }
@@ -145,6 +149,7 @@ impl OpenAiClient {
         api_key: String,
         model: String,
         max_tokens: u32,
+        instructions: String,
     ) -> Result<Self, ProviderError> {
         let endpoint = endpoint_from_base_url(base_url)?;
         let http = reqwest::Client::builder()
@@ -156,6 +161,7 @@ impl OpenAiClient {
             api_key,
             endpoint,
             http,
+            instructions,
             max_tokens,
             model,
         })
@@ -178,7 +184,7 @@ impl OpenAiClient {
         }
     }
 
-    fn build_request(&self, messages: &[Message], tools: &[ToolDefinition]) -> OpenAiRequest {
+    fn build_request(&self, history: &[Message], tools: &[ToolDefinition]) -> OpenAiRequest {
         let openai_tools = tools
             .iter()
             .map(|tool| OpenAiRequestTool {
@@ -191,9 +197,17 @@ impl OpenAiClient {
             })
             .collect();
 
+        let mut messages = Vec::new();
+        if !self.instructions.is_empty() {
+            messages.push(OpenAiRequestMessage::System {
+                content: self.instructions.clone(),
+            });
+        }
+        messages.extend(to_wire(history));
+
         OpenAiRequest {
             max_tokens: self.max_tokens,
-            messages: to_wire(messages),
+            messages,
             model: self.model.clone(),
             stream: true,
             stream_options: OpenAiStreamOptions {
@@ -772,6 +786,7 @@ mod tests {
             "authorization-secret".to_string(),
             "test-model".to_string(),
             1024,
+            String::new(),
         )
         .unwrap();
 
@@ -785,6 +800,35 @@ mod tests {
                 adapter: ProviderAdapter::OpenAiCompatible,
                 endpoint: "https://example.test/openai/v1/chat/completions".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn request_prepends_nonempty_session_instructions() {
+        // Arrange
+        let client = OpenAiClient::new(
+            "https://example.test/v1".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            1024,
+            "Use the configured shell contract.".to_string(),
+        )
+        .unwrap();
+
+        // Act
+        let request = client.build_request(&user_history(), &[]);
+
+        // Assert
+        assert_eq!(
+            request.messages,
+            [
+                OpenAiRequestMessage::System {
+                    content: "Use the configured shell contract.".to_string(),
+                },
+                OpenAiRequestMessage::User {
+                    content: "What's in Cargo.toml?".to_string(),
+                },
+            ]
         );
     }
 
@@ -853,6 +897,7 @@ mod tests {
             "test-key".to_string(),
             "test-model".to_string(),
             1234,
+            String::new(),
         )
         .unwrap()
     }
@@ -1811,7 +1856,7 @@ mod tests {
         let api_key = std::env::var("CANE_API_KEY").unwrap_or("none".to_string());
         let model = std::env::var("CANE_MODEL").expect("set CANE_MODEL");
 
-        let client = OpenAiClient::new(base_url, api_key, model, 8192).unwrap();
+        let client = OpenAiClient::new(base_url, api_key, model, 8192, String::new()).unwrap();
         let messages = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {

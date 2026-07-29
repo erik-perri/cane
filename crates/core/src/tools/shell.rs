@@ -7,7 +7,7 @@ use crate::journal::{
     CapturedStream, CommandTermination as JournalCommandTermination, ToolExecutionCompleted,
     ToolExecutionStarted,
 };
-use crate::protocol::{ApprovalLifetime, ApprovalRequirement};
+use crate::protocol::{AgentEvent, ApprovalLifetime, ApprovalRequirement, EventSink};
 use crate::tools::{
     PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, ToolExecutionOutput,
 };
@@ -20,6 +20,7 @@ const PREVIEW_CHANNEL_CAPACITY: usize = 16;
 
 pub(super) struct ShellTool {
     environment: CommandEnvironmentConfig,
+    events: EventSink,
     executor: Arc<dyn CommandExecutor>,
     workspace: Arc<Workspace>,
 }
@@ -28,10 +29,12 @@ impl ShellTool {
     pub(super) fn new(
         workspace: Arc<Workspace>,
         environment: CommandEnvironmentConfig,
+        events: EventSink,
         executor: Arc<dyn CommandExecutor>,
     ) -> Self {
         Self {
             environment,
+            events,
             executor,
             workspace,
         }
@@ -76,6 +79,7 @@ impl Tool for ShellTool {
             .map_err(|error| error.to_string())?;
 
         Ok(Box::new(PreparedShellInvocation {
+            events: self.events.clone(),
             executor: Arc::clone(&self.executor),
             prepared,
         }))
@@ -83,6 +87,7 @@ impl Tool for ShellTool {
 }
 
 struct PreparedShellInvocation {
+    events: EventSink,
     executor: Arc<dyn CommandExecutor>,
     prepared: PreparedShellCommand,
 }
@@ -107,18 +112,30 @@ impl PreparedInvocation for PreparedShellInvocation {
         self: Box<Self>,
         cancel: CancellationToken,
     ) -> Result<ToolExecutionOutput, ToolExecutionError> {
-        let Self { executor, prepared } = *self;
+        let Self {
+            events,
+            executor,
+            prepared,
+        } = *self;
         let deadline = CommandDeadline::after(prepared.timeout());
-        let (preview, _preview_receiver) = mpsc::channel(PREVIEW_CHANNEL_CAPACITY);
+        let (preview, mut preview_receiver) = mpsc::channel(PREVIEW_CHANNEL_CAPACITY);
+        let preview_task = tokio::spawn(async move {
+            while let Some(chunk) = preview_receiver.recv().await {
+                events.emit_best_effort(AgentEvent::CommandOutput(chunk));
+            }
+        });
         let result = executor
             .execute(cancel, deadline, preview, prepared.into_request())
+            .await;
+        preview_task
             .await
-            .map_err(|error| match error {
-                CommandExecutionError::Cancelled => ToolExecutionError::Cancelled,
-                CommandExecutionError::Failed { .. } => {
-                    ToolExecutionError::ToolError(error.to_string())
-                }
-            })?;
+            .map_err(|error| ToolExecutionError::ToolError(error.to_string()))?;
+        let result = result.map_err(|error| match error {
+            CommandExecutionError::Cancelled => ToolExecutionError::Cancelled,
+            CommandExecutionError::Failed { .. } => {
+                ToolExecutionError::ToolError(error.to_string())
+            }
+        })?;
 
         let execution = shell_execution_completed(&result);
 
@@ -189,7 +206,7 @@ mod tests {
             &self,
             cancel: CancellationToken,
             _deadline: CommandDeadline,
-            _output: CommandOutputSender,
+            output: CommandOutputSender,
             request: CommandRequest,
         ) -> Result<CommandResult, CommandExecutionError> {
             self.observations
@@ -201,7 +218,12 @@ mod tests {
                 });
 
             match &self.result {
-                Ok(result) => Ok(result.clone()),
+                Ok(result) => {
+                    for chunk in &result.output.chunks {
+                        let _ = output.try_send(chunk.clone());
+                    }
+                    Ok(result.clone())
+                }
                 Err(CommandExecutionError::Cancelled) => Err(CommandExecutionError::Cancelled),
                 Err(CommandExecutionError::Failed { message }) => {
                     Err(CommandExecutionError::Failed {
@@ -214,7 +236,12 @@ mod tests {
 
     fn shell_tool(
         result: Result<CommandResult, CommandExecutionError>,
-    ) -> (TempDir, ShellTool, Arc<FakeExecutor>) {
+    ) -> (
+        TempDir,
+        ShellTool,
+        Arc<FakeExecutor>,
+        mpsc::Receiver<AgentEvent>,
+    ) {
         let root = TempDir::new().unwrap();
         let workspace = Arc::new(Workspace::new(root.path().to_path_buf()).unwrap());
         let executor = Arc::new(FakeExecutor {
@@ -227,13 +254,15 @@ mod tests {
             "/sandbox/tmp",
         )
         .unwrap();
+        let (events, event_receiver) = mpsc::channel(16);
         let tool = ShellTool::new(
             workspace,
             environment,
+            EventSink::new(events),
             Arc::clone(&executor) as Arc<dyn CommandExecutor>,
         );
 
-        (root, tool, executor)
+        (root, tool, executor, event_receiver)
     }
 
     #[test]
@@ -243,7 +272,7 @@ mod tests {
             output: CapturedOutput::complete(Vec::new()),
             termination: CommandTermination::Exited { code: 0 },
         };
-        let (_root, tool, _executor) = shell_tool(Ok(result));
+        let (_root, tool, _executor, _events) = shell_tool(Ok(result));
 
         // Act
         let definition = tool.definition();
@@ -276,6 +305,7 @@ mod tests {
         let environment =
             CommandEnvironmentConfig::new("/sandbox/home", vec!["/usr/bin".to_string()], "/tmp")
                 .unwrap();
+        let (events, _event_receiver) = mpsc::channel(16);
 
         // Act
         let without_shell = ToolSet::new(Arc::clone(&workspace), None);
@@ -283,6 +313,7 @@ mod tests {
             workspace,
             Some(ShellToolConfig {
                 environment,
+                events: EventSink::new(events),
                 executor,
             }),
         );
@@ -301,7 +332,7 @@ mod tests {
             )]),
             termination: CommandTermination::Exited { code: 2 },
         };
-        let (root, tool, executor) = shell_tool(Ok(result));
+        let (root, tool, executor, _events) = shell_tool(Ok(result));
         let input = serde_json::json!({
             "command": "cargo check",
             "timeout_seconds": 30
@@ -335,7 +366,7 @@ mod tests {
             output: CapturedOutput::complete(Vec::new()),
             termination: CommandTermination::Exited { code: 0 },
         };
-        let (_root, tool, _executor) = shell_tool(Ok(result));
+        let (_root, tool, _executor, _events) = shell_tool(Ok(result));
 
         // Act
         let invocation = tool
@@ -368,7 +399,7 @@ mod tests {
             },
             termination: CommandTermination::TimedOut,
         };
-        let (_root, tool, _executor) = shell_tool(Ok(result));
+        let (_root, tool, _executor, mut events) = shell_tool(Ok(result));
         let invocation = tool
             .prepare(serde_json::json!({ "command": "cargo test" }))
             .await
@@ -400,12 +431,20 @@ mod tests {
             })
         );
         assert!(completed.content.starts_with("process timed out\n"));
+        let AgentEvent::CommandOutput(stderr) = events.try_recv().unwrap() else {
+            panic!("expected stderr preview");
+        };
+        let AgentEvent::CommandOutput(stdout) = events.try_recv().unwrap() else {
+            panic!("expected stdout preview");
+        };
+        assert_eq!(stderr, CommandOutputChunk::stderr(b"stderr tail".to_vec()));
+        assert_eq!(stdout, CommandOutputChunk::stdout(b"stdout".to_vec()));
     }
 
     #[tokio::test]
     async fn shell_maps_executor_cancellation_to_tool_cancellation() {
         // Arrange
-        let (_root, tool, _executor) = shell_tool(Err(CommandExecutionError::Cancelled));
+        let (_root, tool, _executor, _events) = shell_tool(Err(CommandExecutionError::Cancelled));
         let invocation = tool
             .prepare(serde_json::json!({ "command": "sleep 10" }))
             .await

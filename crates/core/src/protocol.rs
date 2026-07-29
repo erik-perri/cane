@@ -1,4 +1,5 @@
 use crate::StopReason;
+use crate::command::CommandOutputChunk;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use tokio::sync::mpsc;
@@ -13,6 +14,7 @@ pub enum AgentEvent {
         respond_to: oneshot::Sender<ApprovalDecision>,
         subject: ApprovalSubject,
     },
+    CommandOutput(CommandOutputChunk),
     TextDelta(String),
     ToolStarted {
         input: serde_json::Value,
@@ -61,6 +63,10 @@ impl EventSink {
 
     pub async fn closed(&self) {
         self.0.closed().await
+    }
+
+    pub fn emit_best_effort(&self, event: AgentEvent) {
+        let _ = self.0.try_send(event);
     }
 
     pub fn sender(&self) -> &mpsc::Sender<AgentEvent> {

@@ -16,7 +16,7 @@ mod write_file;
 use crate::Workspace;
 use crate::command::{CommandEnvironmentConfig, CommandExecutor};
 use crate::journal::{ToolExecutionCompleted, ToolExecutionStarted};
-use crate::protocol::{ApprovalLifetime, ApprovalRequirement};
+use crate::protocol::{ApprovalLifetime, ApprovalRequirement, EventSink};
 use edit_file::EditFileTool;
 use glob::GlobTool;
 use grep::GrepTool;
@@ -31,6 +31,7 @@ pub(crate) struct ToolSet {
 
 pub(crate) struct ShellToolConfig {
     pub(crate) environment: CommandEnvironmentConfig,
+    pub(crate) events: EventSink,
     pub(crate) executor: Arc<dyn CommandExecutor>,
 }
 
@@ -74,6 +75,7 @@ impl ToolSet {
             tools.push(Box::new(ShellTool::new(
                 workspace,
                 shell.environment,
+                shell.events,
                 shell.executor,
             )));
         }

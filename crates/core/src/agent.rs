@@ -195,12 +195,16 @@ impl AgentShellConfig {
         &self.policy
     }
 
-    fn into_parts(self) -> (Option<ShellToolConfig>, ShellPolicy, Option<PathBuf>) {
+    fn into_parts(
+        self,
+        events: EventSink,
+    ) -> (Option<ShellToolConfig>, ShellPolicy, Option<PathBuf>) {
         let shell = self
             .environment
             .zip(self.executor)
             .map(|(environment, executor)| ShellToolConfig {
                 environment,
+                events,
                 executor,
             });
 
@@ -313,8 +317,11 @@ pub async fn spawn_agent_with_shell(
         provider.api_key,
         provider.model.clone(),
         provider.max_tokens,
+        sessions.instructions().to_string(),
     )?;
-    let (shell_tool, shell_policy, shell_workspace) = shell.into_parts();
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let events = EventSink::new(events_tx);
+    let (shell_tool, shell_policy, shell_workspace) = shell.into_parts(events.clone());
     if let Some(configured) = shell_workspace
         && configured != workspace.root()
     {
@@ -354,12 +361,10 @@ pub async fn spawn_agent_with_shell(
 
     let journal = RunJournal::new(journal, model, provider_descriptor, run_id);
     let journal_path = journal.path().to_path_buf();
-    let (events_tx, events_rx) = mpsc::channel(64);
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
-        let events = EventSink::new(events_tx.clone());
         let host_handle = HostHandle {
             cancel: task_cancel,
             commands: commands_rx,
@@ -1067,7 +1072,8 @@ async fn execute_invocation(
 mod tests {
     use super::*;
     use crate::journal::{
-        InjectedFlushFailure, JournalRecord, SessionProjection, parse_journal, project_journal,
+        InjectedFlushFailure, JournalRecord, SessionProjection, ToolExecutionCompleted,
+        ToolExecutionStarted, parse_journal, project_journal,
     };
     use crate::protocol::ApprovalRequirement;
     use crate::tools::{Tool, ToolDefinition};
@@ -1103,6 +1109,10 @@ mod tests {
         descriptor: crate::command::CommandExecutorDescriptor,
     }
 
+    struct CompletingShellExecutor {
+        result: crate::command::CommandResult,
+    }
+
     #[async_trait]
     impl CommandExecutor for StartupExecutor {
         fn descriptor(&self) -> crate::command::CommandExecutorDescriptor {
@@ -1119,6 +1129,29 @@ mod tests {
             Err(crate::command::CommandExecutionError::Failed {
                 message: "startup test executor must not run".to_string(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl CommandExecutor for CompletingShellExecutor {
+        fn descriptor(&self) -> crate::command::CommandExecutorDescriptor {
+            crate::command::CommandExecutorDescriptor {
+                backend: "fake".to_string(),
+                mode: CommandExecutionMode::Sandboxed,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _cancel: CancellationToken,
+            _deadline: crate::command::CommandDeadline,
+            output: crate::command::CommandOutputSender,
+            _request: crate::command::CommandRequest,
+        ) -> Result<crate::command::CommandResult, crate::command::CommandExecutionError> {
+            for chunk in &self.result.output.chunks {
+                let _ = output.try_send(chunk.clone());
+            }
+            Ok(self.result.clone())
         }
     }
 
@@ -1389,6 +1422,7 @@ mod tests {
             provider.api_key,
             provider.model,
             provider.max_tokens,
+            String::new(),
         )
         .unwrap();
         let provider_descriptor = client.provider_descriptor();
@@ -1670,6 +1704,140 @@ mod tests {
             .await
             .expect("agent task did not join")
             .expect("agent task panicked");
+    }
+
+    #[tokio::test]
+    async fn shell_run_is_explainable_from_approval_execution_and_journal_records() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[("shell-1", "shell", json!({ "command": "cargo check" }))]),
+                text_turn("The check failed with exit code 2."),
+            ],
+        )
+        .await;
+        let sessions = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let policy = sandbox_policy(&root);
+        let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let environment = command_environment(&policy.executable_path()[0]);
+        let result = crate::command::CommandResult {
+            output: crate::command::CapturedOutput::complete(vec![
+                crate::command::CommandOutputChunk::stderr(b"compile failed\n".to_vec()),
+            ]),
+            termination: crate::command::CommandTermination::Exited { code: 2 },
+        };
+        let shell = AgentShellConfig::sandboxed(
+            environment,
+            Arc::new(CompletingShellExecutor { result }),
+            Some("fake 1.0".to_string()),
+            &policy,
+        )
+        .unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path());
+        let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
+            .await
+            .unwrap();
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Check the project.".to_string()))
+            .await
+            .unwrap();
+
+        // Act
+        let (approval, subject) = loop {
+            let event = handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                available_lifetimes,
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                assert_eq!(available_lifetimes, [ApprovalLifetime::Invocation]);
+                break (respond_to, subject);
+            }
+        };
+        approval
+            .send(ApprovalDecision::Grant(
+                subject.grant(ApprovalLifetime::Invocation),
+            ))
+            .unwrap();
+        let events = collect_turn(&mut handle.events).await;
+        let model_messages = nth_request_messages(&server, 1).await;
+        let (records, projection) = finish_and_project(handle).await;
+
+        // Assert
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CommandOutput(chunk)
+                if chunk == &crate::command::CommandOutputChunk::stderr(
+                    b"compile failed\n".to_vec()
+                )
+        )));
+        assert_eq!(
+            model_messages[2],
+            json!({
+                "role": "tool",
+                "content": "process exited with code 2\noutput (15 bytes, complete):\ncompile failed\n",
+                "tool_call_id": "shell-1"
+            })
+        );
+
+        let approval_id = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ApprovalRequested(requested) => Some(requested.approval_id),
+                _ => None,
+            })
+            .expect("approval request missing from journal");
+        assert!(records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::ApprovalDecided(decided)
+                if decided.approval_id == approval_id
+                    && matches!(
+                        &decided.decision,
+                        JournalApprovalDecision::Grant { grant }
+                            if grant.lifetime() == ApprovalLifetime::Invocation
+                    )
+        )));
+        assert!(records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::ToolStarted(started)
+                if started.tool_call_id == "shell-1"
+                    && started.execution
+                        == Some(ToolExecutionStarted::Shell {
+                            capabilities: Vec::new(),
+                        })
+                    && matches!(
+                        started.authorization,
+                        ToolAuthorization::Granted {
+                            approval_id: recorded,
+                            ..
+                        } if recorded == approval_id
+                    )
+        )));
+        assert!(records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::ToolCompleted(completed)
+                if completed.tool_call_id == "shell-1"
+                    && completed.execution
+                        == Some(ToolExecutionCompleted::Shell {
+                            stderr: crate::journal::CapturedStream {
+                                bytes: 15,
+                                truncated: false,
+                            },
+                            stdout: crate::journal::CapturedStream {
+                                bytes: 0,
+                                truncated: false,
+                            },
+                            termination: crate::journal::CommandTermination::Exited { code: 2 },
+                        })
+        )));
+        assert!(projection.warnings.is_empty());
+        assert_eq!(projection.messages.len(), 4);
     }
 
     #[test]
@@ -3132,6 +3300,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 AgentEvent::ApprovalRequest { .. } => "approval",
+                AgentEvent::CommandOutput(_) => "command_output",
                 AgentEvent::ToolStarted { .. } => "started",
                 AgentEvent::ToolFinished { .. } => "finished",
                 AgentEvent::ToolDenied { .. } => "denied",
