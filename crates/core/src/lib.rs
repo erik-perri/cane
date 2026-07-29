@@ -9,7 +9,10 @@ mod session;
 mod tools;
 mod workspace;
 
-pub use agent::{AgentHandle, AgentStartError, spawn_agent};
+pub use agent::{
+    AgentHandle, AgentShellConfig, AgentShellConfigError, AgentStartError, spawn_agent,
+    spawn_agent_with_shell,
+};
 pub use message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 pub use protocol::{
     AgentCommand, AgentEvent, ApprovalDecision, ApprovalGrant, ApprovalLifetime, ApprovalMatcher,

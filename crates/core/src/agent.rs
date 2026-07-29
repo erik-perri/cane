@@ -2,10 +2,15 @@ use crate::Workspace;
 use crate::approval::{
     ApprovalAuthorization, ApprovalCheck, ApprovalGate, ApprovalOutcome, request_approval,
 };
+use crate::command::{
+    CommandEnvironmentConfig, CommandExecutionMode, CommandExecutor, CommandSandboxPolicy,
+    SandboxFilesystemAccess,
+};
 use crate::journal::{
-    ApprovalId, ErrorDetail, JournalApprovalDecision, JournalEntry, JournalError, RunEndReason,
-    RunId, RunJournal, RunStarted, SessionId, SessionJournal, SessionStarted, ToolAuthorization,
-    TurnAbortOutcome, TurnCommitOutcome, TurnId,
+    ApprovalId, BoundaryEnforcement, ErrorDetail, FilesystemAccess, JournalApprovalDecision,
+    JournalEntry, JournalError, RunEndReason, RunId, RunJournal, RunStarted, SessionId,
+    SessionJournal, SessionStarted, ShellBoundaries, ShellExposedRoot, ShellMode, ShellPolicy,
+    ShellSandboxBackend, ToolAuthorization, TurnAbortOutcome, TurnCommitOutcome, TurnId,
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{
@@ -14,7 +19,9 @@ use crate::protocol::{
 };
 use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
-use crate::tools::{PreparedInvocation, ToolExecutionError, ToolExecutionOutput, ToolSet};
+use crate::tools::{
+    PreparedInvocation, ShellToolConfig, ToolExecutionError, ToolExecutionOutput, ToolSet,
+};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -43,6 +50,25 @@ pub struct AgentHandle {
     task: JoinHandle<()>,
 }
 
+pub struct AgentShellConfig {
+    environment: Option<CommandEnvironmentConfig>,
+    executor: Option<Arc<dyn CommandExecutor>>,
+    policy: ShellPolicy,
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum AgentShellConfigError {
+    #[error("shell executor mode mismatch: expected {expected:?}, executor reported {actual:?}")]
+    ExecutorMode {
+        actual: CommandExecutionMode,
+        expected: CommandExecutionMode,
+    },
+
+    #[error("shell exposed root is not valid UTF-8: '{}'", path.display())]
+    ExposedRootPath { path: PathBuf },
+}
+
 #[derive(Debug, Error)]
 pub enum AgentStartError {
     #[error(transparent)]
@@ -53,6 +79,150 @@ pub enum AgentStartError {
 
     #[error("workspace path is not valid UTF-8: '{}'", path.display())]
     WorkspacePath { path: PathBuf },
+
+    #[error(
+        "shell executor workspace '{}' does not match agent workspace '{}'",
+        configured.display(),
+        workspace.display()
+    )]
+    ShellWorkspace {
+        configured: PathBuf,
+        workspace: PathBuf,
+    },
+}
+
+impl AgentShellConfig {
+    pub fn disabled() -> Self {
+        Self {
+            environment: None,
+            executor: None,
+            policy: ShellPolicy {
+                backend: None,
+                boundaries: ShellBoundaries {
+                    environment: BoundaryEnforcement::NotApplicable,
+                    filesystem: BoundaryEnforcement::NotApplicable,
+                    network: BoundaryEnforcement::NotApplicable,
+                    process: BoundaryEnforcement::NotApplicable,
+                },
+                exposed_roots: Vec::new(),
+                mode: ShellMode::Disabled,
+            },
+            workspace: None,
+        }
+    }
+
+    pub fn sandboxed(
+        environment: CommandEnvironmentConfig,
+        executor: Arc<dyn CommandExecutor>,
+        backend_version: Option<String>,
+        policy: &CommandSandboxPolicy,
+    ) -> Result<Self, AgentShellConfigError> {
+        validate_executor_mode(executor.as_ref(), CommandExecutionMode::Sandboxed)?;
+
+        let exposed_roots =
+            policy
+                .grants()
+                .iter()
+                .map(|grant| {
+                    let path = grant.path.to_str().ok_or_else(|| {
+                        AgentShellConfigError::ExposedRootPath {
+                            path: grant.path.clone(),
+                        }
+                    })?;
+                    let access = match grant.access {
+                        SandboxFilesystemAccess::ReadOnly => FilesystemAccess::ReadOnly,
+                        SandboxFilesystemAccess::ReadWrite => FilesystemAccess::ReadWrite,
+                    };
+                    Ok(ShellExposedRoot {
+                        access,
+                        path: path.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, AgentShellConfigError>>()?;
+        let descriptor = executor.descriptor();
+
+        Ok(Self {
+            environment: Some(environment),
+            executor: Some(executor),
+            policy: ShellPolicy {
+                backend: Some(ShellSandboxBackend {
+                    name: descriptor.backend,
+                    version: backend_version,
+                }),
+                boundaries: ShellBoundaries {
+                    environment: enforced_boundary("constructed environment"),
+                    filesystem: enforced_boundary("Bubblewrap mount namespace"),
+                    network: enforced_boundary("network namespace"),
+                    process: enforced_boundary("PID namespace and process-group supervision"),
+                },
+                exposed_roots,
+                mode: ShellMode::Sandboxed,
+            },
+            workspace: Some(policy.workspace().to_path_buf()),
+        })
+    }
+
+    pub fn unsafe_host(
+        environment: CommandEnvironmentConfig,
+        executor: Arc<dyn CommandExecutor>,
+        workspace: PathBuf,
+    ) -> Result<Self, AgentShellConfigError> {
+        validate_executor_mode(executor.as_ref(), CommandExecutionMode::Unsafe)?;
+        let descriptor = executor.descriptor();
+
+        Ok(Self {
+            environment: Some(environment),
+            executor: Some(executor),
+            policy: ShellPolicy {
+                backend: Some(ShellSandboxBackend {
+                    name: descriptor.backend,
+                    version: None,
+                }),
+                boundaries: ShellBoundaries {
+                    environment: BoundaryEnforcement::Unrestricted,
+                    filesystem: BoundaryEnforcement::Unrestricted,
+                    network: BoundaryEnforcement::Unrestricted,
+                    process: enforced_boundary("process-group supervision"),
+                },
+                exposed_roots: Vec::new(),
+                mode: ShellMode::Unsafe,
+            },
+            workspace: Some(workspace),
+        })
+    }
+
+    pub fn policy(&self) -> &ShellPolicy {
+        &self.policy
+    }
+
+    fn into_parts(self) -> (Option<ShellToolConfig>, ShellPolicy, Option<PathBuf>) {
+        let shell = self
+            .environment
+            .zip(self.executor)
+            .map(|(environment, executor)| ShellToolConfig {
+                environment,
+                executor,
+            });
+
+        (shell, self.policy, self.workspace)
+    }
+}
+
+fn validate_executor_mode(
+    executor: &dyn CommandExecutor,
+    expected: CommandExecutionMode,
+) -> Result<(), AgentShellConfigError> {
+    let actual = executor.descriptor().mode;
+    if actual != expected {
+        return Err(AgentShellConfigError::ExecutorMode { actual, expected });
+    }
+    Ok(())
+}
+
+fn enforced_boundary(mechanism: &str) -> BoundaryEnforcement {
+    BoundaryEnforcement::Enforced {
+        mechanism: mechanism.to_string(),
+    }
 }
 
 #[derive(Default)]
@@ -121,6 +291,15 @@ pub async fn spawn_agent(
     workspace: Workspace,
     sessions: SessionConfig,
 ) -> Result<AgentHandle, AgentStartError> {
+    spawn_agent_with_shell(provider, workspace, sessions, AgentShellConfig::disabled()).await
+}
+
+pub async fn spawn_agent_with_shell(
+    provider: ProviderConfig,
+    workspace: Workspace,
+    sessions: SessionConfig,
+    shell: AgentShellConfig,
+) -> Result<AgentHandle, AgentStartError> {
     let workspace_path = workspace
         .root()
         .to_str()
@@ -135,7 +314,16 @@ pub async fn spawn_agent(
         provider.model.clone(),
         provider.max_tokens,
     )?;
-    let tool_set = ToolSet::new(Arc::new(workspace), None);
+    let (shell_tool, shell_policy, shell_workspace) = shell.into_parts();
+    if let Some(configured) = shell_workspace
+        && configured != workspace.root()
+    {
+        return Err(AgentStartError::ShellWorkspace {
+            configured,
+            workspace: workspace.root().to_path_buf(),
+        });
+    }
+    let tool_set = ToolSet::new(Arc::new(workspace), shell_tool);
     let session_id = SessionId::generate();
     let run_id = RunId::generate();
     let mut journal = SessionJournal::create(sessions.sessions_directory(), session_id).await?;
@@ -159,7 +347,7 @@ pub async fn spawn_agent(
             model: model.clone(),
             provider: provider_descriptor.clone(),
             run_id,
-            shell_policy: None,
+            shell_policy: Some(shell_policy),
             tool_catalog: tool_set.definitions().to_vec(),
         }))
         .await?;
@@ -911,6 +1099,29 @@ mod tests {
         executions: Arc<AtomicUsize>,
     }
 
+    struct StartupExecutor {
+        descriptor: crate::command::CommandExecutorDescriptor,
+    }
+
+    #[async_trait]
+    impl CommandExecutor for StartupExecutor {
+        fn descriptor(&self) -> crate::command::CommandExecutorDescriptor {
+            self.descriptor.clone()
+        }
+
+        async fn execute(
+            &self,
+            _cancel: CancellationToken,
+            _deadline: crate::command::CommandDeadline,
+            _output: crate::command::CommandOutputSender,
+            _request: crate::command::CommandRequest,
+        ) -> Result<crate::command::CommandResult, crate::command::CommandExecutionError> {
+            Err(crate::command::CommandExecutionError::Failed {
+                message: "startup test executor must not run".to_string(),
+            })
+        }
+    }
+
     #[async_trait]
     impl PreparedInvocation for CountingInvocation {
         fn approval_requirement(&self) -> ApprovalRequirement {
@@ -1108,6 +1319,44 @@ mod tests {
 
     fn test_workspace() -> Workspace {
         Workspace::new(std::env::temp_dir()).unwrap()
+    }
+
+    fn command_environment(path: &Path) -> CommandEnvironmentConfig {
+        CommandEnvironmentConfig::new(
+            "/home/cane",
+            vec![path.to_str().unwrap().to_string()],
+            "/tmp",
+        )
+        .unwrap()
+    }
+
+    fn sandbox_policy(root: &TempDir) -> CommandSandboxPolicy {
+        let runtime = root.path().join("runtime");
+        let runtime_bin = runtime.join("bin");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&runtime_bin).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        crate::command::build_command_sandbox_policy(crate::command::CommandSandboxPolicyConfig {
+            git_metadata_roots: Vec::new(),
+            inherited_path: vec![runtime_bin],
+            pass_through_roots: Vec::new(),
+            private_home: PathBuf::from("/home/cane"),
+            private_temp: PathBuf::from("/tmp"),
+            runtime_roots: vec![runtime],
+            toolchain_roots: Vec::new(),
+            workspace,
+        })
+        .unwrap()
+    }
+
+    fn startup_executor(mode: CommandExecutionMode) -> Arc<dyn CommandExecutor> {
+        Arc::new(StartupExecutor {
+            descriptor: crate::command::CommandExecutorDescriptor {
+                backend: "fake".to_string(),
+                mode,
+            },
+        })
     }
 
     async fn test_run_journal() -> (RunJournal, TempDir) {
@@ -1347,6 +1596,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["edit_file", "glob", "grep", "read_file", "write_file"]
         );
+        assert_eq!(
+            started.shell_policy,
+            Some(AgentShellConfig::disabled().policy().clone())
+        );
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "startup made a provider request"
@@ -1356,6 +1609,169 @@ mod tests {
             .await
             .expect("agent task did not join")
             .expect("agent task panicked");
+    }
+
+    #[tokio::test]
+    async fn enabled_shell_startup_registers_the_tool_and_records_its_policy() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let policy = sandbox_policy(&root);
+        let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let environment = command_environment(&policy.executable_path()[0]);
+        let shell = AgentShellConfig::sandboxed(
+            environment,
+            startup_executor(CommandExecutionMode::Sandboxed),
+            Some("fake 1.0".to_string()),
+            &policy,
+        )
+        .unwrap();
+        let expected_policy = shell.policy().clone();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path());
+
+        // Act
+        let handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
+            .await
+            .unwrap();
+        let contents = tokio::fs::read(handle.journal_path()).await.unwrap();
+        let records = parse_journal(&contents).unwrap();
+
+        // Assert
+        let JournalEntry::RunStarted(started) = &records[1].entry else {
+            panic!("expected run_started");
+        };
+        assert_eq!(started.shell_policy.as_ref(), Some(&expected_policy));
+        assert_eq!(
+            started
+                .tool_catalog
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "read_file",
+                "write_file",
+                "shell"
+            ]
+        );
+        assert_eq!(
+            expected_policy.backend,
+            Some(ShellSandboxBackend {
+                name: "fake".to_string(),
+                version: Some("fake 1.0".to_string()),
+            })
+        );
+        assert_eq!(expected_policy.mode, ShellMode::Sandboxed);
+
+        timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("agent task did not join")
+            .expect("agent task panicked");
+    }
+
+    #[test]
+    fn shell_config_rejects_an_executor_with_the_wrong_mode() {
+        // Arrange
+        let root = TempDir::new().unwrap();
+        let policy = sandbox_policy(&root);
+        let environment = command_environment(&policy.executable_path()[0]);
+
+        // Act
+        let result = AgentShellConfig::sandboxed(
+            environment,
+            startup_executor(CommandExecutionMode::Unsafe),
+            None,
+            &policy,
+        );
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(AgentShellConfigError::ExecutorMode {
+                actual: CommandExecutionMode::Unsafe,
+                expected: CommandExecutionMode::Sandboxed,
+            })
+        ));
+    }
+
+    #[test]
+    fn unsafe_shell_config_records_unrestricted_host_boundaries() {
+        // Arrange
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().to_path_buf();
+        let environment =
+            CommandEnvironmentConfig::new("/home/cane", vec!["/usr/bin".to_string()], "/tmp")
+                .unwrap();
+
+        // Act
+        let shell = AgentShellConfig::unsafe_host(
+            environment,
+            startup_executor(CommandExecutionMode::Unsafe),
+            workspace,
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(shell.policy().mode, ShellMode::Unsafe);
+        assert_eq!(
+            shell.policy().backend,
+            Some(ShellSandboxBackend {
+                name: "fake".to_string(),
+                version: None,
+            })
+        );
+        assert_eq!(
+            shell.policy().boundaries.environment,
+            BoundaryEnforcement::Unrestricted
+        );
+        assert_eq!(
+            shell.policy().boundaries.filesystem,
+            BoundaryEnforcement::Unrestricted
+        );
+        assert_eq!(
+            shell.policy().boundaries.network,
+            BoundaryEnforcement::Unrestricted
+        );
+        assert!(shell.policy().exposed_roots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_startup_rejects_a_workspace_mismatch_before_journal_creation() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions_root = TempDir::new().unwrap();
+        let sessions = sessions_root.path().join("sessions");
+        let policy_root = TempDir::new().unwrap();
+        let policy = sandbox_policy(&policy_root);
+        let other_workspace_root = TempDir::new().unwrap();
+        let workspace = Workspace::new(other_workspace_root.path().to_path_buf()).unwrap();
+        let expected_workspace = workspace.root().to_path_buf();
+        let environment = command_environment(&policy.executable_path()[0]);
+        let shell = AgentShellConfig::sandboxed(
+            environment,
+            startup_executor(CommandExecutionMode::Sandboxed),
+            None,
+            &policy,
+        )
+        .unwrap();
+        let configured_workspace = policy.workspace().to_path_buf();
+        let config = SessionConfig::new("test-cane-version", "", &sessions);
+
+        // Act
+        let result = spawn_agent_with_shell(test_provider(&server), workspace, config, shell).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(AgentStartError::ShellWorkspace {
+                configured,
+                workspace,
+            }) if configured == configured_workspace && workspace == expected_workspace
+        ));
+        assert!(!sessions.exists());
     }
 
     #[tokio::test]
