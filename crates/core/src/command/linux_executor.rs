@@ -804,10 +804,13 @@ mod tests {
     async fn resetting_the_deadline_extends_a_running_execution() {
         // Arrange
         let fixture = fixture();
-        let request = request(&fixture.workspace, "/bin/sleep 0.3; printf 'completed'");
-        let deadline = CommandDeadline::after(Duration::from_millis(200));
+        let request = request(
+            &fixture.workspace,
+            "printf 'started'; /bin/sleep 1.2; printf 'completed'",
+        );
+        let deadline = CommandDeadline::after(Duration::from_secs(5));
         let extension = deadline.clone();
-        let (preview_tx, _preview_rx) = mpsc::channel(1);
+        let (preview_tx, mut preview_rx) = mpsc::channel(1);
 
         // Act
         let execution =
@@ -815,8 +818,14 @@ mod tests {
                 .executor
                 .execute(CancellationToken::new(), deadline, preview_tx, request);
         let extend = async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let started = tokio::time::timeout(Duration::from_secs(5), preview_rx.recv())
+                .await
+                .expect("command did not start before the test timeout")
+                .expect("command output closed before the start marker");
+            assert_eq!(started, CommandOutputChunk::stdout(b"started".to_vec()));
             extension.reset_after(Duration::from_secs(1));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            extension.reset_after(Duration::from_secs(2));
         };
         let (result, ()) = tokio::join!(execution, extend);
 
