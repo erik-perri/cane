@@ -322,13 +322,15 @@ pub async fn spawn_agent_with_shell(
     let (events_tx, events_rx) = mpsc::channel(64);
     let events = EventSink::new(events_tx);
     let (shell_tool, shell_policy, shell_workspace) = shell.into_parts(events.clone());
-    if let Some(configured) = shell_workspace
-        && configured != workspace.root()
-    {
-        return Err(AgentStartError::ShellWorkspace {
-            configured,
-            workspace: workspace.root().to_path_buf(),
-        });
+    if let Some(configured) = shell_workspace {
+        let matches_workspace =
+            dunce::canonicalize(&configured).is_ok_and(|canonical| canonical == workspace.root());
+        if !matches_workspace {
+            return Err(AgentStartError::ShellWorkspace {
+                configured,
+                workspace: workspace.root().to_path_buf(),
+            });
+        }
     }
     let tool_set = ToolSet::new(Arc::new(workspace), shell_tool);
     let session_id = SessionId::generate();
@@ -1354,16 +1356,18 @@ mod tests {
         Workspace::new(std::env::temp_dir()).unwrap()
     }
 
-    fn command_environment(path: &Path) -> CommandEnvironmentConfig {
+    fn command_environment() -> CommandEnvironmentConfig {
         CommandEnvironmentConfig::new(
-            "/home/cane",
-            vec![path.to_str().unwrap().to_string()],
-            "/tmp",
+            "/sandbox/home",
+            vec!["/sandbox/bin".to_string()],
+            "/sandbox/temp",
         )
         .unwrap()
     }
 
     fn sandbox_policy(root: &TempDir) -> CommandSandboxPolicy {
+        let private_home = root.path().join("private-home");
+        let private_temp = root.path().join("private-temp");
         let runtime = root.path().join("runtime");
         let runtime_bin = runtime.join("bin");
         let workspace = root.path().join("workspace");
@@ -1374,8 +1378,8 @@ mod tests {
             git_metadata_roots: Vec::new(),
             inherited_path: vec![runtime_bin],
             pass_through_roots: Vec::new(),
-            private_home: PathBuf::from("/home/cane"),
-            private_temp: PathBuf::from("/tmp"),
+            private_home,
+            private_temp,
             runtime_roots: vec![runtime],
             toolchain_roots: Vec::new(),
             workspace,
@@ -1653,7 +1657,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let policy = sandbox_policy(&root);
         let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
-        let environment = command_environment(&policy.executable_path()[0]);
+        let environment = command_environment();
         let shell = AgentShellConfig::sandboxed(
             environment,
             startup_executor(CommandExecutionMode::Sandboxed),
@@ -1722,7 +1726,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let policy = sandbox_policy(&root);
         let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
-        let environment = command_environment(&policy.executable_path()[0]);
+        let environment = command_environment();
         let result = crate::command::CommandResult {
             output: crate::command::CapturedOutput::complete(vec![
                 crate::command::CommandOutputChunk::stderr(b"compile failed\n".to_vec()),
@@ -1845,7 +1849,7 @@ mod tests {
         // Arrange
         let root = TempDir::new().unwrap();
         let policy = sandbox_policy(&root);
-        let environment = command_environment(&policy.executable_path()[0]);
+        let environment = command_environment();
 
         // Act
         let result = AgentShellConfig::sandboxed(
@@ -1907,6 +1911,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_startup_accepts_an_equivalent_workspace_spelling() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let configured_workspace = workspace_root.join("..").join("workspace");
+        let workspace = Workspace::new(workspace_root).unwrap();
+        let shell = AgentShellConfig::unsafe_host(
+            command_environment(),
+            startup_executor(CommandExecutionMode::Unsafe),
+            configured_workspace,
+        )
+        .unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path());
+
+        // Act
+        let handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "startup made a provider request"
+        );
+        timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("agent task did not join")
+            .expect("agent task panicked");
+    }
+
+    #[tokio::test]
     async fn shell_startup_rejects_a_workspace_mismatch_before_journal_creation() {
         // Arrange
         let server = MockServer::start().await;
@@ -1917,7 +1955,7 @@ mod tests {
         let other_workspace_root = TempDir::new().unwrap();
         let workspace = Workspace::new(other_workspace_root.path().to_path_buf()).unwrap();
         let expected_workspace = workspace.root().to_path_buf();
-        let environment = command_environment(&policy.executable_path()[0]);
+        let environment = command_environment();
         let shell = AgentShellConfig::sandboxed(
             environment,
             startup_executor(CommandExecutionMode::Sandboxed),

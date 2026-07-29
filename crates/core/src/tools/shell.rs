@@ -332,7 +332,7 @@ mod tests {
             )]),
             termination: CommandTermination::Exited { code: 2 },
         };
-        let (root, tool, executor, _events) = shell_tool(Ok(result));
+        let (_root, tool, executor, _events) = shell_tool(Ok(result));
         let input = serde_json::json!({
             "command": "cargo check",
             "timeout_seconds": 30
@@ -351,7 +351,7 @@ mod tests {
         let observations = executor.observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
         assert!(!observations[0].cancelled);
-        assert_eq!(observations[0].request.workdir, root.path());
+        assert_eq!(observations[0].request.workdir, tool.workspace.root());
         assert_eq!(observations[0].request.executable, "/bin/bash");
         assert_eq!(
             observations[0].request.arguments,
