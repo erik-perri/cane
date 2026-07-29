@@ -1,6 +1,7 @@
 mod classify;
 mod deadline;
 mod diagnostics;
+mod docker;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -14,6 +15,7 @@ pub use diagnostics::{
     DiagnosticImportance, DiagnosticStatus, SandboxDiagnosticFinding, SandboxDiagnosticInput,
     SandboxDiagnosticReport, diagnose_sandbox,
 };
+pub use docker::{DockerEndpoint, DockerEndpointError};
 #[cfg(target_os = "linux")]
 pub use linux::{
     BubblewrapInstallation, BubblewrapResolutionError, LinuxSandboxOperation, LinuxSandboxPlan,

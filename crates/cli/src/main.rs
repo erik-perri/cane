@@ -150,7 +150,8 @@ fn sandbox_diagnostic_input(
     let docker_endpoint = discover_docker_endpoint(
         std::env::var_os("DOCKER_HOST"),
         std::env::var_os("XDG_RUNTIME_DIR"),
-    );
+    )
+    .map(|endpoint| endpoint.path().to_path_buf());
     cane_core::command::SandboxDiagnosticInput {
         docker_endpoint,
         inherited_path,
@@ -331,24 +332,33 @@ fn user_executable_roots(home: &Path) -> Vec<PathBuf> {
 fn discover_docker_endpoint(
     docker_host: Option<OsString>,
     xdg_runtime_directory: Option<OsString>,
-) -> Option<PathBuf> {
+) -> Option<cane_core::command::DockerEndpoint> {
+    discover_docker_endpoint_from(
+        docker_host,
+        xdg_runtime_directory,
+        Path::new("/var/run/docker.sock"),
+    )
+}
+
+fn discover_docker_endpoint_from(
+    docker_host: Option<OsString>,
+    xdg_runtime_directory: Option<OsString>,
+    system_socket: &Path,
+) -> Option<cane_core::command::DockerEndpoint> {
     if let Some(docker_host) = docker_host.and_then(|value| value.into_string().ok())
         && let Some(path) = docker_host.strip_prefix("unix://")
+        && let Ok(endpoint) = cane_core::command::DockerEndpoint::validate(path)
     {
-        let path = PathBuf::from(path);
-        if path.is_absolute() {
-            return Some(path);
-        }
+        return Some(endpoint);
     }
 
-    let system_socket = PathBuf::from("/var/run/docker.sock");
-    if system_socket.exists() {
-        return Some(system_socket);
+    if let Ok(endpoint) = cane_core::command::DockerEndpoint::validate(system_socket) {
+        return Some(endpoint);
     }
 
     non_empty_path(xdg_runtime_directory)
         .map(|directory| directory.join("docker.sock"))
-        .filter(|path| path.exists())
+        .and_then(|path| cane_core::command::DockerEndpoint::validate(path).ok())
 }
 
 fn resolve_cane_home(cane_home: Option<OsString>, user_home: Option<OsString>) -> Option<PathBuf> {
@@ -362,6 +372,8 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs;
 
     #[test]
     fn cane_home_overrides_the_platform_home_directory() {
@@ -506,23 +518,69 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn docker_discovery_accepts_only_absolute_unix_endpoints_from_the_environment() {
+    fn docker_discovery_validates_and_canonicalizes_unix_endpoints_from_the_environment() {
         // Arrange
-        let unix = Some(OsString::from("unix:///run/user/1000/docker.sock"));
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let socket = root.path().join("daemon.sock");
+        let link = root.path().join("docker.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        symlink(&socket, &link).unwrap();
+        let unix = Some(OsString::from(format!("unix://{}", link.display())));
         let tcp = Some(OsString::from("tcp://localhost:2375"));
         let relative = Some(OsString::from("unix://docker.sock"));
+        let missing_system_socket = root.path().join("system.sock");
 
         // Act
-        let unix_endpoint = discover_docker_endpoint(unix, None);
-        let tcp_endpoint = discover_docker_endpoint(tcp, None);
-        let relative_endpoint = discover_docker_endpoint(relative, None);
+        let unix_endpoint = discover_docker_endpoint_from(unix, None, &missing_system_socket);
+        let tcp_endpoint = discover_docker_endpoint_from(tcp, None, &missing_system_socket);
+        let relative_endpoint =
+            discover_docker_endpoint_from(relative, None, &missing_system_socket);
 
         // Assert
         assert_eq!(
-            unix_endpoint,
-            Some(PathBuf::from("/run/user/1000/docker.sock"))
+            unix_endpoint.unwrap().path(),
+            fs::canonicalize(socket).unwrap()
         );
-        assert_ne!(tcp_endpoint, Some(PathBuf::from("localhost:2375")));
-        assert_ne!(relative_endpoint, Some(PathBuf::from("docker.sock")));
+        assert_eq!(tcp_endpoint, None);
+        assert_eq!(relative_endpoint, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_discovery_falls_back_to_system_then_rootless_sockets() {
+        // Arrange
+        use std::os::unix::net::UnixListener;
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let system_socket = root.path().join("system.sock");
+        let missing_system_socket = root.path().join("missing-system.sock");
+        let runtime_directory = root.path().join("runtime");
+        fs::create_dir(&runtime_directory).unwrap();
+        let rootless_socket = runtime_directory.join("docker.sock");
+        let _system_listener = UnixListener::bind(&system_socket).unwrap();
+        let _rootless_listener = UnixListener::bind(&rootless_socket).unwrap();
+
+        // Act
+        let system = discover_docker_endpoint_from(
+            Some(OsString::from("tcp://localhost:2375")),
+            Some(runtime_directory.clone().into_os_string()),
+            &system_socket,
+        )
+        .unwrap();
+        let rootless = discover_docker_endpoint_from(
+            None,
+            Some(runtime_directory.into_os_string()),
+            &missing_system_socket,
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(system.path(), fs::canonicalize(system_socket).unwrap());
+        assert_eq!(rootless.path(), fs::canonicalize(rootless_socket).unwrap());
     }
 }
