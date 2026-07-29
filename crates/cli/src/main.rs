@@ -72,8 +72,7 @@ async fn main() -> anyhow::Result<()> {
     .context("could not locate Cane's home directory")?;
     let sessions_directory = cane_home.join("sessions");
     let shell = configure_shell(shell_mode, &workspace)?;
-    let instructions = resolved_instructions(shell.policy());
-    let sessions = cane_core::SessionConfig::new(CANE_VERSION, instructions, sessions_directory);
+    let sessions = cane_core::SessionConfig::new(CANE_VERSION, "", sessions_directory);
 
     if shell_mode == CliShellMode::Unsafe {
         eprintln!("{}", unsafe_shell_warning());
@@ -139,6 +138,17 @@ fn run_doctor() -> anyhow::Result<bool> {
 fn sandbox_diagnostic_input(
     workspace: &cane_core::Workspace,
 ) -> cane_core::command::SandboxDiagnosticInput {
+    let docker_endpoint = discover_docker_endpoint(
+        std::env::var_os("DOCKER_HOST"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    );
+    sandbox_diagnostic_input_with_docker(workspace, docker_endpoint.as_ref())
+}
+
+fn sandbox_diagnostic_input_with_docker(
+    workspace: &cane_core::Workspace,
+    docker_endpoint: Option<&cane_core::command::DockerEndpoint>,
+) -> cane_core::command::SandboxDiagnosticInput {
     let inherited_path = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
@@ -147,13 +157,8 @@ fn sandbox_diagnostic_input(
         .as_deref()
         .map(user_executable_roots)
         .unwrap_or_default();
-    let docker_endpoint = discover_docker_endpoint(
-        std::env::var_os("DOCKER_HOST"),
-        std::env::var_os("XDG_RUNTIME_DIR"),
-    )
-    .map(|endpoint| endpoint.path().to_path_buf());
     cane_core::command::SandboxDiagnosticInput {
-        docker_endpoint,
+        docker_endpoint: docker_endpoint.map(|endpoint| endpoint.path().to_path_buf()),
         inherited_path,
         pass_through_roots,
         toolchain_roots: Vec::new(),
@@ -169,8 +174,12 @@ fn configure_shell(
     match mode {
         CliShellMode::Disabled => Ok(cane_core::AgentShellConfig::disabled()),
         CliShellMode::Sandboxed => {
+            let docker_endpoint = discover_docker_endpoint(
+                std::env::var_os("DOCKER_HOST"),
+                std::env::var_os("XDG_RUNTIME_DIR"),
+            );
             let (executor, report) = cane_core::command::establish_bubblewrap_executor(
-                sandbox_diagnostic_input(workspace),
+                sandbox_diagnostic_input_with_docker(workspace, docker_endpoint.as_ref()),
             )
             .map_err(|report| {
                 anyhow::anyhow!(
@@ -194,18 +203,34 @@ fn configure_shell(
                 report.bubblewrap_version.clone(),
                 policy,
             )
+            .map(|config| match docker_endpoint {
+                Some(endpoint) => {
+                    config.with_integration(cane_core::ShellIntegration::Docker(endpoint))
+                }
+                None => config,
+            })
             .map_err(Into::into)
         }
         CliShellMode::Unsafe => {
             let environment =
                 command_environment(Path::new("/tmp"), &unsafe_visible_path(), Path::new("/tmp"))?;
             let executor = cane_core::command::UnsafeExecutor::new(workspace.root().to_path_buf());
+            let docker_endpoint = discover_docker_endpoint(
+                std::env::var_os("DOCKER_HOST"),
+                std::env::var_os("XDG_RUNTIME_DIR"),
+            );
 
             cane_core::AgentShellConfig::unsafe_host(
                 environment,
                 Arc::new(executor),
                 workspace.root().to_path_buf(),
             )
+            .map(|config| match docker_endpoint {
+                Some(endpoint) => {
+                    config.with_integration(cane_core::ShellIntegration::Docker(endpoint))
+                }
+                None => config,
+            })
             .map_err(Into::into)
         }
     }
@@ -284,36 +309,6 @@ fn unsafe_visible_path() -> Vec<PathBuf> {
         );
     }
     visible
-}
-
-fn resolved_instructions(policy: &cane_core::journal::ShellPolicy) -> String {
-    use cane_core::journal::ShellMode;
-
-    match policy.mode {
-        ShellMode::Disabled => {
-            "No shell tool is available. Use the native workspace tools for file operations."
-                .to_string()
-        }
-        ShellMode::Sandboxed => "A shell tool is available on Linux. It runs the exact command \
-            with `/bin/bash --noprofile --norc -c` in a fresh process. Its default working \
-            directory is the workspace root; `workdir` must be relative to that workspace, and \
-            `cd` does not persist between calls. Every command requires one-time user approval. \
-            `timeout_seconds` defaults to 600 and must be between 1 and 1800. Commands receive a \
-            clean constructed environment, private home and temporary directories, read/write \
-            workspace access, read-only Git metadata and execution dependencies, no external \
-            network or host-local service access, and complete process-tree cleanup. Git metadata \
-            mutation must fail. Docker daemon access is not available."
-            .to_string(),
-        ShellMode::Unsafe => "An unsafe shell tool is available on Linux. It runs the exact \
-            command with `/bin/bash --noprofile --norc -c` in a fresh host process. Its default \
-            working directory is the workspace root; `workdir` must be relative to that \
-            workspace, and `cd` does not persist between calls. Every command requires one-time \
-            user approval. `timeout_seconds` defaults to 600 and must be between 1 and 1800. The \
-            child receives a clean constructed environment and process-group supervision, but \
-            filesystem, credential-store, host IPC, localhost, and external network access are \
-            not sandboxed. Docker daemon access is not automatically provided."
-            .to_string(),
-    }
 }
 
 fn unsafe_shell_warning() -> &'static str {
@@ -477,43 +472,15 @@ mod tests {
     }
 
     #[test]
-    fn resolved_shell_instructions_state_the_command_contract_and_boundaries() {
+    fn unsafe_shell_warning_states_the_host_risk() {
         // Arrange
-        let disabled = cane_core::AgentShellConfig::disabled();
-        let sandboxed = shell_policy(cane_core::journal::ShellMode::Sandboxed);
-        let unsafe_host = shell_policy(cane_core::journal::ShellMode::Unsafe);
+        let expected_risk = "unsandboxed host processes";
 
         // Act
-        let disabled_instructions = resolved_instructions(disabled.policy());
-        let sandboxed_instructions = resolved_instructions(&sandboxed);
-        let unsafe_instructions = resolved_instructions(&unsafe_host);
+        let warning = unsafe_shell_warning();
 
         // Assert
-        assert!(disabled_instructions.contains("No shell tool is available"));
-        for instructions in [&sandboxed_instructions, &unsafe_instructions] {
-            assert!(instructions.contains("`/bin/bash --noprofile --norc -c`"));
-            assert!(instructions.contains("one-time user approval"));
-            assert!(instructions.contains("defaults to 600"));
-            assert!(instructions.contains("between 1 and 1800"));
-            assert!(instructions.contains("`cd` does not persist"));
-        }
-        assert!(sandboxed_instructions.contains("no external network"));
-        assert!(unsafe_instructions.contains("not sandboxed"));
-        assert!(unsafe_shell_warning().contains("unsandboxed host processes"));
-    }
-
-    fn shell_policy(mode: cane_core::journal::ShellMode) -> cane_core::journal::ShellPolicy {
-        cane_core::journal::ShellPolicy {
-            backend: None,
-            boundaries: cane_core::journal::ShellBoundaries {
-                environment: cane_core::journal::BoundaryEnforcement::NotApplicable,
-                filesystem: cane_core::journal::BoundaryEnforcement::NotApplicable,
-                network: cane_core::journal::BoundaryEnforcement::NotApplicable,
-                process: cane_core::journal::BoundaryEnforcement::NotApplicable,
-            },
-            exposed_roots: Vec::new(),
-            mode,
-        }
+        assert!(warning.contains(expected_risk));
     }
 
     #[cfg(unix)]

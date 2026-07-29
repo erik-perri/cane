@@ -211,6 +211,49 @@ mod tests {
     }
 
     #[test]
+    fn run_capability_approvals_follow_the_exact_resource_across_tool_calls() {
+        // Arrange
+        let mut gate = ApprovalGate::new();
+        let capability = crate::NamedCapability::docker_daemon("unix:///run/user/1000/docker.sock");
+        let approved_subject = ApprovalSubject::capability(capability.clone(), "shell-1", "shell");
+        let run_grant = approved_subject.grant(ApprovalLifetime::Run);
+        let decision = ApprovalDecision::Grant(run_grant.clone());
+        let outcome = gate.apply_decision(
+            &[ApprovalLifetime::Run],
+            approval_id(),
+            &decision,
+            &approved_subject,
+        );
+        let same_endpoint = ApprovalSubject::capability(capability, "shell-2", "shell");
+        let changed_endpoint = ApprovalSubject::capability(
+            crate::NamedCapability::docker_daemon("unix:///var/run/docker.sock"),
+            "shell-3",
+            "shell",
+        );
+
+        // Act
+        let reused = gate.check(ApprovalRequirement::Required, &same_endpoint);
+        let changed = gate.check(ApprovalRequirement::Required, &changed_endpoint);
+
+        // Assert
+        assert_eq!(
+            outcome,
+            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
+                approval_id: approval_id(),
+                grant: run_grant.clone(),
+            })
+        );
+        assert_eq!(
+            reused,
+            ApprovalCheck::Authorized(ApprovalAuthorization::Granted {
+                approval_id: approval_id(),
+                grant: run_grant,
+            })
+        );
+        assert_eq!(changed, ApprovalCheck::RequiresDecision);
+    }
+
+    #[test]
     fn applying_decisions_preserves_the_authorizing_approval() {
         // Arrange
         let mut gate = ApprovalGate::new();

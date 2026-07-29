@@ -1,7 +1,7 @@
 use anyhow::Context;
 use cane_core::{
     AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, ApprovalLifetime, ApprovalSubject,
-    ShutdownReason, TurnOutcome,
+    CapabilityKind, ShutdownReason, TurnOutcome,
 };
 use std::io::{BufRead, Write};
 use tokio::sync::mpsc;
@@ -205,6 +205,9 @@ async fn run_with_input(
                     subject,
                 } => {
                     let options = approval_options(&available_lifetimes);
+                    if let Some(notice) = capability_notice(&subject) {
+                        writeln!(output, "\n{notice}")?;
+                    }
                     writeln!(
                         output,
                         "\n[approval request: {} {command_input}] {options}",
@@ -236,6 +239,20 @@ async fn run_with_input(
     }
 
     Ok(())
+}
+
+fn capability_notice(subject: &ApprovalSubject) -> Option<String> {
+    let ApprovalSubject::Capability { capability, .. } = subject else {
+        return None;
+    };
+    match capability.kind() {
+        CapabilityKind::DockerDaemon => Some(format!(
+            "WARNING: Docker daemon access can mount arbitrary host paths, use external networks, \
+             and create persistent host effects. The command sandbox does not make Docker safe, \
+             and containers may outlive this command or Cane. Endpoint: {}",
+            capability.resource()
+        )),
+    }
 }
 
 async fn read_decision(
@@ -791,6 +808,27 @@ mod tests {
 
         // Assert
         assert_eq!(options, "[n,a,w]");
+    }
+
+    #[test]
+    fn docker_capability_notice_states_the_host_authority_and_persistence_risks() {
+        // Arrange
+        let subject = ApprovalSubject::capability(
+            cane_core::NamedCapability::docker_daemon("unix:///run/user/1000/docker.sock"),
+            "shell-1",
+            "shell",
+        );
+
+        // Act
+        let notice = capability_notice(&subject).unwrap();
+
+        // Assert
+        assert!(notice.contains("mount arbitrary host paths"));
+        assert!(notice.contains("external networks"));
+        assert!(notice.contains("persistent host effects"));
+        assert!(notice.contains("does not make Docker safe"));
+        assert!(notice.contains("containers may outlive"));
+        assert!(notice.contains("unix:///run/user/1000/docker.sock"));
     }
 
     #[tokio::test]

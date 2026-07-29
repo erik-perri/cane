@@ -7,20 +7,22 @@ use crate::command::{
     SandboxFilesystemAccess,
 };
 use crate::journal::{
-    ApprovalId, BoundaryEnforcement, ErrorDetail, FilesystemAccess, JournalApprovalDecision,
-    JournalEntry, JournalError, RunEndReason, RunId, RunJournal, RunStarted, SessionId,
-    SessionJournal, SessionStarted, ShellBoundaries, ShellExposedRoot, ShellMode, ShellPolicy,
-    ShellSandboxBackend, ToolAuthorization, TurnAbortOutcome, TurnCommitOutcome, TurnId,
+    ApprovalId, BoundaryEnforcement, CapabilityAuthorizationSource, ErrorDetail, FilesystemAccess,
+    JournalApprovalDecision, JournalEntry, JournalError, RunEndReason, RunId, RunJournal,
+    RunStarted, SessionId, SessionJournal, SessionStarted, ShellBoundaries, ShellExposedRoot,
+    ShellMode, ShellPolicy, ShellSandboxBackend, ToolAuthorization, TurnAbortOutcome,
+    TurnCommitOutcome, TurnId,
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{
-    AgentCommand, AgentEvent, AgentExit, ApprovalSubject, EventSink, HostHandle, ShutdownReason,
-    TurnOutcome,
+    AgentCommand, AgentEvent, AgentExit, ApprovalRequirement, ApprovalSubject, EventSink,
+    HostHandle, ShutdownReason, TurnOutcome,
 };
 use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
 use crate::tools::{
-    PreparedInvocation, ShellToolConfig, ToolExecutionError, ToolExecutionOutput, ToolSet,
+    AuthorizedCapability, PreparedInvocation, ShellIntegration, ShellIntegrations, ShellToolConfig,
+    ToolExecutionError, ToolExecutionOutput, ToolSet,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -53,6 +55,7 @@ pub struct AgentHandle {
 pub struct AgentShellConfig {
     environment: Option<CommandEnvironmentConfig>,
     executor: Option<Arc<dyn CommandExecutor>>,
+    integrations: ShellIntegrations,
     policy: ShellPolicy,
     workspace: Option<PathBuf>,
 }
@@ -96,6 +99,7 @@ impl AgentShellConfig {
         Self {
             environment: None,
             executor: None,
+            integrations: ShellIntegrations::default(),
             policy: ShellPolicy {
                 backend: None,
                 boundaries: ShellBoundaries {
@@ -144,6 +148,7 @@ impl AgentShellConfig {
         Ok(Self {
             environment: Some(environment),
             executor: Some(executor),
+            integrations: ShellIntegrations::default(),
             policy: ShellPolicy {
                 backend: Some(ShellSandboxBackend {
                     name: descriptor.backend,
@@ -173,6 +178,7 @@ impl AgentShellConfig {
         Ok(Self {
             environment: Some(environment),
             executor: Some(executor),
+            integrations: ShellIntegrations::default(),
             policy: ShellPolicy {
                 backend: Some(ShellSandboxBackend {
                     name: descriptor.backend,
@@ -195,6 +201,11 @@ impl AgentShellConfig {
         &self.policy
     }
 
+    pub fn with_integration(mut self, integration: ShellIntegration) -> Self {
+        self.integrations.insert(integration);
+        self
+    }
+
     fn into_parts(
         self,
         events: EventSink,
@@ -206,6 +217,7 @@ impl AgentShellConfig {
                 environment,
                 events,
                 executor,
+                integrations: self.integrations,
             });
 
         (shell, self.policy, self.workspace)
@@ -757,7 +769,7 @@ impl AgentSession {
         input: &Value,
         gate: &mut ApprovalGate,
     ) -> Result<ToolResultData, AgentExit> {
-        let invocation = match prepare_tool_call(&self.tool_set, id, name, input).await {
+        let mut invocation = match prepare_tool_call(&self.tool_set, id, name, input).await {
             Ok(invocation) => invocation,
             Err(result) => {
                 self.journal
@@ -774,68 +786,75 @@ impl AgentSession {
             }
         };
 
-        let subject = ApprovalSubject::tool_call(id, name);
-        let available_lifetimes = invocation.available_grant_lifetimes().to_vec();
-        let authorization = match gate.check(invocation.approval_requirement(), &subject) {
-            ApprovalCheck::Authorized(authorization) => authorization,
-            ApprovalCheck::RequiresDecision => {
-                let approval_id = ApprovalId::generate();
-                self.journal
-                    .approval_requested(
-                        approval_id,
-                        available_lifetimes.clone(),
-                        subject.clone(),
-                        turn_id,
-                    )
-                    .await?;
-                let decision = request_approval(
-                    available_lifetimes.clone(),
+        if let Some(request) = invocation.capability_request() {
+            let subject = ApprovalSubject::capability(request.capability.clone(), id, name);
+            let outcome = self
+                .authorize_subject(
+                    turn_id,
                     input,
-                    subject.clone(),
-                    &self.host_handle.events,
-                    &self.host_handle.cancel,
+                    gate,
+                    ApprovalRequirement::Required,
+                    request.available_lifetimes,
+                    subject,
                 )
                 .await?;
-
-                match gate.apply_decision(&available_lifetimes, approval_id, &decision, &subject) {
-                    ApprovalOutcome::Authorized(authorization) => {
-                        self.journal
-                            .approval_decided(approval_id, journal_approval_decision(&decision))
-                            .await?;
-                        authorization
-                    }
-                    ApprovalOutcome::Denied { reason } => {
-                        self.journal
-                            .approval_decided(approval_id, journal_approval_decision(&decision))
-                            .await?;
-                        self.journal
-                            .tool_rejected("approval_denied", id, name, turn_id)
-                            .await?;
-                        self.host_handle
-                            .events
-                            .emit(AgentEvent::ToolDenied {
-                                name: name.to_string(),
-                                reason: reason.to_string(),
-                            })
-                            .await?;
-
-                        return Ok(denied_tool_result(id, &reason));
-                    }
-                    ApprovalOutcome::InvalidGrant { reason } => {
-                        self.journal
-                            .tool_rejected("invalid_approval_grant", id, name, turn_id)
-                            .await?;
-                        self.host_handle
-                            .events
-                            .emit(AgentEvent::ToolRejected {
-                                error: reason.clone(),
-                                name: name.to_string(),
-                            })
-                            .await?;
-
-                        return Ok(failed_tool_result(id, reason));
-                    }
+            let authorization = match outcome {
+                ApprovalOutcome::Authorized(authorization) => authorization,
+                ApprovalOutcome::Denied { reason } => {
+                    self.reject_denied_tool(turn_id, id, name, &reason, "capability_denied")
+                        .await?;
+                    return Ok(denied_tool_result(id, &reason));
                 }
+                ApprovalOutcome::InvalidGrant { reason } => {
+                    self.reject_invalid_grant(turn_id, id, name, &reason)
+                        .await?;
+                    return Ok(failed_tool_result(id, reason));
+                }
+            };
+            let ApprovalAuthorization::Granted { approval_id, .. } = authorization else {
+                unreachable!("required capability approval cannot be not-required")
+            };
+            if let Err(reason) = invocation.authorize_capability(AuthorizedCapability {
+                capability: request.capability,
+                source: CapabilityAuthorizationSource::Approval { approval_id },
+            }) {
+                self.journal
+                    .tool_rejected("capability_authorization_failed", id, name, turn_id)
+                    .await?;
+                self.host_handle
+                    .events
+                    .emit(AgentEvent::ToolRejected {
+                        error: reason.clone(),
+                        name: name.to_string(),
+                    })
+                    .await?;
+                return Ok(failed_tool_result(id, reason));
+            }
+        }
+
+        let subject = ApprovalSubject::tool_call(id, name);
+        let available_lifetimes = invocation.available_grant_lifetimes().to_vec();
+        let authorization = match self
+            .authorize_subject(
+                turn_id,
+                input,
+                gate,
+                invocation.approval_requirement(),
+                &available_lifetimes,
+                subject,
+            )
+            .await?
+        {
+            ApprovalOutcome::Authorized(authorization) => authorization,
+            ApprovalOutcome::Denied { reason } => {
+                self.reject_denied_tool(turn_id, id, name, &reason, "approval_denied")
+                    .await?;
+                return Ok(denied_tool_result(id, &reason));
+            }
+            ApprovalOutcome::InvalidGrant { reason } => {
+                self.reject_invalid_grant(turn_id, id, name, &reason)
+                    .await?;
+                return Ok(failed_tool_result(id, reason));
             }
         };
 
@@ -859,6 +878,89 @@ impl AgentSession {
             invocation,
         )
         .await
+    }
+
+    async fn authorize_subject(
+        &mut self,
+        turn_id: TurnId,
+        input: &Value,
+        gate: &mut ApprovalGate,
+        requirement: ApprovalRequirement,
+        available_lifetimes: &[crate::ApprovalLifetime],
+        subject: ApprovalSubject,
+    ) -> Result<ApprovalOutcome, AgentExit> {
+        if let ApprovalCheck::Authorized(authorization) = gate.check(requirement, &subject) {
+            return Ok(ApprovalOutcome::Authorized(authorization));
+        }
+
+        let approval_id = ApprovalId::generate();
+        self.journal
+            .approval_requested(
+                approval_id,
+                available_lifetimes.to_vec(),
+                subject.clone(),
+                turn_id,
+            )
+            .await?;
+        let decision = request_approval(
+            available_lifetimes.to_vec(),
+            input,
+            subject.clone(),
+            &self.host_handle.events,
+            &self.host_handle.cancel,
+        )
+        .await?;
+        let outcome = gate.apply_decision(available_lifetimes, approval_id, &decision, &subject);
+        if matches!(
+            outcome,
+            ApprovalOutcome::Authorized(_) | ApprovalOutcome::Denied { .. }
+        ) {
+            self.journal
+                .approval_decided(approval_id, journal_approval_decision(&decision))
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    async fn reject_denied_tool(
+        &mut self,
+        turn_id: TurnId,
+        id: &str,
+        name: &str,
+        reason: &str,
+        category: &str,
+    ) -> Result<(), AgentExit> {
+        self.journal
+            .tool_rejected(category, id, name, turn_id)
+            .await?;
+        self.host_handle
+            .events
+            .emit(AgentEvent::ToolDenied {
+                name: name.to_string(),
+                reason: reason.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn reject_invalid_grant(
+        &mut self,
+        turn_id: TurnId,
+        id: &str,
+        name: &str,
+        reason: &str,
+    ) -> Result<(), AgentExit> {
+        self.journal
+            .tool_rejected("invalid_approval_grant", id, name, turn_id)
+            .await?;
+        self.host_handle
+            .events
+            .emit(AgentEvent::ToolRejected {
+                error: reason.to_string(),
+                name: name.to_string(),
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -1073,6 +1175,7 @@ async fn execute_invocation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::DockerEndpoint;
     use crate::journal::{
         InjectedFlushFailure, JournalRecord, SessionProjection, ToolExecutionCompleted,
         ToolExecutionStarted, parse_journal, project_journal,
@@ -1717,7 +1820,7 @@ mod tests {
         mount_turns(
             &server,
             vec![
-                tool_call_turn(&[("shell-1", "shell", json!({ "command": "cargo check" }))]),
+                tool_call_turn(&[("shell-1", "shell", json!({ "command": "docker ps" }))]),
                 text_turn("The check failed with exit code 2."),
             ],
         )
@@ -1726,6 +1829,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let policy = sandbox_policy(&root);
         let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let socket_path = root.path().join("docker.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let docker_endpoint = DockerEndpoint::validate(socket_path).unwrap();
         let environment = command_environment();
         let result = crate::command::CommandResult {
             output: crate::command::CapturedOutput::complete(vec![
@@ -1739,7 +1845,8 @@ mod tests {
             Some("fake 1.0".to_string()),
             &policy,
         )
-        .unwrap();
+        .unwrap()
+        .with_integration(ShellIntegration::Docker(docker_endpoint.clone()));
         let config = SessionConfig::new("test-cane-version", "", sessions.path());
         let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
             .await
@@ -1751,7 +1858,31 @@ mod tests {
             .unwrap();
 
         // Act
-        let (approval, subject) = loop {
+        let (capability_approval, capability_subject) = loop {
+            let event = handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                available_lifetimes,
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                assert_eq!(available_lifetimes, [ApprovalLifetime::Run]);
+                break (respond_to, subject);
+            }
+        };
+        assert!(matches!(
+            &capability_subject,
+            ApprovalSubject::Capability { capability, .. }
+                if capability.kind() == crate::CapabilityKind::DockerDaemon
+                    && capability.resource() == docker_endpoint.resource()
+        ));
+        capability_approval
+            .send(ApprovalDecision::Grant(
+                capability_subject.grant(ApprovalLifetime::Run),
+            ))
+            .unwrap();
+        let (tool_approval, tool_subject) = loop {
             let event = handle.events.recv().await.unwrap();
             if let AgentEvent::ApprovalRequest {
                 available_lifetimes,
@@ -1764,9 +1895,10 @@ mod tests {
                 break (respond_to, subject);
             }
         };
-        approval
+        assert_eq!(tool_subject, ApprovalSubject::tool_call("shell-1", "shell"));
+        tool_approval
             .send(ApprovalDecision::Grant(
-                subject.grant(ApprovalLifetime::Invocation),
+                tool_subject.grant(ApprovalLifetime::Invocation),
             ))
             .unwrap();
         let events = collect_turn(&mut handle.events).await;
@@ -1790,21 +1922,36 @@ mod tests {
             })
         );
 
-        let approval_id = records
+        let capability_approval_id = records
             .iter()
             .find_map(|record| match &record.entry {
-                JournalEntry::ApprovalRequested(requested) => Some(requested.approval_id),
+                JournalEntry::ApprovalRequested(requested)
+                    if matches!(requested.subject, ApprovalSubject::Capability { .. }) =>
+                {
+                    Some(requested.approval_id)
+                }
                 _ => None,
             })
-            .expect("approval request missing from journal");
+            .expect("capability approval request missing from journal");
+        let tool_approval_id = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ApprovalRequested(requested)
+                    if matches!(requested.subject, ApprovalSubject::ToolCall { .. }) =>
+                {
+                    Some(requested.approval_id)
+                }
+                _ => None,
+            })
+            .expect("tool approval request missing from journal");
         assert!(records.iter().any(|record| matches!(
             &record.entry,
             JournalEntry::ApprovalDecided(decided)
-                if decided.approval_id == approval_id
+                if decided.approval_id == capability_approval_id
                     && matches!(
                         &decided.decision,
                         JournalApprovalDecision::Grant { grant }
-                            if grant.lifetime() == ApprovalLifetime::Invocation
+                            if grant.lifetime() == ApprovalLifetime::Run
                     )
         )));
         assert!(records.iter().any(|record| matches!(
@@ -1813,14 +1960,21 @@ mod tests {
                 if started.tool_call_id == "shell-1"
                     && started.execution
                         == Some(ToolExecutionStarted::Shell {
-                            capabilities: Vec::new(),
+                            capabilities: vec![crate::journal::ExecutionCapability {
+                                capability: crate::NamedCapability::docker_daemon(
+                                    docker_endpoint.resource(),
+                                ),
+                                source: CapabilityAuthorizationSource::Approval {
+                                    approval_id: capability_approval_id,
+                                },
+                            }],
                         })
                     && matches!(
                         started.authorization,
                         ToolAuthorization::Granted {
                             approval_id: recorded,
                             ..
-                        } if recorded == approval_id
+                        } if recorded == tool_approval_id
                     )
         )));
         assert!(records.iter().any(|record| matches!(

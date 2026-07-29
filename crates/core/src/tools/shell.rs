@@ -1,15 +1,18 @@
 use crate::Workspace;
 use crate::command::{
     CommandDeadline, CommandEnvironmentConfig, CommandExecutionError, CommandExecutor,
-    PreparedShellCommand, format_command_result, prepare_shell_command,
+    DockerEndpoint, PreparedShellCommand, format_command_result, prepare_shell_command,
 };
 use crate::journal::{
-    CapturedStream, CommandTermination as JournalCommandTermination, ToolExecutionCompleted,
-    ToolExecutionStarted,
+    CapturedStream, CommandTermination as JournalCommandTermination, ExecutionCapability,
+    ToolExecutionCompleted, ToolExecutionStarted,
 };
-use crate::protocol::{AgentEvent, ApprovalLifetime, ApprovalRequirement, EventSink};
+use crate::protocol::{
+    AgentEvent, ApprovalLifetime, ApprovalRequirement, EventSink, NamedCapability,
+};
 use crate::tools::{
-    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, ToolExecutionOutput,
+    AuthorizedCapability, CapabilityRequest, PreparedInvocation, Tool, ToolDefinition,
+    ToolExecutionError, ToolExecutionOutput,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -17,17 +20,46 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const PREVIEW_CHANNEL_CAPACITY: usize = 16;
+const DOCKER_CAPABILITY_LIFETIMES: &[ApprovalLifetime] = &[ApprovalLifetime::Run];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShellIntegration {
+    Docker(DockerEndpoint),
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ShellIntegrations {
+    docker_endpoint: Option<DockerEndpoint>,
+}
+
+impl ShellIntegrations {
+    pub(crate) fn insert(&mut self, integration: ShellIntegration) {
+        match integration {
+            ShellIntegration::Docker(endpoint) => self.docker_endpoint = Some(endpoint),
+        }
+    }
+
+    fn docker_endpoint_for(&self, prepared: &PreparedShellCommand) -> Option<DockerEndpoint> {
+        if prepared.classification().is_direct_docker_invocation() {
+            self.docker_endpoint.clone()
+        } else {
+            None
+        }
+    }
+}
 
 pub(super) struct ShellTool {
     environment: CommandEnvironmentConfig,
     events: EventSink,
     executor: Arc<dyn CommandExecutor>,
+    integrations: ShellIntegrations,
     workspace: Arc<Workspace>,
 }
 
 impl ShellTool {
     pub(super) fn new(
         workspace: Arc<Workspace>,
+        integrations: ShellIntegrations,
         environment: CommandEnvironmentConfig,
         events: EventSink,
         executor: Arc<dyn CommandExecutor>,
@@ -36,6 +68,7 @@ impl ShellTool {
             environment,
             events,
             executor,
+            integrations,
             workspace,
         }
     }
@@ -46,10 +79,7 @@ impl Tool for ShellTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "shell".to_string(),
-            description: "Run a command with fixed non-login Bash in a fresh process. The working \
-                directory defaults to the workspace root and must remain inside the workspace. \
-                Commands require approval and time out after 600 seconds by default."
-                .to_string(),
+            description: shell_description(self.integrations.docker_endpoint.is_some()),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -77,8 +107,11 @@ impl Tool for ShellTool {
     async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
         let prepared = prepare_shell_command(&self.environment, input, &self.workspace)
             .map_err(|error| error.to_string())?;
+        let docker_endpoint = self.integrations.docker_endpoint_for(&prepared);
 
         Ok(Box::new(PreparedShellInvocation {
+            authorized_capability: None,
+            docker_endpoint,
             events: self.events.clone(),
             executor: Arc::clone(&self.executor),
             prepared,
@@ -86,7 +119,25 @@ impl Tool for ShellTool {
     }
 }
 
+fn shell_description(docker_available: bool) -> String {
+    let mut description = "Run an exact command with `/bin/bash --noprofile --norc -c` in a \
+            fresh process. The working directory defaults to the workspace root and may be changed \
+            per call with `workdir`; changes such as `cd` do not persist between calls. \
+            `timeout_seconds` defaults to 600 and must be between 1 and 1800."
+        .to_string();
+    if docker_available {
+        description.push_str(
+            " Direct `docker` and `docker-compose` commands can request Docker daemon access; \
+                 wrappers and compound commands do not receive it.",
+        );
+    }
+
+    description
+}
+
 struct PreparedShellInvocation {
+    authorized_capability: Option<AuthorizedCapability>,
+    docker_endpoint: Option<DockerEndpoint>,
     events: EventSink,
     executor: Arc<dyn CommandExecutor>,
     prepared: PreparedShellCommand,
@@ -102,9 +153,40 @@ impl PreparedInvocation for PreparedShellInvocation {
         &[ApprovalLifetime::Invocation]
     }
 
+    fn capability_request(&self) -> Option<CapabilityRequest> {
+        self.docker_endpoint
+            .as_ref()
+            .map(|endpoint| CapabilityRequest {
+                available_lifetimes: DOCKER_CAPABILITY_LIFETIMES,
+                capability: NamedCapability::docker_daemon(endpoint.resource()),
+            })
+    }
+
+    fn authorize_capability(&mut self, authorization: AuthorizedCapability) -> Result<(), String> {
+        let endpoint = self
+            .docker_endpoint
+            .as_ref()
+            .ok_or_else(|| "shell invocation did not request Docker access".to_string())?;
+        let expected = NamedCapability::docker_daemon(endpoint.resource());
+        if authorization.capability != expected {
+            return Err("capability authorization does not match the Docker endpoint".to_string());
+        }
+
+        self.prepared.authorize_docker(endpoint.clone());
+        self.authorized_capability = Some(authorization);
+        Ok(())
+    }
+
     fn execution_started(&self) -> Option<ToolExecutionStarted> {
         Some(ToolExecutionStarted::Shell {
-            capabilities: Vec::new(),
+            capabilities: self
+                .authorized_capability
+                .iter()
+                .map(|authorization| ExecutionCapability {
+                    capability: authorization.capability.clone(),
+                    source: authorization.source.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -116,6 +198,7 @@ impl PreparedInvocation for PreparedShellInvocation {
             events,
             executor,
             prepared,
+            ..
         } = *self;
         let deadline = CommandDeadline::after(prepared.timeout());
         let (preview, mut preview_receiver) = mpsc::channel(PREVIEW_CHANNEL_CAPACITY);
@@ -179,6 +262,7 @@ mod tests {
     };
     use crate::tools::{ShellToolConfig, ToolSet, ToolTestExt};
     use async_trait::async_trait;
+    use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -242,6 +326,18 @@ mod tests {
         Arc<FakeExecutor>,
         mpsc::Receiver<AgentEvent>,
     ) {
+        shell_tool_with_endpoint(result, None)
+    }
+
+    fn shell_tool_with_endpoint(
+        result: Result<CommandResult, CommandExecutionError>,
+        docker_endpoint: Option<DockerEndpoint>,
+    ) -> (
+        TempDir,
+        ShellTool,
+        Arc<FakeExecutor>,
+        mpsc::Receiver<AgentEvent>,
+    ) {
         let root = TempDir::new().unwrap();
         let workspace = Arc::new(Workspace::new(root.path().to_path_buf()).unwrap());
         let executor = Arc::new(FakeExecutor {
@@ -255,8 +351,13 @@ mod tests {
         )
         .unwrap();
         let (events, event_receiver) = mpsc::channel(16);
+        let mut integrations = ShellIntegrations::default();
+        if let Some(endpoint) = docker_endpoint {
+            integrations.insert(ShellIntegration::Docker(endpoint));
+        }
         let tool = ShellTool::new(
             workspace,
+            integrations,
             environment,
             EventSink::new(events),
             Arc::clone(&executor) as Arc<dyn CommandExecutor>,
@@ -288,6 +389,26 @@ mod tests {
             definition.input_schema["properties"]["timeout_seconds"]["maximum"],
             1800
         );
+        assert!(definition.description.contains("`cd` do not persist"));
+        assert!(definition.description.contains("defaults to 600"));
+        assert!(!definition.description.contains("Docker"));
+        assert!(!definition.description.contains("sandbox"));
+        assert!(!definition.description.contains("approval"));
+    }
+
+    #[test]
+    fn shell_definition_advertises_only_configured_docker_command_support() {
+        // Arrange
+        let docker_available = true;
+
+        // Act
+        let description = shell_description(docker_available);
+
+        // Assert
+        assert!(description.contains("Direct `docker`"));
+        assert!(description.contains("compound commands"));
+        assert!(!description.contains("sandbox"));
+        assert!(!description.contains("approval"));
     }
 
     #[test]
@@ -315,6 +436,7 @@ mod tests {
                 environment,
                 events: EventSink::new(events),
                 executor,
+                integrations: ShellIntegrations::default(),
             }),
         );
 
@@ -382,6 +504,100 @@ mod tests {
         assert_eq!(
             invocation.available_grant_lifetimes(),
             [ApprovalLifetime::Invocation]
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_docker_command_requires_separate_run_capability_authorization() {
+        // Arrange
+        let socket_root = TempDir::new().unwrap();
+        let socket_path = socket_root.path().join("docker.sock");
+        let _socket = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(&socket_path).unwrap();
+        let result = CommandResult {
+            output: CapturedOutput::complete(Vec::new()),
+            termination: CommandTermination::Exited { code: 0 },
+        };
+        let (_root, tool, executor, _events) =
+            shell_tool_with_endpoint(Ok(result), Some(endpoint.clone()));
+        let mut invocation = tool
+            .prepare(serde_json::json!({ "command": "docker ps" }))
+            .await
+            .unwrap();
+        let approval_id = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAY".parse().unwrap();
+
+        // Act
+        let capability_request = invocation.capability_request().unwrap();
+        invocation
+            .authorize_capability(AuthorizedCapability {
+                capability: capability_request.capability.clone(),
+                source: crate::journal::CapabilityAuthorizationSource::Approval { approval_id },
+            })
+            .unwrap();
+        let started = invocation.execution_started();
+        let output = invocation.execute(CancellationToken::new()).await.unwrap();
+
+        // Assert
+        assert_eq!(
+            capability_request,
+            CapabilityRequest {
+                available_lifetimes: &[ApprovalLifetime::Run],
+                capability: NamedCapability::docker_daemon(endpoint.resource()),
+            }
+        );
+        assert_eq!(
+            started,
+            Some(ToolExecutionStarted::Shell {
+                capabilities: vec![ExecutionCapability {
+                    capability: capability_request.capability,
+                    source: crate::journal::CapabilityAuthorizationSource::Approval { approval_id },
+                }],
+            })
+        );
+        assert_eq!(
+            output.content,
+            "process exited with code 0\noutput (0 bytes, complete):\n"
+        );
+        assert_eq!(
+            executor.observations.lock().unwrap()[0]
+                .request
+                .docker_endpoint,
+            Some(endpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn compound_docker_command_does_not_request_or_receive_daemon_access() {
+        // Arrange
+        let socket_root = TempDir::new().unwrap();
+        let socket_path = socket_root.path().join("docker.sock");
+        let _socket = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(socket_path).unwrap();
+        let result = CommandResult {
+            output: CapturedOutput::complete(Vec::new()),
+            termination: CommandTermination::Exited { code: 0 },
+        };
+        let (_root, tool, executor, _events) = shell_tool_with_endpoint(Ok(result), Some(endpoint));
+        let invocation = tool
+            .prepare(serde_json::json!({ "command": "docker ps | cat" }))
+            .await
+            .unwrap();
+
+        // Act
+        let capability_request = invocation.capability_request();
+        let output = invocation.execute(CancellationToken::new()).await.unwrap();
+
+        // Assert
+        assert_eq!(capability_request, None);
+        assert_eq!(
+            output.content,
+            "process exited with code 0\noutput (0 bytes, complete):\n"
+        );
+        assert_eq!(
+            executor.observations.lock().unwrap()[0]
+                .request
+                .docker_endpoint,
+            None
         );
     }
 

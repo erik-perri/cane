@@ -16,11 +16,11 @@ pub use agent::{
 pub use message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 pub use protocol::{
     AgentCommand, AgentEvent, ApprovalDecision, ApprovalGrant, ApprovalLifetime, ApprovalMatcher,
-    ApprovalScope, ApprovalSubject, NamedCapability, ShutdownReason, TurnOutcome,
+    ApprovalScope, ApprovalSubject, CapabilityKind, NamedCapability, ShutdownReason, TurnOutcome,
 };
 pub use provider::{
     ModelTurn, ModelUsage, ProviderAdapter, ProviderConfig, ProviderDescriptor, ReportedCost,
 };
 pub use session::SessionConfig;
-pub use tools::ToolDefinition;
+pub use tools::{ShellIntegration, ToolDefinition};
 pub use workspace::Workspace;

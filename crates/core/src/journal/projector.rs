@@ -231,11 +231,11 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     ));
                 }
                 if let ApprovalSubject::Capability { capability, .. } = &requested.subject
-                    && (capability.name.trim().is_empty() || capability.resource.trim().is_empty())
+                    && capability.resource().trim().is_empty()
                 {
                     return Err(invalid(
                         record.sequence,
-                        "approval capability name or resource is empty",
+                        "approval capability resource is empty",
                     ));
                 }
                 if turn
@@ -758,11 +758,8 @@ fn validate_execution_start(
     let mut seen = HashSet::new();
     for execution_capability in capabilities {
         let ExecutionCapability { capability, source } = execution_capability;
-        if capability.name.trim().is_empty() || capability.resource.trim().is_empty() {
-            return Err(invalid(
-                sequence,
-                "execution capability name or resource is empty",
-            ));
+        if capability.resource().trim().is_empty() {
+            return Err(invalid(sequence, "execution capability resource is empty"));
         }
         if !seen.insert(capability) {
             return Err(invalid(
@@ -1539,10 +1536,7 @@ mod tests {
     fn shell_execution_capabilities_require_a_correlated_approval() {
         // Arrange
         let approval_id: ApprovalId = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().unwrap();
-        let capability = NamedCapability {
-            name: "docker_daemon".to_string(),
-            resource: "unix:///var/run/docker.sock".to_string(),
-        };
+        let capability = NamedCapability::docker_daemon("unix:///var/run/docker.sock");
         let turn = TurnState {
             approvals: HashMap::new(),
             awaiting_assistant: None,
@@ -1586,10 +1580,7 @@ mod tests {
     #[test]
     fn workspace_configured_capabilities_require_an_effective_run_grant() {
         // Arrange
-        let capability = NamedCapability {
-            name: "docker_daemon".to_string(),
-            resource: "unix:///var/run/docker.sock".to_string(),
-        };
+        let capability = NamedCapability::docker_daemon("unix:///var/run/docker.sock");
         let subject = ApprovalSubject::capability(capability.clone(), "shell-1", "shell");
         let configured_grants = vec![subject.grant(ApprovalLifetime::Workspace)];
         let turn = TurnState {

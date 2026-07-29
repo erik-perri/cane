@@ -15,12 +15,14 @@ mod write_file;
 
 use crate::Workspace;
 use crate::command::{CommandEnvironmentConfig, CommandExecutor};
-use crate::journal::{ToolExecutionCompleted, ToolExecutionStarted};
-use crate::protocol::{ApprovalLifetime, ApprovalRequirement, EventSink};
+use crate::journal::{CapabilityAuthorizationSource, ToolExecutionCompleted, ToolExecutionStarted};
+use crate::protocol::{ApprovalLifetime, ApprovalRequirement, EventSink, NamedCapability};
 use edit_file::EditFileTool;
 use glob::GlobTool;
 use grep::GrepTool;
 use read_file::ReadFileTool;
+pub use shell::ShellIntegration;
+pub(crate) use shell::ShellIntegrations;
 use shell::ShellTool;
 use write_file::WriteFileTool;
 
@@ -33,6 +35,19 @@ pub(crate) struct ShellToolConfig {
     pub(crate) environment: CommandEnvironmentConfig,
     pub(crate) events: EventSink,
     pub(crate) executor: Arc<dyn CommandExecutor>,
+    pub(crate) integrations: ShellIntegrations,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapabilityRequest {
+    pub(crate) available_lifetimes: &'static [ApprovalLifetime],
+    pub(crate) capability: NamedCapability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthorizedCapability {
+    pub(crate) capability: NamedCapability,
+    pub(crate) source: CapabilityAuthorizationSource,
 }
 
 #[derive(Debug, PartialEq)]
@@ -74,6 +89,7 @@ impl ToolSet {
         if let Some(shell) = shell {
             tools.push(Box::new(ShellTool::new(
                 workspace,
+                shell.integrations,
                 shell.environment,
                 shell.events,
                 shell.executor,
@@ -129,6 +145,14 @@ pub(crate) trait Tool: Send + Sync {
 #[async_trait]
 pub(crate) trait PreparedInvocation: Send {
     fn approval_requirement(&self) -> ApprovalRequirement;
+
+    fn capability_request(&self) -> Option<CapabilityRequest> {
+        None
+    }
+
+    fn authorize_capability(&mut self, _authorization: AuthorizedCapability) -> Result<(), String> {
+        Err("prepared invocation did not request a capability".to_string())
+    }
 
     /// Grant lifetimes this invocation may receive.
     ///

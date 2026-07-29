@@ -132,10 +132,38 @@ pub enum ApprovalLifetime {
     Workspace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    DockerDaemon,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NamedCapability {
-    pub name: String,
-    pub resource: String,
+    #[serde(rename = "name")]
+    kind: CapabilityKind,
+    resource: String,
+}
+
+impl NamedCapability {
+    pub fn new(kind: CapabilityKind, resource: impl Into<String>) -> Self {
+        Self {
+            kind,
+            resource: resource.into(),
+        }
+    }
+
+    pub fn docker_daemon(resource: impl Into<String>) -> Self {
+        Self::new(CapabilityKind::DockerDaemon, resource)
+    }
+
+    pub fn kind(&self) -> CapabilityKind {
+        self.kind
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

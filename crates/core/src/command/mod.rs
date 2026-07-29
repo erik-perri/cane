@@ -128,6 +128,10 @@ pub struct PreparedShellCommand {
 }
 
 impl PreparedShellCommand {
+    pub(crate) fn authorize_docker(&mut self, endpoint: DockerEndpoint) {
+        self.request.docker_endpoint = Some(endpoint);
+    }
+
     pub fn classification(&self) -> &CommandClassification {
         &self.classification
     }

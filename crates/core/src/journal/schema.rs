@@ -658,10 +658,7 @@ mod tests {
     #[test]
     fn typed_capability_approvals_and_shell_diagnostics_round_trip() {
         // Arrange
-        let capability = NamedCapability {
-            name: "docker_daemon".to_string(),
-            resource: "unix:///var/run/docker.sock".to_string(),
-        };
+        let capability = NamedCapability::docker_daemon("unix:///var/run/docker.sock");
         let subject = ApprovalSubject::capability(capability.clone(), "shell-1", "shell");
         let grant = subject.grant(ApprovalLifetime::Run);
         let request = ApprovalRequested {
@@ -719,10 +716,7 @@ mod tests {
         };
         let effective_grant = EffectiveApprovalGrant {
             grant: ApprovalSubject::capability(
-                NamedCapability {
-                    name: "docker_daemon".to_string(),
-                    resource: "unix:///var/run/docker.sock".to_string(),
-                },
+                NamedCapability::docker_daemon("unix:///var/run/docker.sock"),
                 "shell-1",
                 "shell",
             )
@@ -751,6 +745,7 @@ mod tests {
             serde_json::from_value(values[5].clone()).unwrap();
 
         // Assert
+        assert_eq!(values[0]["capability"]["name"], "docker_daemon");
         assert_eq!(decoded_request, request);
         assert_eq!(decoded_decision, decision);
         assert_eq!(decoded_started, started);
