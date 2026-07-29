@@ -104,6 +104,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+      # Ubuntu 24.04 AppArmor blocks the user-namespace capabilities these tests require.
+      - name: Enable unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run Linux sandbox enforcement suite
         run: |
           cargo test -p cane-core installed_bubblewrap_ -- --ignored
