@@ -24,4 +24,5 @@ tracing = "0.1.44"
 ulid = "3.0.0"
 
 [dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }
 wiremock = "0.6.5"

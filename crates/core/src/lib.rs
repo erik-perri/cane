@@ -1,5 +1,6 @@
 mod agent;
 mod approval;
+pub mod command;
 pub mod journal;
 mod message;
 mod protocol;
