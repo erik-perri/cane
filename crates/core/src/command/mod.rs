@@ -1,12 +1,29 @@
 mod classify;
 mod deadline;
+mod diagnostics;
+#[cfg(target_os = "linux")]
+mod linux;
 mod output;
+mod policy;
 
 pub use classify::{CommandClassification, SimpleCommand, classify_command};
 pub use deadline::CommandDeadline;
+pub use diagnostics::{
+    DiagnosticImportance, DiagnosticStatus, SandboxDiagnosticFinding, SandboxDiagnosticInput,
+    SandboxDiagnosticReport, diagnose_sandbox,
+};
+#[cfg(target_os = "linux")]
+pub use linux::{
+    BubblewrapInstallation, BubblewrapResolutionError, LinuxSandboxOperation, LinuxSandboxPlan,
+    compile_linux_sandbox_plan, resolve_bubblewrap,
+};
 pub use output::{
     CapturedOutput, CommandOutputChunk, CommandOutputStream, CommandResult, CommandTermination,
     MAX_COMMAND_RESULT_BYTES, format_command_result,
+};
+pub use policy::{
+    CommandSandboxPolicy, CommandSandboxPolicyConfig, CommandSandboxPolicyError,
+    SandboxFilesystemAccess, SandboxPathGrant, SandboxPathPurpose, build_command_sandbox_policy,
 };
 
 use crate::Workspace;
