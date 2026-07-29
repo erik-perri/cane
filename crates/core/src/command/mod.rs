@@ -113,6 +113,7 @@ impl CommandEnvironmentConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest {
     pub arguments: Vec<String>,
+    pub docker_endpoint: Option<DockerEndpoint>,
     pub environment: BTreeMap<String, String>,
     pub executable: String,
     pub workdir: PathBuf,
@@ -244,6 +245,7 @@ pub fn prepare_shell_command(
             "-c".to_string(),
             command.clone(),
         ],
+        docker_endpoint: None,
         environment: environment.environment(),
         executable: BASH_PATH.to_string(),
         workdir,
@@ -342,6 +344,7 @@ mod tests {
             prepared.request().arguments,
             ["--noprofile", "--norc", "-c", command]
         );
+        assert_eq!(prepared.request().docker_endpoint, None);
         assert_eq!(prepared.request().workdir, workspace.root());
         assert_eq!(prepared.classification(), &CommandClassification::Complex);
     }

@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 const OUTPUT_READ_BYTES: usize = 8 * 1024;
 const PIPE_EVENT_CAPACITY: usize = 16;
+const PRIVATE_DOCKER_HOST: &str = "unix:///tmp/cane-docker.sock";
+const PRIVATE_DOCKER_SOCKET: &str = "/tmp/cane-docker.sock";
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 pub struct BubblewrapExecutor {
@@ -37,8 +39,12 @@ impl UnsafeExecutor {
         Self { workspace }
     }
 
-    fn prepare_process(&self, request: CommandRequest) -> Result<Command, CommandExecutionError> {
+    fn prepare_process(
+        &self,
+        mut request: CommandRequest,
+    ) -> Result<Command, CommandExecutionError> {
         validate_request(&request, &self.workspace)?;
+        expose_host_docker_endpoint(&mut request);
 
         let mut process = Command::new(request.executable);
         process
@@ -90,13 +96,23 @@ impl BubblewrapExecutor {
         validate_request(&request, &self.workspace)?;
 
         let mut process = Command::new(&self.launcher);
-        process
-            .args(self.plan.arguments())
-            .arg("--chdir")
-            .arg(&request.workdir);
+        process.args(self.plan.arguments());
+        if let Some(endpoint) = &request.docker_endpoint {
+            process
+                .arg("--bind")
+                .arg(endpoint.path())
+                .arg(PRIVATE_DOCKER_SOCKET);
+        }
+        process.arg("--chdir").arg(&request.workdir);
 
         for (name, value) in request.environment {
             process.arg("--setenv").arg(name).arg(value);
+        }
+        if request.docker_endpoint.is_some() {
+            process
+                .arg("--setenv")
+                .arg("DOCKER_HOST")
+                .arg(PRIVATE_DOCKER_HOST);
         }
         process
             .arg("--")
@@ -111,6 +127,14 @@ impl BubblewrapExecutor {
             .process_group(0);
 
         Ok(process)
+    }
+}
+
+fn expose_host_docker_endpoint(request: &mut CommandRequest) {
+    if let Some(endpoint) = &request.docker_endpoint {
+        request
+            .environment
+            .insert("DOCKER_HOST".to_string(), endpoint.resource().to_string());
     }
 }
 
@@ -505,7 +529,9 @@ fn execution_failure_message(message: impl Into<String>) -> CommandExecutionErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{CommandSandboxPolicyConfig, build_command_sandbox_policy};
+    use crate::command::{
+        CommandSandboxPolicyConfig, DockerEndpoint, build_command_sandbox_policy,
+    };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::net::TcpListener;
@@ -597,10 +623,102 @@ mod tests {
                 "-c".to_string(),
                 command.to_string(),
             ],
+            docker_endpoint: None,
             environment: BTreeMap::from([("TEST_VALUE".to_string(), "explicit".to_string())]),
             executable: "/bin/bash".to_string(),
             workdir: workspace.to_path_buf(),
         }
+    }
+
+    fn process_arguments(process: &Command) -> Vec<String> {
+        process
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn bubblewrap_exposes_docker_only_for_a_capability_bearing_request() {
+        // Arrange
+        let fixture = fixture();
+        let socket_path = fixture._root.path().join("docker.sock");
+        let _socket = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(&socket_path).unwrap();
+        let mut docker_request = request(&fixture.workspace, "docker ps");
+        docker_request.environment.insert(
+            "DOCKER_HOST".to_string(),
+            "unix:///host/guess.sock".to_string(),
+        );
+        docker_request.docker_endpoint = Some(endpoint.clone());
+        let ordinary_request = request(&fixture.workspace, "cargo test");
+
+        // Act
+        let docker_process = fixture.executor.prepare_process(docker_request).unwrap();
+        let ordinary_process = fixture.executor.prepare_process(ordinary_request).unwrap();
+        let docker_arguments = process_arguments(&docker_process);
+        let ordinary_arguments = process_arguments(&ordinary_process);
+        let docker_host_values = docker_arguments
+            .windows(3)
+            .filter(|arguments| arguments[0] == "--setenv" && arguments[1] == "DOCKER_HOST")
+            .map(|arguments| arguments[2].as_str())
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert!(docker_arguments.windows(3).any(|arguments| {
+            arguments
+                == [
+                    "--bind",
+                    endpoint.path().to_str().unwrap(),
+                    PRIVATE_DOCKER_SOCKET,
+                ]
+        }));
+        assert_eq!(
+            docker_host_values,
+            ["unix:///host/guess.sock", PRIVATE_DOCKER_HOST]
+        );
+        assert!(
+            !ordinary_arguments
+                .iter()
+                .any(|argument| argument == endpoint.path().to_str().unwrap())
+        );
+        assert!(
+            !ordinary_arguments
+                .iter()
+                .any(|argument| argument == PRIVATE_DOCKER_HOST)
+        );
+    }
+
+    #[test]
+    fn unsafe_executor_adds_docker_host_only_to_a_capability_bearing_request() {
+        // Arrange
+        let fixture = fixture();
+        let executor = UnsafeExecutor::new(fixture.workspace.clone());
+        let socket_path = fixture._root.path().join("docker.sock");
+        let _socket = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(&socket_path).unwrap();
+        let mut docker_request = request(&fixture.workspace, "docker ps");
+        docker_request.docker_endpoint = Some(endpoint.clone());
+        let ordinary_request = request(&fixture.workspace, "cargo test");
+
+        // Act
+        let docker_process = executor.prepare_process(docker_request).unwrap();
+        let ordinary_process = executor.prepare_process(ordinary_request).unwrap();
+        let docker_environment = docker_process
+            .as_std()
+            .get_envs()
+            .collect::<BTreeMap<_, _>>();
+        let ordinary_environment = ordinary_process
+            .as_std()
+            .get_envs()
+            .collect::<BTreeMap<_, _>>();
+
+        // Assert
+        assert_eq!(
+            docker_environment.get(std::ffi::OsStr::new("DOCKER_HOST")),
+            Some(&Some(std::ffi::OsStr::new(endpoint.resource())))
+        );
+        assert!(!ordinary_environment.contains_key(std::ffi::OsStr::new("DOCKER_HOST")));
     }
 
     #[test]
@@ -1112,6 +1230,7 @@ else:
             .unwrap();
         let request = CommandRequest {
             arguments: Vec::new(),
+            docker_endpoint: None,
             environment: BTreeMap::from([("ONLY_VALUE".to_string(), "prepared".to_string())]),
             executable: "/usr/bin/env".to_string(),
             workdir: workspace.path().to_path_buf(),

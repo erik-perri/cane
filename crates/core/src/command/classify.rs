@@ -4,6 +4,16 @@ pub enum CommandClassification {
     Simple(SimpleCommand),
 }
 
+impl CommandClassification {
+    pub fn is_direct_docker_invocation(&self) -> bool {
+        let Self::Simple(command) = self else {
+            return false;
+        };
+
+        matches!(command.executable(), "docker" | "docker-compose")
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleCommand {
     executable_index: usize,
@@ -212,6 +222,48 @@ mod tests {
             simple.words(),
             ["RUST_LOG=debug", "CARGO_TERM_COLOR=never", "cargo", "test"]
         );
+    }
+
+    #[test]
+    fn direct_docker_recognition_accepts_only_supported_simple_executables() {
+        // Arrange
+        let commands = [
+            "docker",
+            "docker ps",
+            "DOCKER_CLI_HINTS=false docker compose ps",
+            "'docker' inspect example",
+            "docker-compose up",
+        ];
+
+        // Act
+        let recognized =
+            commands.map(|command| classify_command(command).is_direct_docker_invocation());
+
+        // Assert
+        assert_eq!(recognized, [true; 5]);
+    }
+
+    #[test]
+    fn direct_docker_recognition_rejects_wrappers_paths_and_compound_syntax() {
+        // Arrange
+        let commands = [
+            "/usr/bin/docker ps",
+            "env docker ps",
+            "sudo docker ps",
+            "make docker-test",
+            "docker ps | cat",
+            "docker ps && echo done",
+            "docker ps > containers.txt",
+            "docker $(cat command)",
+            "docker ps\nwhoami",
+        ];
+
+        // Act
+        let recognized =
+            commands.map(|command| classify_command(command).is_direct_docker_invocation());
+
+        // Assert
+        assert_eq!(recognized, [false; 9]);
     }
 
     #[test]
