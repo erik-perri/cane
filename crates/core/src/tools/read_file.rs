@@ -1,7 +1,8 @@
 use crate::protocol::ApprovalRequirement;
 use crate::tools::{
     MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition,
-    ToolExecutionError, background_task_failed, invalid_input, operation_failed,
+    ToolExecutionError, ToolExecutionOutput, background_task_failed, invalid_input,
+    operation_failed,
 };
 use crate::workspace::Workspace;
 use serde::Deserialize;
@@ -123,7 +124,7 @@ impl PreparedInvocation for PreparedReadFile {
     async fn execute(
         self: Box<Self>,
         cancel: CancellationToken,
-    ) -> Result<String, ToolExecutionError> {
+    ) -> Result<ToolExecutionOutput, ToolExecutionError> {
         if cancel.is_cancelled() {
             return Err(ToolExecutionError::Cancelled);
         }
@@ -142,7 +143,7 @@ impl PreparedInvocation for PreparedReadFile {
         .map_err(|error| background_task_failed("read", &requested_path, error))?
         .map_err(|error| operation_failed("read", &requested_path, error))?;
 
-        Ok(read)
+        Ok(ToolExecutionOutput::text(read))
     }
 }
 

@@ -1,8 +1,8 @@
 use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
 use crate::tools::{
-    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, background_task_failed,
-    invalid_input, operation_failed, reject_git_directory,
+    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, ToolExecutionOutput,
+    background_task_failed, invalid_input, operation_failed, reject_git_directory,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -99,7 +99,7 @@ impl PreparedInvocation for PreparedWriteFile {
     async fn execute(
         self: Box<Self>,
         cancel: CancellationToken,
-    ) -> Result<String, ToolExecutionError> {
+    ) -> Result<ToolExecutionOutput, ToolExecutionError> {
         if cancel.is_cancelled() {
             return Err(ToolExecutionError::Cancelled);
         }
@@ -122,7 +122,7 @@ impl PreparedInvocation for PreparedWriteFile {
             format!("created `{requested_path}`; {written} bytes written")
         };
 
-        Ok(message)
+        Ok(ToolExecutionOutput::text(message))
     }
 }
 

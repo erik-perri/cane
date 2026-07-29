@@ -15,6 +15,7 @@ mod write_file;
 
 use crate::Workspace;
 use crate::command::{CommandEnvironmentConfig, CommandExecutor};
+use crate::journal::{ToolExecutionCompleted, ToolExecutionStarted};
 use crate::protocol::{ApprovalLifetime, ApprovalRequirement};
 use edit_file::EditFileTool;
 use glob::GlobTool;
@@ -37,6 +38,21 @@ pub(crate) struct ShellToolConfig {
 pub(crate) enum ToolExecutionError {
     Cancelled,
     ToolError(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ToolExecutionOutput {
+    pub(crate) content: String,
+    pub(crate) execution: Option<ToolExecutionCompleted>,
+}
+
+impl ToolExecutionOutput {
+    pub(crate) fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            execution: None,
+        }
+    }
 }
 
 impl From<String> for ToolExecutionError {
@@ -119,10 +135,14 @@ pub(crate) trait PreparedInvocation: Send {
         &[ApprovalLifetime::Invocation, ApprovalLifetime::Run]
     }
 
+    fn execution_started(&self) -> Option<ToolExecutionStarted> {
+        None
+    }
+
     async fn execute(
         self: Box<Self>,
         cancel: CancellationToken,
-    ) -> Result<String, ToolExecutionError>;
+    ) -> Result<ToolExecutionOutput, ToolExecutionError>;
 }
 
 /// Largest file the file tools will load into memory.
@@ -184,7 +204,7 @@ where
         let invocation = self.prepare(input).await?;
 
         match invocation.execute(CancellationToken::new()).await {
-            Ok(output) => Ok(output),
+            Ok(output) => Ok(output.content),
             Err(ToolExecutionError::ToolError(error)) => Err(error),
             Err(ToolExecutionError::Cancelled) => {
                 unreachable!("a fresh test cancellation token cannot be cancelled")

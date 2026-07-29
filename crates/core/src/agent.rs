@@ -14,7 +14,7 @@ use crate::protocol::{
 };
 use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
-use crate::tools::{PreparedInvocation, ToolExecutionError, ToolSet};
+use crate::tools::{PreparedInvocation, ToolExecutionError, ToolExecutionOutput, ToolSet};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -788,10 +788,11 @@ async fn execute_invocation(
     call: AuthorizedToolCall<'_>,
     invocation: Box<dyn PreparedInvocation>,
 ) -> Result<ToolResultData, AgentExit> {
+    let execution_started = invocation.execution_started();
     journal
         .tool_started(
             tool_authorization(call.authorization),
-            None,
+            execution_started,
             call.id,
             call.name,
             call.turn_id,
@@ -838,9 +839,9 @@ async fn execute_invocation(
     let duration_ms = elapsed_ms(execution_started);
 
     let (content, is_error) = match execution_result {
-        Ok(content) => {
+        Ok(ToolExecutionOutput { content, execution }) => {
             journal
-                .tool_completed(duration_ms, None, call.id, call.turn_id)
+                .tool_completed(duration_ms, execution, call.id, call.turn_id)
                 .await?;
             (content, false)
         }
@@ -919,9 +920,9 @@ mod tests {
         async fn execute(
             self: Box<Self>,
             _cancel: CancellationToken,
-        ) -> Result<String, ToolExecutionError> {
+        ) -> Result<ToolExecutionOutput, ToolExecutionError> {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            Ok("executed".to_string())
+            Ok(ToolExecutionOutput::text("executed"))
         }
     }
 
@@ -3289,6 +3290,41 @@ mod tests {
         execution: TestExecution,
     }
 
+    struct DiagnosticInvocation;
+
+    #[async_trait]
+    impl PreparedInvocation for DiagnosticInvocation {
+        fn approval_requirement(&self) -> ApprovalRequirement {
+            ApprovalRequirement::None
+        }
+
+        fn execution_started(&self) -> Option<crate::journal::ToolExecutionStarted> {
+            Some(crate::journal::ToolExecutionStarted::Shell {
+                capabilities: Vec::new(),
+            })
+        }
+
+        async fn execute(
+            self: Box<Self>,
+            _cancel: CancellationToken,
+        ) -> Result<ToolExecutionOutput, ToolExecutionError> {
+            Ok(ToolExecutionOutput {
+                content: "process exited with code 0\noutput (0 bytes, complete):\n".to_string(),
+                execution: Some(crate::journal::ToolExecutionCompleted::Shell {
+                    stderr: crate::journal::CapturedStream {
+                        bytes: 0,
+                        truncated: false,
+                    },
+                    stdout: crate::journal::CapturedStream {
+                        bytes: 0,
+                        truncated: false,
+                    },
+                    termination: crate::journal::CommandTermination::Exited { code: 0 },
+                }),
+            })
+        }
+    }
+
     #[async_trait]
     impl PreparedInvocation for TestInvocation {
         fn approval_requirement(&self) -> ApprovalRequirement {
@@ -3298,7 +3334,7 @@ mod tests {
         async fn execute(
             self: Box<Self>,
             cancel: CancellationToken,
-        ) -> Result<String, ToolExecutionError> {
+        ) -> Result<ToolExecutionOutput, ToolExecutionError> {
             match self.execution {
                 TestExecution::Fail(error) => Err(ToolExecutionError::ToolError(error)),
                 TestExecution::Cancel => Err(ToolExecutionError::Cancelled),
@@ -3453,6 +3489,73 @@ mod tests {
                 tool_use_id: mock_id,
             }),
         );
+    }
+
+    #[tokio::test]
+    async fn invocation_diagnostics_are_written_to_matching_tool_records() {
+        // Arrange
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
+        let host_handle = HostHandle {
+            cancel: CancellationToken::new(),
+            commands: commands_rx,
+            events: EventSink::new(events_tx),
+        };
+        let (mut journal, _sessions) = test_run_journal().await;
+        let journal_path = journal.path().to_path_buf();
+        let turn_id = TurnId::generate();
+
+        // Act
+        let result = execute_invocation(
+            &host_handle,
+            &mut journal,
+            AuthorizedToolCall {
+                authorization: ApprovalAuthorization::NotRequired,
+                id: "shell-1",
+                input: &json!({ "command": "true" }),
+                name: "shell",
+                turn_id,
+            },
+            Box::new(DiagnosticInvocation),
+        )
+        .await
+        .unwrap();
+        let records = tokio::fs::read_to_string(journal_path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<JournalRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert!(!result.is_error);
+        assert!(matches!(
+            records.first().map(|record| &record.entry),
+            Some(JournalEntry::ToolStarted(crate::journal::ToolStarted {
+                execution: Some(crate::journal::ToolExecutionStarted::Shell { capabilities }),
+                tool_call_id,
+                tool_name,
+                ..
+            })) if capabilities.is_empty()
+                && tool_call_id == "shell-1"
+                && tool_name == "shell"
+        ));
+        assert!(matches!(
+            records.get(1).map(|record| &record.entry),
+            Some(JournalEntry::ToolCompleted(crate::journal::ToolCompleted {
+                execution: Some(crate::journal::ToolExecutionCompleted::Shell {
+                    stderr,
+                    stdout,
+                    termination: crate::journal::CommandTermination::Exited { code: 0 },
+                }),
+                tool_call_id,
+                ..
+            })) if stderr.bytes == 0
+                && !stderr.truncated
+                && stdout.bytes == 0
+                && !stdout.truncated
+                && tool_call_id == "shell-1"
+        ));
     }
 
     #[tokio::test]

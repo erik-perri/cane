@@ -7,7 +7,8 @@ use crate::tools::path_display::{
     PathDisplayError, RenderedPath, compare_located_files, render_workspace_path,
 };
 use crate::tools::{
-    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, invalid_input, operation_failed,
+    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, ToolExecutionOutput,
+    invalid_input, operation_failed,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -159,7 +160,7 @@ impl PreparedInvocation for PreparedGlob {
     async fn execute(
         self: Box<Self>,
         cancel: CancellationToken,
-    ) -> Result<String, ToolExecutionError> {
+    ) -> Result<ToolExecutionOutput, ToolExecutionError> {
         if cancel.is_cancelled() {
             return Err(ToolExecutionError::Cancelled);
         }
@@ -200,7 +201,10 @@ impl PreparedInvocation for PreparedGlob {
             return Err(ToolExecutionError::Cancelled);
         }
 
-        Ok(format_result_output(result, limits.output_bytes))
+        Ok(ToolExecutionOutput::text(format_result_output(
+            result,
+            limits.output_bytes,
+        )))
     }
 }
 

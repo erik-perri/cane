@@ -3,8 +3,14 @@ use crate::command::{
     CommandDeadline, CommandEnvironmentConfig, CommandExecutionError, CommandExecutor,
     PreparedShellCommand, format_command_result, prepare_shell_command,
 };
+use crate::journal::{
+    CapturedStream, CommandTermination as JournalCommandTermination, ToolExecutionCompleted,
+    ToolExecutionStarted,
+};
 use crate::protocol::{ApprovalLifetime, ApprovalRequirement};
-use crate::tools::{PreparedInvocation, Tool, ToolDefinition, ToolExecutionError};
+use crate::tools::{
+    PreparedInvocation, Tool, ToolDefinition, ToolExecutionError, ToolExecutionOutput,
+};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -91,10 +97,16 @@ impl PreparedInvocation for PreparedShellInvocation {
         &[ApprovalLifetime::Invocation]
     }
 
+    fn execution_started(&self) -> Option<ToolExecutionStarted> {
+        Some(ToolExecutionStarted::Shell {
+            capabilities: Vec::new(),
+        })
+    }
+
     async fn execute(
         self: Box<Self>,
         cancel: CancellationToken,
-    ) -> Result<String, ToolExecutionError> {
+    ) -> Result<ToolExecutionOutput, ToolExecutionError> {
         let Self { executor, prepared } = *self;
         let deadline = CommandDeadline::after(prepared.timeout());
         let (preview, _preview_receiver) = mpsc::channel(PREVIEW_CHANNEL_CAPACITY);
@@ -108,7 +120,36 @@ impl PreparedInvocation for PreparedShellInvocation {
                 }
             })?;
 
-        Ok(format_command_result(&result))
+        let execution = shell_execution_completed(&result);
+
+        Ok(ToolExecutionOutput {
+            content: format_command_result(&result),
+            execution: Some(execution),
+        })
+    }
+}
+
+fn shell_execution_completed(result: &crate::command::CommandResult) -> ToolExecutionCompleted {
+    let termination = match result.termination {
+        crate::command::CommandTermination::Exited { code } => {
+            JournalCommandTermination::Exited { code }
+        }
+        crate::command::CommandTermination::Signaled { signal } => {
+            JournalCommandTermination::Signaled { signal }
+        }
+        crate::command::CommandTermination::TimedOut => JournalCommandTermination::TimedOut,
+    };
+
+    ToolExecutionCompleted::Shell {
+        stderr: CapturedStream {
+            bytes: result.output.stderr_bytes,
+            truncated: result.output.stderr_truncated(),
+        },
+        stdout: CapturedStream {
+            bytes: result.output.stdout_bytes,
+            truncated: result.output.stdout_truncated(),
+        },
+        termination,
     }
 }
 
@@ -311,6 +352,54 @@ mod tests {
             invocation.available_grant_lifetimes(),
             [ApprovalLifetime::Invocation]
         );
+    }
+
+    #[tokio::test]
+    async fn shell_reports_structured_start_and_completion_diagnostics() {
+        // Arrange
+        let result = CommandResult {
+            output: CapturedOutput {
+                chunks: vec![
+                    CommandOutputChunk::stderr(b"stderr tail".to_vec()),
+                    CommandOutputChunk::stdout(b"stdout".to_vec()),
+                ],
+                stderr_bytes: 50,
+                stdout_bytes: 6,
+            },
+            termination: CommandTermination::TimedOut,
+        };
+        let (_root, tool, _executor) = shell_tool(Ok(result));
+        let invocation = tool
+            .prepare(serde_json::json!({ "command": "cargo test" }))
+            .await
+            .unwrap();
+
+        // Act
+        let started = invocation.execution_started();
+        let completed = invocation.execute(CancellationToken::new()).await.unwrap();
+
+        // Assert
+        assert_eq!(
+            started,
+            Some(ToolExecutionStarted::Shell {
+                capabilities: Vec::new(),
+            })
+        );
+        assert_eq!(
+            completed.execution,
+            Some(ToolExecutionCompleted::Shell {
+                stderr: CapturedStream {
+                    bytes: 50,
+                    truncated: true,
+                },
+                stdout: CapturedStream {
+                    bytes: 6,
+                    truncated: false,
+                },
+                termination: JournalCommandTermination::TimedOut,
+            })
+        );
+        assert!(completed.content.starts_with("process timed out\n"));
     }
 
     #[tokio::test]

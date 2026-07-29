@@ -4,7 +4,7 @@ use crate::tools::file_discovery::{FileDiscoveryError, FileSelector, LocatedFile
 use crate::tools::path_display::{compare_located_files, render_workspace_path};
 use crate::tools::{
     MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition, ToolExecutionError,
-    background_task_failed, invalid_input, operation_failed,
+    ToolExecutionOutput, background_task_failed, invalid_input, operation_failed,
 };
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use serde::Deserialize;
@@ -396,7 +396,7 @@ impl PreparedInvocation for PreparedGrep {
     async fn execute(
         self: Box<Self>,
         cancel: CancellationToken,
-    ) -> Result<String, ToolExecutionError> {
+    ) -> Result<ToolExecutionOutput, ToolExecutionError> {
         if cancel.is_cancelled() {
             return Err(ToolExecutionError::Cancelled);
         }
@@ -465,7 +465,7 @@ impl PreparedInvocation for PreparedGrep {
             return Err(ToolExecutionError::Cancelled);
         }
 
-        Ok(formatted_results)
+        Ok(ToolExecutionOutput::text(formatted_results))
     }
 }
 

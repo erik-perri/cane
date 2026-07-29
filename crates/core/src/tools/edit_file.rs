@@ -2,8 +2,8 @@ use crate::Workspace;
 use crate::protocol::ApprovalRequirement;
 use crate::tools::{
     MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB, PreparedInvocation, Tool, ToolDefinition,
-    ToolExecutionError, background_task_failed, invalid_input, operation_failed,
-    reject_git_directory,
+    ToolExecutionError, ToolExecutionOutput, background_task_failed, invalid_input,
+    operation_failed, reject_git_directory,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -135,7 +135,7 @@ impl PreparedInvocation for PreparedEditFile {
     async fn execute(
         self: Box<Self>,
         cancel: CancellationToken,
-    ) -> Result<String, ToolExecutionError> {
+    ) -> Result<ToolExecutionOutput, ToolExecutionError> {
         if cancel.is_cancelled() {
             return Err(ToolExecutionError::Cancelled);
         }
@@ -163,10 +163,10 @@ impl PreparedInvocation for PreparedEditFile {
 
         let replaced = result.map_err(|error| format_edit_error(&requested_path, error))?;
 
-        Ok(format!(
+        Ok(ToolExecutionOutput::text(format!(
             "edited `{requested_path}`; {replaced} {} replaced",
             occurrence_label(replaced)
-        ))
+        )))
     }
 }
 

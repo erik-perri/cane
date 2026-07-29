@@ -64,6 +64,14 @@ impl CapturedOutput {
         observed_stream_bytes(self, CommandOutputStream::Stderr)
             .saturating_add(observed_stream_bytes(self, CommandOutputStream::Stdout))
     }
+
+    pub fn stderr_truncated(&self) -> bool {
+        stream_was_truncated(self, CommandOutputStream::Stderr)
+    }
+
+    pub fn stdout_truncated(&self) -> bool {
+        stream_was_truncated(self, CommandOutputStream::Stdout)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +139,17 @@ fn observed_stream_bytes(output: &CapturedOutput, stream: CommandOutputStream) -
     };
 
     observed_bytes.max(retained_bytes)
+}
+
+fn stream_was_truncated(output: &CapturedOutput, stream: CommandOutputStream) -> bool {
+    let retained_bytes = output
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.stream == stream)
+        .map(|chunk| u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX))
+        .fold(0_u64, u64::saturating_add);
+
+    observed_stream_bytes(output, stream) > retained_bytes
 }
 
 fn output_header(total_bytes: u64, truncated: bool) -> String {
@@ -312,6 +331,8 @@ mod tests {
             formatted.find("retained stderr tail").unwrap()
                 < formatted.find("retained stdout tail").unwrap()
         );
+        assert!(result.output.stderr_truncated());
+        assert!(result.output.stdout_truncated());
     }
 
     #[test]
