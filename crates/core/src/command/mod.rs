@@ -3,6 +3,8 @@ mod deadline;
 mod diagnostics;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod linux_executor;
 mod output;
 mod policy;
 
@@ -17,6 +19,8 @@ pub use linux::{
     BubblewrapInstallation, BubblewrapResolutionError, LinuxSandboxOperation, LinuxSandboxPlan,
     compile_linux_sandbox_plan, resolve_bubblewrap,
 };
+#[cfg(target_os = "linux")]
+pub use linux_executor::{BubblewrapExecutor, UnsafeExecutor, establish_bubblewrap_executor};
 pub use output::{
     CapturedOutput, CommandOutputChunk, CommandOutputStream, CommandResult, CommandTermination,
     MAX_COMMAND_RESULT_BYTES, format_command_result,

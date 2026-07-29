@@ -104,8 +104,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
-      - name: Probe required Linux sandbox capabilities
-        run: >-
-          cargo test -p cane-core
-          command::linux::tests::installed_bubblewrap_passes_the_functional_probe
-          -- --ignored --exact
+      - name: Run Linux sandbox enforcement suite
+        run: |
+          cargo test -p cane-core installed_bubblewrap_ -- --ignored

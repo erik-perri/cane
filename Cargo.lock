@@ -132,6 +132,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "jiff",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
