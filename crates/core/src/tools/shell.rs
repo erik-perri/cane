@@ -1,8 +1,8 @@
 use crate::Workspace;
 use crate::command::{
-    CommandClassification, CommandDeadline, CommandEnvironmentConfig, CommandExecutionError,
-    CommandExecutor, DockerEndpoint, DockerExecutableName, DockerIntegration, PreparedShellCommand,
-    format_command_result, prepare_shell_command,
+    CommandDeadline, CommandEnvironmentConfig, CommandExecutionError, CommandExecutor,
+    DockerEndpoint, DockerExecutableName, DockerIntegration, PreparedShellCommand,
+    format_command_result, invokes_direct_executable, prepare_shell_command,
 };
 use crate::journal::{
     CapturedStream, CommandTermination as JournalCommandTermination, ExecutionCapability,
@@ -42,17 +42,19 @@ impl ShellIntegrations {
     }
 
     fn docker_integration_for(&self, prepared: &PreparedShellCommand) -> Option<DockerIntegration> {
-        let CommandClassification::Simple(command) = prepared.classification() else {
-            return None;
-        };
-        let name = match command.executable() {
-            "docker" => DockerExecutableName::Docker,
-            "docker-compose" => DockerExecutableName::DockerCompose,
-            _ => return None,
-        };
         self.docker
             .as_ref()
-            .filter(|integration| integration.supports(name))
+            .filter(|integration| {
+                [
+                    (DockerExecutableName::Docker, "docker"),
+                    (DockerExecutableName::DockerCompose, "docker-compose"),
+                ]
+                .into_iter()
+                .any(|(name, executable)| {
+                    integration.supports(name)
+                        && invokes_direct_executable(prepared.command(), executable)
+                })
+            })
             .cloned()
     }
 
@@ -90,15 +92,16 @@ impl ShellTool {
 #[async_trait::async_trait]
 impl Tool for ShellTool {
     fn definition(&self) -> ToolDefinition {
+        let docker_available = self.integrations.docker.is_some();
         ToolDefinition {
             name: "shell".to_string(),
-            description: shell_description(self.integrations.docker.is_some()),
+            description: shell_description(docker_available),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The exact Bash command to execute."
+                        "description": shell_command_description(docker_available)
                     },
                     "timeout_seconds": {
                         "type": "integer",
@@ -140,12 +143,24 @@ fn shell_description(docker_available: bool) -> String {
         .to_string();
     if docker_available {
         description.push_str(
-            " Direct `docker` and `docker-compose` commands can request Docker daemon access; \
-                 wrappers and compound commands do not receive it.",
+            " A shell invocation containing an actual command-position `docker` or \
+             `docker-compose` command can request Docker daemon access. When authorized, the \
+             entire shell invocation and all descendants receive that access. Mere mentions, \
+             executable paths, and opaque wrappers do not request it.",
         );
     }
 
     description
+}
+
+fn shell_command_description(docker_available: bool) -> &'static str {
+    if docker_available {
+        "The exact Bash command to execute. An actual command-position `docker` or \
+         `docker-compose` command makes the entire shell invocation and its descendants eligible \
+         for Docker daemon access; mentioning Docker as data or hiding it behind a wrapper does not."
+    } else {
+        "The exact Bash command to execute."
+    }
 }
 
 struct PreparedShellInvocation {
@@ -416,10 +431,15 @@ mod tests {
 
         // Act
         let description = shell_description(docker_available);
+        let command_description = shell_command_description(docker_available);
 
         // Assert
-        assert!(description.contains("Direct `docker`"));
-        assert!(description.contains("compound commands"));
+        assert!(description.contains("actual command-position `docker`"));
+        assert!(description.contains("entire shell invocation and all descendants"));
+        assert!(description.contains("opaque wrappers"));
+        assert!(command_description.contains("command-position `docker`"));
+        assert!(command_description.contains("entire shell invocation"));
+        assert!(command_description.contains("mentioning Docker as data"));
         assert!(!description.contains("sandbox"));
         assert!(!description.contains("approval"));
     }
@@ -595,7 +615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compound_docker_command_does_not_request_or_receive_daemon_access() {
+    async fn compound_invocation_with_a_direct_docker_segment_requests_daemon_access_for_all() {
         // Arrange
         let socket_root = TempDir::new().unwrap();
         let socket_path = socket_root.path().join("docker.sock");
@@ -606,18 +626,30 @@ mod tests {
             termination: CommandTermination::Exited { code: 0 },
         };
         let (_root, tool, executor, _events) =
-            shell_tool_with_docker(Ok(result), Some(endpoint.into()));
-        let invocation = tool
-            .prepare(serde_json::json!({ "command": "docker ps | cat" }))
+            shell_tool_with_docker(Ok(result), Some(endpoint.clone().into()));
+        let mut invocation = tool
+            .prepare(serde_json::json!({
+                "command": "which docker 2>&1; docker ps | cat"
+            }))
             .await
             .unwrap();
+        let approval_id = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAY".parse().unwrap();
 
         // Act
-        let capability_request = invocation.capability_request();
+        let capability_request = invocation.capability_request().unwrap();
+        invocation
+            .authorize_capability(AuthorizedCapability {
+                capability: capability_request.capability.clone(),
+                source: crate::journal::CapabilityAuthorizationSource::Approval { approval_id },
+            })
+            .unwrap();
         let output = invocation.execute(CancellationToken::new()).await.unwrap();
 
         // Assert
-        assert_eq!(capability_request, None);
+        assert_eq!(
+            capability_request.capability,
+            NamedCapability::docker_daemon(endpoint.resource())
+        );
         assert_eq!(
             output.content,
             "process exited with code 0\noutput (0 bytes, complete):\n"
@@ -626,8 +658,40 @@ mod tests {
             executor.observations.lock().unwrap()[0]
                 .request
                 .docker_endpoint,
-            None
+            Some(endpoint)
         );
+    }
+
+    #[tokio::test]
+    async fn docker_mentions_and_opaque_wrappers_request_no_daemon_access() {
+        // Arrange
+        let socket_root = TempDir::new().unwrap();
+        let socket_path = socket_root.path().join("docker.sock");
+        let _socket = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(socket_path).unwrap();
+        let result = CommandResult {
+            output: CapturedOutput::complete(Vec::new()),
+            termination: CommandTermination::Exited { code: 0 },
+        };
+        let (_root, tool, _executor, _events) =
+            shell_tool_with_docker(Ok(result), Some(endpoint.into()));
+
+        for command in [
+            "echo docker; true",
+            "grep docker README.md",
+            "/usr/bin/docker ps",
+            "env docker ps",
+            "make docker-test",
+        ] {
+            // Act
+            let invocation = tool
+                .prepare(serde_json::json!({ "command": command }))
+                .await
+                .unwrap();
+
+            // Assert
+            assert!(invocation.capability_request().is_none(), "{command}");
+        }
     }
 
     #[tokio::test]

@@ -255,7 +255,8 @@ fn capability_notice(subject: &ApprovalSubject) -> Option<String> {
         CapabilityKind::DockerDaemon => Some(format!(
             "WARNING: Docker daemon access can mount arbitrary host paths, use external networks, \
              and create persistent host effects. The command sandbox does not make Docker safe, \
-             and containers may outlive this command or Cane. Endpoint: {}",
+             and containers may outlive this command or Cane. If approved, this entire shell \
+             invocation and all descendants receive access. Endpoint: {}",
             capability.resource()
         )),
     }
@@ -858,6 +859,7 @@ mod tests {
         assert!(notice.contains("persistent host effects"));
         assert!(notice.contains("does not make Docker safe"));
         assert!(notice.contains("containers may outlive"));
+        assert!(notice.contains("entire shell invocation and all descendants"));
         assert!(notice.contains("unix:///run/user/1000/docker.sock"));
     }
 

@@ -9,6 +9,7 @@ mod linux_executor;
 mod output;
 mod policy;
 
+pub(crate) use classify::invokes_direct_executable;
 pub use classify::{CommandClassification, SimpleCommand, classify_command};
 pub use deadline::CommandDeadline;
 pub use diagnostics::{
