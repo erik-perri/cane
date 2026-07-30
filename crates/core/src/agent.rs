@@ -1,17 +1,17 @@
 use crate::Workspace;
 use crate::approval::{
-    ApprovalAuthorization, ApprovalCheck, ApprovalGate, ApprovalOutcome, request_approval,
+    ApprovalCheck, ApprovalGate, ApprovalOutcome, EffectiveAuthorization, request_approval,
 };
 use crate::command::{
     CommandEnvironmentConfig, CommandExecutionMode, CommandExecutor, CommandSandboxPolicy,
     SandboxFilesystemAccess,
 };
 use crate::journal::{
-    ApprovalGrantSource, ApprovalId, BoundaryEnforcement, CapabilityAuthorizationSource,
-    EffectiveApprovalGrant, ErrorDetail, FilesystemAccess, JournalApprovalDecision, JournalEntry,
-    JournalError, RunEndReason, RunId, RunJournal, RunStarted, SessionId, SessionJournal,
-    SessionStarted, ShellBoundaries, ShellExposedRoot, ShellMode, ShellPolicy, ShellSandboxBackend,
-    ToolAuthorization, TurnAbortOutcome, TurnCommitOutcome, TurnId,
+    ApprovalId, BoundaryEnforcement, CapabilityAuthorizationSource, CapabilityConsentSource,
+    EffectiveCapabilityConsent, ErrorDetail, FilesystemAccess, JournalApprovalDecision,
+    JournalEntry, JournalError, RunEndReason, RunId, RunJournal, RunStarted, SessionId,
+    SessionJournal, SessionStarted, ShellBoundaries, ShellExposedRoot, ShellMode, ShellPolicy,
+    ShellSandboxBackend, ToolAuthorization, TurnAbortOutcome, TurnCommitOutcome, TurnId,
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, ToolInput, ToolResultData};
 use crate::protocol::{
@@ -38,10 +38,27 @@ const MAX_PROVIDER_ROUNDS_PER_TURN: usize = 24;
 
 pub struct AgentSession {
     client: OpenAiClient,
-    configured_approval_grants: Vec<crate::ApprovalGrant>,
+    configured_capability_consents: Vec<crate::NamedCapability>,
     host_handle: HostHandle,
     journal: RunJournal,
     tool_set: ToolSet,
+    workspace_consent_persistence: Option<WorkspaceConsentPersistence>,
+}
+
+struct WorkspaceConsentPersistence {
+    consent: crate::WorkspaceCapabilityConsent,
+    recover_invalid: bool,
+    store: crate::WorkspaceCapabilityConsentStore,
+}
+
+struct WorkspaceConsentStartup {
+    configured: Vec<crate::NamedCapability>,
+    persistence: Option<WorkspaceConsentPersistence>,
+}
+
+enum SubjectAuthorizationOutcome {
+    Approval(ApprovalOutcome),
+    WorkspaceConsentPersistenceFailed { reason: String },
 }
 
 pub struct AgentHandle {
@@ -248,7 +265,7 @@ struct TurnBudget {
 }
 
 struct AuthorizedToolCall<'a> {
-    authorization: ApprovalAuthorization,
+    authorization: EffectiveAuthorization,
     id: &'a str,
     input: &'a Value,
     name: &'a str,
@@ -334,9 +351,9 @@ pub async fn spawn_agent_with_shell(
     )?;
     let (events_tx, events_rx) = mpsc::channel(64);
     let events = EventSink::new(events_tx);
-    let configured_approval_grants = match sessions.workspace_grants().cloned() {
+    let workspace_consents = match sessions.workspace_consents().cloned() {
         Some(store) => {
-            load_configured_workspace_grants(
+            load_configured_workspace_consents(
                 store,
                 &workspace,
                 shell.integrations.docker_endpoint(),
@@ -344,8 +361,12 @@ pub async fn spawn_agent_with_shell(
             )
             .await
         }
-        None => Vec::new(),
+        None => WorkspaceConsentStartup {
+            configured: Vec::new(),
+            persistence: None,
+        },
     };
+    let configured_capability_consents = workspace_consents.configured;
     let (shell_tool, shell_policy, shell_workspace) = shell.into_parts(events.clone());
     if let Some(configured) = shell_workspace {
         let matches_workspace =
@@ -375,12 +396,12 @@ pub async fn spawn_agent_with_shell(
 
     journal
         .append(JournalEntry::RunStarted(RunStarted {
-            approval_grants: configured_approval_grants
+            capability_consents: configured_capability_consents
                 .iter()
                 .cloned()
-                .map(|grant| EffectiveApprovalGrant {
-                    grant,
-                    source: ApprovalGrantSource::WorkspaceConfiguration,
+                .map(|capability| EffectiveCapabilityConsent {
+                    capability,
+                    source: CapabilityConsentSource::WorkspaceConfiguration,
                 })
                 .collect(),
             git: None,
@@ -407,10 +428,11 @@ pub async fn spawn_agent_with_shell(
 
         let session = AgentSession {
             client,
-            configured_approval_grants,
+            configured_capability_consents,
             host_handle,
             journal,
             tool_set,
+            workspace_consent_persistence: workspace_consents.persistence,
         };
 
         run_and_report(session, &events).await;
@@ -426,22 +448,26 @@ pub async fn spawn_agent_with_shell(
     })
 }
 
-async fn load_configured_workspace_grants(
-    store: crate::WorkspaceCapabilityGrantStore,
+async fn load_configured_workspace_consents(
+    store: crate::WorkspaceCapabilityConsentStore,
     workspace: &Workspace,
     docker_endpoint: Option<&crate::command::DockerEndpoint>,
     events: &EventSink,
-) -> Vec<crate::ApprovalGrant> {
+) -> WorkspaceConsentStartup {
+    let live_consent = docker_endpoint.and_then(|endpoint| {
+        crate::WorkspaceCapabilityConsent::docker_daemon(workspace, endpoint).ok()
+    });
+    let load_store = store.clone();
     let load = tokio::task::spawn_blocking(move || {
-        store
+        load_store
             .refresh_schema()
             .map_err(|error| {
                 format!(
-                    "Workspace capability grants are unavailable because the generated schema \
+                    "Workspace capability consents are unavailable because the generated schema \
                      could not be refreshed: {error}"
                 )
             })
-            .map(|_| store.load())
+            .map(|_| load_store.load())
     })
     .await;
 
@@ -449,22 +475,42 @@ async fn load_configured_workspace_grants(
         Ok(Ok(outcome)) => outcome,
         Ok(Err(warning)) => {
             events.emit_best_effort(AgentEvent::Warning(warning));
-            return Vec::new();
+            return WorkspaceConsentStartup {
+                configured: Vec::new(),
+                persistence: None,
+            };
         }
         Err(error) => {
             events.emit_best_effort(AgentEvent::Warning(format!(
-                "Workspace capability grants are unavailable because their blocking load task \
+                "Workspace capability consents are unavailable because their blocking load task \
                  failed: {error}"
             )));
-            return Vec::new();
+            return WorkspaceConsentStartup {
+                configured: Vec::new(),
+                persistence: None,
+            };
         }
     };
 
     match outcome {
-        cane_config::LoadOutcome::Missing => Vec::new(),
-        cane_config::LoadOutcome::Loaded(loaded) => loaded
-            .document
-            .effective_approval_grants(workspace, docker_endpoint),
+        cane_config::LoadOutcome::Missing => WorkspaceConsentStartup {
+            configured: Vec::new(),
+            persistence: live_consent.map(|consent| WorkspaceConsentPersistence {
+                consent,
+                recover_invalid: false,
+                store,
+            }),
+        },
+        cane_config::LoadOutcome::Loaded(loaded) => WorkspaceConsentStartup {
+            configured: loaded
+                .document
+                .effective_capability_consents(workspace, docker_endpoint),
+            persistence: live_consent.map(|consent| WorkspaceConsentPersistence {
+                consent,
+                recover_invalid: false,
+                store,
+            }),
+        },
         cane_config::LoadOutcome::Invalid(invalid) => {
             let detail = match invalid {
                 cane_config::InvalidDocument::MalformedJson(error) => error.to_string(),
@@ -472,23 +518,37 @@ async fn load_configured_workspace_grants(
                 cane_config::InvalidDocument::Rejected(error) => error.to_string(),
             };
             events.emit_best_effort(AgentEvent::Warning(format!(
-                "Workspace capability grants were ignored because the configuration document is \
-                 invalid: {detail}"
+                "Workspace capability consents were ignored because the configuration document is \
+                 invalid: {detail}. Choosing Workspace for a new capability approval in this Run \
+                 will archive and replace the invalid document"
             )));
-            Vec::new()
+            WorkspaceConsentStartup {
+                configured: Vec::new(),
+                persistence: live_consent.map(|consent| WorkspaceConsentPersistence {
+                    consent,
+                    recover_invalid: true,
+                    store,
+                }),
+            }
         }
         cane_config::LoadOutcome::UnsupportedVersion { version } => {
             events.emit_best_effort(AgentEvent::Warning(format!(
-                "Workspace capability grants were ignored because configuration schema version \
+                "Workspace capability consents were ignored because configuration schema version \
                  {version} is not supported"
             )));
-            Vec::new()
+            WorkspaceConsentStartup {
+                configured: Vec::new(),
+                persistence: None,
+            }
         }
         cane_config::LoadOutcome::Io(error) => {
             events.emit_best_effort(AgentEvent::Warning(format!(
-                "Workspace capability grants are unavailable: {error}"
+                "Workspace capability consents are unavailable: {error}"
             )));
-            Vec::new()
+            WorkspaceConsentStartup {
+                configured: Vec::new(),
+                persistence: None,
+            }
         }
     }
 }
@@ -560,7 +620,7 @@ impl AgentSession {
     async fn run_until_end(&mut self) -> Result<RunEndReason, AgentExit> {
         let mut history = Vec::new();
         let mut approval_gate = ApprovalGate::new();
-        approval_gate.seed_workspace_grants(self.configured_approval_grants.clone());
+        approval_gate.seed_workspace_consents(self.configured_capability_consents.clone());
 
         loop {
             let prompt = tokio::select! {
@@ -877,37 +937,53 @@ impl AgentSession {
 
         if let Some(request) = invocation.capability_request() {
             let subject = ApprovalSubject::capability(request.capability.clone(), id, name);
+            let available_lifetimes = request
+                .available_lifetimes
+                .iter()
+                .copied()
+                .filter(|lifetime| {
+                    *lifetime != crate::ApprovalLifetime::Workspace
+                        || self.workspace_consent_persistence.is_some()
+                })
+                .collect::<Vec<_>>();
             let outcome = self
                 .authorize_subject(
                     turn_id,
                     input,
                     gate,
                     ApprovalRequirement::Required,
-                    request.available_lifetimes,
+                    &available_lifetimes,
                     subject,
                 )
                 .await?;
             let authorization = match outcome {
-                ApprovalOutcome::Authorized(authorization) => authorization,
-                ApprovalOutcome::Denied { reason } => {
+                SubjectAuthorizationOutcome::Approval(ApprovalOutcome::Authorized(
+                    authorization,
+                )) => authorization,
+                SubjectAuthorizationOutcome::Approval(ApprovalOutcome::Denied { reason }) => {
                     self.reject_denied_tool(turn_id, id, name, &reason, "capability_denied")
                         .await?;
                     return Ok(denied_tool_result(id, &reason));
                 }
-                ApprovalOutcome::InvalidGrant { reason } => {
+                SubjectAuthorizationOutcome::Approval(ApprovalOutcome::InvalidGrant { reason }) => {
                     self.reject_invalid_grant(turn_id, id, name, &reason)
+                        .await?;
+                    return Ok(failed_tool_result(id, reason));
+                }
+                SubjectAuthorizationOutcome::WorkspaceConsentPersistenceFailed { reason } => {
+                    self.reject_workspace_consent_persistence_failure(turn_id, id, name, &reason)
                         .await?;
                     return Ok(failed_tool_result(id, reason));
                 }
             };
             let source = match authorization {
-                ApprovalAuthorization::Granted { approval_id, .. } => {
+                EffectiveAuthorization::ApprovalGrant { approval_id, .. } => {
                     CapabilityAuthorizationSource::Approval { approval_id }
                 }
-                ApprovalAuthorization::WorkspaceConfigured { .. } => {
+                EffectiveAuthorization::WorkspaceCapabilityConsent { .. } => {
                     CapabilityAuthorizationSource::WorkspaceConfiguration
                 }
-                ApprovalAuthorization::NotRequired => {
+                EffectiveAuthorization::NotRequired => {
                     unreachable!("required capability approval cannot be not-required")
                 }
             };
@@ -942,14 +1018,21 @@ impl AgentSession {
             )
             .await?
         {
-            ApprovalOutcome::Authorized(authorization) => authorization,
-            ApprovalOutcome::Denied { reason } => {
+            SubjectAuthorizationOutcome::Approval(ApprovalOutcome::Authorized(authorization)) => {
+                authorization
+            }
+            SubjectAuthorizationOutcome::Approval(ApprovalOutcome::Denied { reason }) => {
                 self.reject_denied_tool(turn_id, id, name, &reason, "approval_denied")
                     .await?;
                 return Ok(denied_tool_result(id, &reason));
             }
-            ApprovalOutcome::InvalidGrant { reason } => {
+            SubjectAuthorizationOutcome::Approval(ApprovalOutcome::InvalidGrant { reason }) => {
                 self.reject_invalid_grant(turn_id, id, name, &reason)
+                    .await?;
+                return Ok(failed_tool_result(id, reason));
+            }
+            SubjectAuthorizationOutcome::WorkspaceConsentPersistenceFailed { reason } => {
+                self.reject_workspace_consent_persistence_failure(turn_id, id, name, &reason)
                     .await?;
                 return Ok(failed_tool_result(id, reason));
             }
@@ -985,9 +1068,11 @@ impl AgentSession {
         requirement: ApprovalRequirement,
         available_lifetimes: &[crate::ApprovalLifetime],
         subject: ApprovalSubject,
-    ) -> Result<ApprovalOutcome, AgentExit> {
+    ) -> Result<SubjectAuthorizationOutcome, AgentExit> {
         if let ApprovalCheck::Authorized(authorization) = gate.check(requirement, &subject) {
-            return Ok(ApprovalOutcome::Authorized(authorization));
+            return Ok(SubjectAuthorizationOutcome::Approval(
+                ApprovalOutcome::Authorized(authorization),
+            ));
         }
 
         let approval_id = ApprovalId::generate();
@@ -1007,7 +1092,7 @@ impl AgentSession {
             &self.host_handle.cancel,
         )
         .await?;
-        let outcome = gate.apply_decision(available_lifetimes, approval_id, &decision, &subject);
+        let outcome = gate.evaluate_decision(available_lifetimes, approval_id, &decision, &subject);
         if matches!(
             outcome,
             ApprovalOutcome::Authorized(_) | ApprovalOutcome::Denied { .. }
@@ -1016,7 +1101,87 @@ impl AgentSession {
                 .approval_decided(approval_id, journal_approval_decision(&decision))
                 .await?;
         }
-        Ok(outcome)
+        if let ApprovalOutcome::Authorized(authorization) = &outcome {
+            if let EffectiveAuthorization::ApprovalGrant { approval_id, grant } = authorization
+                && grant.lifetime() == crate::ApprovalLifetime::Workspace
+            {
+                if let Err(reason) = self.persist_workspace_consent(&subject).await {
+                    self.journal
+                        .workspace_capability_consent_persistence_failed(
+                            *approval_id,
+                            ErrorDetail {
+                                category: "configuration_persistence".to_string(),
+                                message: reason.clone(),
+                            },
+                        )
+                        .await?;
+                    return Ok(
+                        SubjectAuthorizationOutcome::WorkspaceConsentPersistenceFailed { reason },
+                    );
+                }
+                self.journal
+                    .workspace_capability_consent_persisted(*approval_id)
+                    .await?;
+            }
+            gate.activate(authorization);
+        }
+        Ok(SubjectAuthorizationOutcome::Approval(outcome))
+    }
+
+    async fn persist_workspace_consent(&mut self, subject: &ApprovalSubject) -> Result<(), String> {
+        let persistence = self.workspace_consent_persistence.as_mut().ok_or_else(|| {
+            "Workspace capability consent persistence is unavailable for this Run".to_string()
+        })?;
+        let ApprovalSubject::Capability { capability, .. } = subject else {
+            return Err(
+                "only named capabilities can be persisted as Workspace consent".to_string(),
+            );
+        };
+        if capability.kind() != persistence.consent.capability_kind()
+            || capability.resource() != persistence.consent.resource()
+        {
+            return Err(
+                "requested capability does not match the current canonical integration".to_string(),
+            );
+        }
+
+        let store = persistence.store.clone();
+        let consent = persistence.consent.clone();
+        let recover_invalid = persistence.recover_invalid;
+        let result = tokio::task::spawn_blocking(move || {
+            let archived = if recover_invalid {
+                let archive = invalid_workspace_consent_archive_path(store.document_path());
+                match store.archive_invalid(&archive) {
+                    Ok(()) => Some(archive),
+                    Err(cane_config::ArchiveError::Refused(
+                        cane_config::ArchiveRefusal::Missing | cane_config::ArchiveRefusal::Valid,
+                    )) => None,
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to archive the warned invalid Workspace consent document: \
+                             {error}"
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            store.remember(consent).map_err(|error| {
+                format!("failed to persist Workspace capability consent: {error}")
+            })?;
+            Ok::<_, String>(archived)
+        })
+        .await
+        .map_err(|error| format!("Workspace capability persistence task failed: {error}"))??;
+
+        persistence.recover_invalid = false;
+        if let Some(path) = result {
+            tracing::debug!(
+                archive_path = %path.display(),
+                "archived invalid Workspace capability consent document"
+            );
+        }
+        Ok(())
     }
 
     async fn reject_denied_tool(
@@ -1059,6 +1224,46 @@ impl AgentSession {
             .await?;
         Ok(())
     }
+
+    async fn reject_workspace_consent_persistence_failure(
+        &mut self,
+        turn_id: TurnId,
+        id: &str,
+        name: &str,
+        reason: &str,
+    ) -> Result<(), AgentExit> {
+        self.journal
+            .tool_rejected(
+                "workspace_capability_consent_persistence_failed",
+                id,
+                name,
+                turn_id,
+            )
+            .await?;
+        self.host_handle
+            .events
+            .emit(AgentEvent::ToolRejected {
+                error: reason.to_string(),
+                name: name.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+fn invalid_workspace_consent_archive_path(document_path: &Path) -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let file_name = document_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(crate::WORKSPACE_CAPABILITY_CONSENTS_DOCUMENT);
+    document_path.with_file_name(format!(
+        "{file_name}.invalid-{}-{:09}.json",
+        timestamp.as_secs(),
+        timestamp.subsec_nanos()
+    ))
 }
 
 async fn prepare_tool_call(
@@ -1167,15 +1372,15 @@ fn provider_error_detail(error: &ProviderError) -> ErrorDetail {
     }
 }
 
-fn tool_authorization(authorization: ApprovalAuthorization) -> ToolAuthorization {
+fn tool_authorization(authorization: EffectiveAuthorization) -> ToolAuthorization {
     match authorization {
-        ApprovalAuthorization::Granted { approval_id, grant } => {
+        EffectiveAuthorization::ApprovalGrant { approval_id, grant } => {
             ToolAuthorization::Granted { approval_id, grant }
         }
-        ApprovalAuthorization::WorkspaceConfigured { .. } => {
+        EffectiveAuthorization::WorkspaceCapabilityConsent { .. } => {
             unreachable!("Workspace configuration grants capabilities, not tool invocations")
         }
-        ApprovalAuthorization::NotRequired => ToolAuthorization::NotRequired,
+        EffectiveAuthorization::NotRequired => ToolAuthorization::NotRequired,
     }
 }
 
@@ -1650,7 +1855,7 @@ mod tests {
             .unwrap();
         journal
             .append(JournalEntry::RunStarted(RunStarted {
-                approval_grants: Vec::new(),
+                capability_consents: Vec::new(),
                 git: None,
                 max_output_tokens: provider.max_tokens,
                 model: model.clone(),
@@ -1666,10 +1871,11 @@ mod tests {
         (
             AgentSession {
                 client,
-                configured_approval_grants: Vec::new(),
+                configured_capability_consents: Vec::new(),
                 host_handle,
                 journal,
                 tool_set,
+                workspace_consent_persistence: None,
             },
             sessions,
         )
@@ -1854,15 +2060,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_workspace_grants_warn_and_seed_no_authority() {
+    async fn invalid_workspace_consents_warn_and_seed_no_authority() {
         // Arrange
         let server = MockServer::start().await;
         let sessions = TempDir::new().unwrap();
         let config_root = TempDir::new().unwrap();
-        let store = crate::WorkspaceCapabilityGrantStore::new(config_root.path()).unwrap();
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         std::fs::write(store.document_path(), b"invalid").unwrap();
         let config = SessionConfig::new("test-cane-version", "", sessions.path())
-            .with_workspace_capability_grants(store);
+            .with_workspace_capability_consents(store);
 
         // Act
         let mut handle = spawn_agent(test_provider(&server), test_workspace(), config)
@@ -1881,7 +2087,7 @@ mod tests {
         let JournalEntry::RunStarted(started) = &records[1].entry else {
             panic!("expected run_started");
         };
-        assert!(started.approval_grants.is_empty());
+        assert!(started.capability_consents.is_empty());
 
         handle
             .commands
@@ -1893,7 +2099,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn exact_current_workspace_grant_is_recorded_at_startup() {
+    async fn exact_current_workspace_consent_is_recorded_at_startup() {
         use std::os::unix::net::UnixListener;
 
         // Arrange
@@ -1914,12 +2120,12 @@ mod tests {
         )
         .unwrap()
         .with_integration(ShellIntegration::Docker(endpoint.clone()));
-        let store = crate::WorkspaceCapabilityGrantStore::new(config_root.path()).unwrap();
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         std::fs::write(
             store.document_path(),
             serde_json::to_vec(&json!({
                 "schema_version": 0,
-                "grants": [{
+                "consents": [{
                     "workspace": workspace.root().to_str().unwrap(),
                     "capability": {
                         "name": "docker_daemon",
@@ -1931,7 +2137,7 @@ mod tests {
         )
         .unwrap();
         let config = SessionConfig::new("test-cane-version", "", sessions.path())
-            .with_workspace_capability_grants(store);
+            .with_workspace_capability_consents(store);
 
         // Act
         let handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
@@ -1945,15 +2151,10 @@ mod tests {
             panic!("expected run_started");
         };
         assert_eq!(
-            started.approval_grants,
-            vec![EffectiveApprovalGrant {
-                grant: ApprovalSubject::capability(
-                    crate::NamedCapability::docker_daemon(endpoint.resource()),
-                    "seed",
-                    "shell",
-                )
-                .grant(crate::ApprovalLifetime::Workspace),
-                source: ApprovalGrantSource::WorkspaceConfiguration,
+            started.capability_consents,
+            vec![EffectiveCapabilityConsent {
+                capability: crate::NamedCapability::docker_daemon(endpoint.resource()),
+                source: CapabilityConsentSource::WorkspaceConfiguration,
             }]
         );
 
@@ -2245,12 +2446,12 @@ mod tests {
         )
         .unwrap()
         .with_integration(ShellIntegration::Docker(endpoint.clone()));
-        let store = crate::WorkspaceCapabilityGrantStore::new(config_root.path()).unwrap();
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         std::fs::write(
             store.document_path(),
             serde_json::to_vec(&json!({
                 "schema_version": 0,
-                "grants": [{
+                "consents": [{
                     "workspace": workspace.root().to_str().unwrap(),
                     "capability": {
                         "name": "docker_daemon",
@@ -2262,7 +2463,7 @@ mod tests {
         )
         .unwrap();
         let config = SessionConfig::new("test-cane-version", "", sessions.path())
-            .with_workspace_capability_grants(store);
+            .with_workspace_capability_consents(store);
         let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
             .await
             .unwrap();
@@ -2350,24 +2551,21 @@ mod tests {
         )
         .unwrap()
         .with_integration(ShellIntegration::Docker(endpoint.clone()));
-        let store = crate::WorkspaceCapabilityGrantStore::new(config_root.path()).unwrap();
-        std::fs::write(
-            store.document_path(),
-            serde_json::to_vec(&json!({
-                "schema_version": 0,
-                "grants": [{
-                    "workspace": workspace.root().to_str().unwrap(),
-                    "capability": {
-                        "name": "docker_daemon",
-                        "resource": "unix:///different/docker.sock"
-                    }
-                }]
-            }))
-            .unwrap(),
-        )
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
+        let persisted = serde_json::to_vec(&json!({
+            "schema_version": 0,
+            "consents": [{
+                "workspace": workspace.root().to_str().unwrap(),
+                "capability": {
+                    "name": "docker_daemon",
+                    "resource": "unix:///different/docker.sock"
+                }
+            }]
+        }))
         .unwrap();
+        std::fs::write(store.document_path(), &persisted).unwrap();
         let config = SessionConfig::new("test-cane-version", "", sessions.path())
-            .with_workspace_capability_grants(store);
+            .with_workspace_capability_consents(store.clone());
         let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
             .await
             .unwrap();
@@ -2375,7 +2573,7 @@ mod tests {
         let JournalEntry::RunStarted(started) = &startup_records[1].entry else {
             panic!("expected run_started");
         };
-        assert!(started.approval_grants.is_empty());
+        assert!(started.capability_consents.is_empty());
         handle
             .commands
             .send(AgentCommand::UserInput("Check Docker.".to_string()))
@@ -2477,6 +2675,478 @@ mod tests {
                         })
                 )
         )));
+        assert_eq!(std::fs::read(store.document_path()).unwrap(), persisted);
+        assert!(projection.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_decision_is_persisted_before_activation_and_restored_next_run() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[("shell-1", "shell", json!({ "command": "docker ps" }))]),
+                text_turn("Understood."),
+            ],
+        )
+        .await;
+        let sessions = TempDir::new().unwrap();
+        let config_root = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let policy = sandbox_policy(&root);
+        let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let socket_path = root.path().join("docker.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(socket_path).unwrap();
+        let shell = AgentShellConfig::sandboxed(
+            command_environment(),
+            Arc::new(CompletingShellExecutor {
+                result: crate::command::CommandResult {
+                    output: crate::command::CapturedOutput::complete(Vec::new()),
+                    termination: crate::command::CommandTermination::Exited { code: 0 },
+                },
+            }),
+            Some("fake 1.0".to_string()),
+            &policy,
+        )
+        .unwrap()
+        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path())
+            .with_workspace_capability_consents(store.clone());
+        let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
+            .await
+            .unwrap();
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Check Docker.".to_string()))
+            .await
+            .unwrap();
+        let (capability_approval, capability_subject) = loop {
+            let event = handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                available_lifetimes,
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                assert_eq!(
+                    available_lifetimes,
+                    [ApprovalLifetime::Run, ApprovalLifetime::Workspace]
+                );
+                break (respond_to, subject);
+            }
+        };
+
+        // Act
+        capability_approval
+            .send(ApprovalDecision::Grant(
+                capability_subject.grant(ApprovalLifetime::Workspace),
+            ))
+            .unwrap();
+        let (tool_approval, tool_subject) = loop {
+            let event = handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                break (respond_to, subject);
+            }
+        };
+        let persisted = store.load();
+        let records_before_tool_decision = read_journal_records(handle.journal_path()).await;
+
+        // Assert
+        let cane_config::LoadOutcome::Loaded(loaded) = persisted else {
+            panic!("expected persisted Workspace consent");
+        };
+        assert_eq!(loaded.document.consents().len(), 1);
+        assert_eq!(
+            loaded.document.consents()[0].workspace(),
+            policy.workspace().to_str().unwrap()
+        );
+        assert_eq!(
+            loaded.document.consents()[0].resource(),
+            endpoint.resource()
+        );
+        let (approval_id, decided_sequence) = records_before_tool_decision
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ApprovalDecided(decided)
+                    if matches!(
+                            &decided.decision,
+                            JournalApprovalDecision::Grant { grant }
+                                if grant.lifetime() == ApprovalLifetime::Workspace
+                    ) =>
+                {
+                    Some((decided.approval_id, record.sequence))
+                }
+                _ => None,
+            })
+            .expect("Workspace decision was not journaled");
+        let persisted_sequence = records_before_tool_decision
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::WorkspaceCapabilityConsentPersisted(persisted)
+                    if persisted.approval_id == approval_id =>
+                {
+                    Some(record.sequence)
+                }
+                _ => None,
+            })
+            .expect("Workspace capability consent persistence was not journaled");
+        assert!(decided_sequence < persisted_sequence);
+        assert!(
+            !records_before_tool_decision
+                .iter()
+                .any(|record| matches!(&record.entry, JournalEntry::ToolStarted(_)))
+        );
+
+        tool_approval
+            .send(ApprovalDecision::Deny {
+                reason: "do not run it".to_string(),
+            })
+            .unwrap();
+        let _events = collect_turn(&mut handle.events).await;
+        let (records, projection) = finish_and_project(handle).await;
+        let rejection_sequence = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ToolRejected(rejected)
+                    if rejected.error_category == "approval_denied" =>
+                {
+                    Some(record.sequence)
+                }
+                _ => None,
+            })
+            .expect("denied shell invocation was not journaled");
+        assert!(persisted_sequence < rejection_sequence);
+        assert!(matches!(store.load(), cane_config::LoadOutcome::Loaded(_)));
+        assert!(projection.warnings.is_empty());
+        assert_eq!(tool_subject, ApprovalSubject::tool_call("shell-1", "shell"));
+
+        let second_server = MockServer::start().await;
+        mount_turns(
+            &second_server,
+            vec![
+                tool_call_turn(&[("shell-2", "shell", json!({ "command": "docker ps" }))]),
+                text_turn("Understood."),
+            ],
+        )
+        .await;
+        let second_workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let second_shell = AgentShellConfig::sandboxed(
+            command_environment(),
+            Arc::new(CompletingShellExecutor {
+                result: crate::command::CommandResult {
+                    output: crate::command::CapturedOutput::complete(Vec::new()),
+                    termination: crate::command::CommandTermination::Exited { code: 0 },
+                },
+            }),
+            Some("fake 1.0".to_string()),
+            &policy,
+        )
+        .unwrap()
+        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        let second_config = SessionConfig::new("test-cane-version", "", sessions.path())
+            .with_workspace_capability_consents(store);
+        let mut second_handle = spawn_agent_with_shell(
+            test_provider(&second_server),
+            second_workspace,
+            second_config,
+            second_shell,
+        )
+        .await
+        .unwrap();
+        second_handle
+            .commands
+            .send(AgentCommand::UserInput("Check Docker again.".to_string()))
+            .await
+            .unwrap();
+        let (second_tool_approval, second_subject) = loop {
+            let event = second_handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                break (respond_to, subject);
+            }
+        };
+        assert_eq!(
+            second_subject,
+            ApprovalSubject::tool_call("shell-2", "shell")
+        );
+        second_tool_approval
+            .send(ApprovalDecision::Deny {
+                reason: "do not run it".to_string(),
+            })
+            .unwrap();
+        let _events = collect_turn(&mut second_handle.events).await;
+        let (second_records, second_projection) = finish_and_project(second_handle).await;
+        assert!(!second_records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::ApprovalRequested(requested)
+                if matches!(requested.subject, ApprovalSubject::Capability { .. })
+        )));
+        assert!(second_records.iter().any(|record| matches!(
+            &record.entry,
+            JournalEntry::RunStarted(started)
+                if started.capability_consents
+                    == vec![EffectiveCapabilityConsent {
+                        capability: crate::NamedCapability::docker_daemon(endpoint.resource()),
+                        source: CapabilityConsentSource::WorkspaceConfiguration,
+                    }]
+        )));
+        assert!(second_projection.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_consent_persistence_failure_activates_nothing_and_rejects_the_tool() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[("shell-1", "shell", json!({ "command": "docker ps" }))]),
+                text_turn("I could not run it."),
+            ],
+        )
+        .await;
+        let sessions = TempDir::new().unwrap();
+        let config_root = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let policy = sandbox_policy(&root);
+        let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let socket_path = root.path().join("docker.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(socket_path).unwrap();
+        let shell = AgentShellConfig::sandboxed(
+            command_environment(),
+            Arc::new(CompletingShellExecutor {
+                result: crate::command::CommandResult {
+                    output: crate::command::CapturedOutput::complete(Vec::new()),
+                    termination: crate::command::CommandTermination::Exited { code: 0 },
+                },
+            }),
+            Some("fake 1.0".to_string()),
+            &policy,
+        )
+        .unwrap()
+        .with_integration(ShellIntegration::Docker(endpoint));
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path())
+            .with_workspace_capability_consents(store.clone());
+        let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
+            .await
+            .unwrap();
+        let unsupported = br#"{"schema_version":99,"consents":[]}"#;
+        std::fs::write(store.document_path(), unsupported).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Check Docker.".to_string()))
+            .await
+            .unwrap();
+        let (capability_approval, capability_subject) = loop {
+            let event = handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                available_lifetimes,
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                assert!(available_lifetimes.contains(&ApprovalLifetime::Workspace));
+                break (respond_to, subject);
+            }
+        };
+
+        // Act
+        capability_approval
+            .send(ApprovalDecision::Grant(
+                capability_subject.grant(ApprovalLifetime::Workspace),
+            ))
+            .unwrap();
+        let events = collect_turn(&mut handle.events).await;
+        let (records, projection) = finish_and_project(handle).await;
+
+        // Assert
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolRejected { error, .. }
+                if error.contains("failed to persist Workspace capability consent")
+        )));
+        assert_eq!(std::fs::read(store.document_path()).unwrap(), unsupported);
+        let (approval_id, decided_sequence) = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ApprovalDecided(decided)
+                    if matches!(
+                            &decided.decision,
+                            JournalApprovalDecision::Grant { grant }
+                                if grant.lifetime() == ApprovalLifetime::Workspace
+                    ) =>
+                {
+                    Some((decided.approval_id, record.sequence))
+                }
+                _ => None,
+            })
+            .expect("Workspace decision was not journaled");
+        let failed_sequence = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::WorkspaceCapabilityConsentPersistenceFailed(failed)
+                    if failed.approval_id == approval_id =>
+                {
+                    Some(record.sequence)
+                }
+                _ => None,
+            })
+            .expect("persistence failure was not journaled");
+        let rejected_sequence = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                JournalEntry::ToolRejected(rejected)
+                    if rejected.error_category
+                        == "workspace_capability_consent_persistence_failed" =>
+                {
+                    Some(record.sequence)
+                }
+                _ => None,
+            })
+            .expect("tool rejection was not journaled");
+        assert!(decided_sequence < failed_sequence);
+        assert!(failed_sequence < rejected_sequence);
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(&record.entry, JournalEntry::ToolStarted(_)))
+        );
+        assert!(projection.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warned_invalid_document_is_archived_only_after_workspace_recovery_choice() {
+        // Arrange
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[("shell-1", "shell", json!({ "command": "docker ps" }))]),
+                text_turn("Understood."),
+            ],
+        )
+        .await;
+        let sessions = TempDir::new().unwrap();
+        let config_root = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let policy = sandbox_policy(&root);
+        let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let socket_path = root.path().join("docker.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let endpoint = DockerEndpoint::validate(socket_path).unwrap();
+        let shell = AgentShellConfig::sandboxed(
+            command_environment(),
+            Arc::new(CompletingShellExecutor {
+                result: crate::command::CommandResult {
+                    output: crate::command::CapturedOutput::complete(Vec::new()),
+                    termination: crate::command::CommandTermination::Exited { code: 0 },
+                },
+            }),
+            Some("fake 1.0".to_string()),
+            &policy,
+        )
+        .unwrap()
+        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
+        let invalid = b"invalid Workspace consents";
+        std::fs::write(store.document_path(), invalid).unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path())
+            .with_workspace_capability_consents(store.clone());
+        let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
+            .await
+            .unwrap();
+        let warning = handle.events.recv().await.unwrap();
+        assert!(matches!(warning, AgentEvent::Warning(_)));
+        assert_eq!(std::fs::read(store.document_path()).unwrap(), invalid);
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Check Docker.".to_string()))
+            .await
+            .unwrap();
+        let (capability_approval, capability_subject) = loop {
+            let event = handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                available_lifetimes,
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                assert!(available_lifetimes.contains(&ApprovalLifetime::Workspace));
+                break (respond_to, subject);
+            }
+        };
+
+        // Act
+        capability_approval
+            .send(ApprovalDecision::Grant(
+                capability_subject.grant(ApprovalLifetime::Workspace),
+            ))
+            .unwrap();
+        let (tool_approval, _) = loop {
+            let event = handle.events.recv().await.unwrap();
+            if let AgentEvent::ApprovalRequest {
+                respond_to,
+                subject,
+                ..
+            } = event
+            {
+                break (respond_to, subject);
+            }
+        };
+
+        // Assert
+        let cane_config::LoadOutcome::Loaded(loaded) = store.load() else {
+            panic!("expected recovered Workspace consent document");
+        };
+        assert_eq!(loaded.document.consents().len(), 1);
+        assert_eq!(
+            loaded.document.consents()[0].resource(),
+            endpoint.resource()
+        );
+        let archives = std::fs::read_dir(config_root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&format!(
+                            "{}.invalid-",
+                            crate::WORKSPACE_CAPABILITY_CONSENTS_DOCUMENT
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(std::fs::read(&archives[0]).unwrap(), invalid);
+
+        tool_approval
+            .send(ApprovalDecision::Deny {
+                reason: "do not run it".to_string(),
+            })
+            .unwrap();
+        let _events = collect_turn(&mut handle.events).await;
+        let (_records, projection) = finish_and_project(handle).await;
         assert!(projection.warnings.is_empty());
     }
 
@@ -4728,7 +5398,7 @@ mod tests {
             &host_handle,
             &mut journal,
             AuthorizedToolCall {
-                authorization: ApprovalAuthorization::NotRequired,
+                authorization: EffectiveAuthorization::NotRequired,
                 id: mock_id.as_str(),
                 input: &json!({}),
                 name: "test",
@@ -4770,7 +5440,7 @@ mod tests {
             &host_handle,
             &mut journal,
             AuthorizedToolCall {
-                authorization: ApprovalAuthorization::NotRequired,
+                authorization: EffectiveAuthorization::NotRequired,
                 id: "shell-1",
                 input: &json!({ "command": "true" }),
                 name: "shell",
@@ -4837,7 +5507,7 @@ mod tests {
             &host_handle,
             &mut journal,
             AuthorizedToolCall {
-                authorization: ApprovalAuthorization::NotRequired,
+                authorization: EffectiveAuthorization::NotRequired,
                 id: "call-1",
                 input: &json!({}),
                 name: "test",
@@ -4891,7 +5561,7 @@ mod tests {
                 &host_handle,
                 &mut journal,
                 AuthorizedToolCall {
-                    authorization: ApprovalAuthorization::NotRequired,
+                    authorization: EffectiveAuthorization::NotRequired,
                     id: "call-1",
                     input: &json!({}),
                     name: "test",
@@ -4959,7 +5629,7 @@ mod tests {
                 &host_handle,
                 &mut journal,
                 AuthorizedToolCall {
-                    authorization: ApprovalAuthorization::NotRequired,
+                    authorization: EffectiveAuthorization::NotRequired,
                     id: "call-1",
                     input: &json!({}),
                     name: "test",

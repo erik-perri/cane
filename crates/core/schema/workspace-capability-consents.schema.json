@@ -22,9 +22,9 @@
         }
       ]
     },
-    "WorkspaceCapabilityGrant": {
+    "WorkspaceCapabilityConsent": {
       "additionalProperties": false,
-      "description": "One capability authorization persisted for one canonical Workspace.",
+      "description": "One capability consent persisted for one canonical Workspace.",
       "properties": {
         "capability": {
           "$ref": "#/$defs/PersistedCapability"
@@ -40,13 +40,13 @@
       ],
       "type": "object"
     },
-    "WorkspaceCapabilityGrantDocument": {
+    "WorkspaceCapabilityConsentDocument": {
       "additionalProperties": false,
-      "description": "The current in-memory Workspace capability-grant document.",
+      "description": "The current in-memory Workspace capability-consent document.",
       "examples": [
         {
-          "$schema": "./workspace-capability-grants.schema.json",
-          "grants": [
+          "$schema": "./workspace-capability-consents.schema.json",
+          "consents": [
             {
               "capability": {
                 "name": "docker_daemon",
@@ -63,10 +63,10 @@
           "description": "Advisory editor schema reference. Runtime decoding remains authoritative.",
           "type": "string"
         },
-        "grants": {
-          "description": "Complete, deterministically ordered grant set.",
+        "consents": {
+          "description": "Complete, deterministically ordered consent set.",
           "items": {
-            "$ref": "#/$defs/WorkspaceCapabilityGrant"
+            "$ref": "#/$defs/WorkspaceCapabilityConsent"
           },
           "maxItems": 256,
           "type": "array"
@@ -79,7 +79,7 @@
       },
       "required": [
         "schema_version",
-        "grants"
+        "consents"
       ],
       "type": "object"
     }
@@ -87,8 +87,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {
-      "$ref": "#/$defs/WorkspaceCapabilityGrantDocument"
+      "$ref": "#/$defs/WorkspaceCapabilityConsentDocument"
     }
   ],
-  "title": "SupportedWorkspaceCapabilityGrantDocuments"
+  "title": "SupportedWorkspaceCapabilityConsentDocuments"
 }

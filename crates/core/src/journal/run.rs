@@ -4,7 +4,8 @@ use super::{
     ProviderRoundFailed, ProviderRoundId, ProviderRoundStarted, RunEndReason, RunEnded, RunId,
     SessionId, SessionJournal, ToolAuthorization, ToolCancelled, ToolCompleted, ToolFailed,
     ToolRejected, ToolStarted, TurnAbortOutcome, TurnAborted, TurnCommitOutcome, TurnCommitted,
-    TurnId, TurnStarted,
+    TurnId, TurnStarted, WorkspaceCapabilityConsentPersisted,
+    WorkspaceCapabilityConsentPersistenceFailed,
 };
 use crate::{ApprovalLifetime, ApprovalSubject, Message, ModelTurn, ProviderDescriptor};
 use std::path::Path;
@@ -70,6 +71,31 @@ impl RunJournal {
                 subject,
                 turn_id,
             }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn workspace_capability_consent_persisted(
+        &mut self,
+        approval_id: ApprovalId,
+    ) -> Result<(), JournalError> {
+        self.journal
+            .append(JournalEntry::WorkspaceCapabilityConsentPersisted(
+                WorkspaceCapabilityConsentPersisted { approval_id },
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn workspace_capability_consent_persistence_failed(
+        &mut self,
+        approval_id: ApprovalId,
+        error: ErrorDetail,
+    ) -> Result<(), JournalError> {
+        self.journal
+            .append(JournalEntry::WorkspaceCapabilityConsentPersistenceFailed(
+                WorkspaceCapabilityConsentPersistenceFailed { approval_id, error },
+            ))
             .await?;
         Ok(())
     }

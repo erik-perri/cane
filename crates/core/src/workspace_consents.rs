@@ -13,30 +13,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-pub const WORKSPACE_CAPABILITY_GRANTS_DOCUMENT: &str = "workspace-capability-grants.json";
-pub const WORKSPACE_CAPABILITY_GRANTS_SCHEMA: &str = "workspace-capability-grants.schema.json";
-pub const MAX_WORKSPACE_CAPABILITY_GRANTS: usize = 256;
+pub const WORKSPACE_CAPABILITY_CONSENTS_DOCUMENT: &str = "workspace-capability-consents.json";
+pub const WORKSPACE_CAPABILITY_CONSENTS_SCHEMA: &str = "workspace-capability-consents.schema.json";
+pub const MAX_WORKSPACE_CAPABILITY_CONSENTS: usize = 256;
 
 const SCHEMA_VERSION: u64 = 0;
-const SCHEMA_REFERENCE: &str = "./workspace-capability-grants.schema.json";
+const SCHEMA_REFERENCE: &str = "./workspace-capability-consents.schema.json";
 
-/// One capability authorization persisted for one canonical Workspace.
+/// One capability consent persisted for one canonical Workspace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct WorkspaceCapabilityGrant {
+pub struct WorkspaceCapabilityConsent {
     /// The canonical Workspace path serialized for the current platform.
     workspace: String,
     capability: PersistedCapability,
 }
 
-impl WorkspaceCapabilityGrant {
-    /// Creates a grant from live domain objects whose identities have already been canonicalized.
+impl WorkspaceCapabilityConsent {
+    /// Creates a consent from live domain objects whose identities have already been canonicalized.
     pub fn docker_daemon(
         workspace: &crate::Workspace,
         endpoint: &crate::command::DockerEndpoint,
-    ) -> Result<Self, WorkspaceGrantDocumentError> {
+    ) -> Result<Self, WorkspaceConsentDocumentError> {
         let workspace = workspace.root().to_str().ok_or_else(|| {
-            WorkspaceGrantDocumentError::NonUtf8Workspace {
+            WorkspaceConsentDocumentError::NonUtf8Workspace {
                 path: workspace.root().to_path_buf(),
             }
         })?;
@@ -60,14 +60,14 @@ impl WorkspaceCapabilityGrant {
         self.capability.resource()
     }
 
-    fn validate(&self) -> Result<(), WorkspaceGrantDocumentError> {
+    fn validate(&self) -> Result<(), WorkspaceConsentDocumentError> {
         if !is_canonical_persisted_path(&self.workspace) {
-            return Err(WorkspaceGrantDocumentError::InvalidWorkspace {
+            return Err(WorkspaceConsentDocumentError::InvalidWorkspace {
                 workspace: self.workspace.clone(),
             });
         }
         if !is_canonical_docker_resource(self.resource()) {
-            return Err(WorkspaceGrantDocumentError::InvalidDockerResource {
+            return Err(WorkspaceConsentDocumentError::InvalidDockerResource {
                 resource: self.resource().to_owned(),
             });
         }
@@ -79,11 +79,11 @@ impl WorkspaceCapabilityGrant {
     }
 }
 
-/// The current in-memory Workspace capability-grant document.
+/// The current in-memory Workspace capability-consent document.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(example = document_example())]
-pub struct WorkspaceCapabilityGrantDocument {
+pub struct WorkspaceCapabilityConsentDocument {
     /// Advisory editor schema reference. Runtime decoding remains authoritative.
     #[serde(
         rename = "$schema",
@@ -96,71 +96,66 @@ pub struct WorkspaceCapabilityGrantDocument {
     /// Persisted format discriminator.
     #[schemars(schema_with = "schema_version_schema")]
     schema_version: u64,
-    /// Complete, deterministically ordered grant set.
+    /// Complete, deterministically ordered consent set.
     #[schemars(length(max = 256))]
-    grants: Vec<WorkspaceCapabilityGrant>,
+    consents: Vec<WorkspaceCapabilityConsent>,
 }
 
-impl WorkspaceCapabilityGrantDocument {
+impl WorkspaceCapabilityConsentDocument {
     pub fn empty() -> Self {
         Self {
             schema: Some(SCHEMA_REFERENCE.to_owned()),
             schema_version: SCHEMA_VERSION,
-            grants: Vec::new(),
+            consents: Vec::new(),
         }
     }
 
-    pub fn grants(&self) -> &[WorkspaceCapabilityGrant] {
-        &self.grants
+    pub fn consents(&self) -> &[WorkspaceCapabilityConsent] {
+        &self.consents
     }
 
-    pub(crate) fn effective_approval_grants(
+    pub(crate) fn effective_capability_consents(
         &self,
         workspace: &crate::Workspace,
         docker_endpoint: Option<&crate::command::DockerEndpoint>,
-    ) -> Vec<crate::ApprovalGrant> {
+    ) -> Vec<crate::NamedCapability> {
         let Some(workspace) = workspace.root().to_str() else {
             return Vec::new();
         };
-        self.effective_approval_grants_for(
+        self.effective_capability_consents_for(
             workspace,
             docker_endpoint.map(crate::command::DockerEndpoint::resource),
         )
     }
 
-    fn effective_approval_grants_for(
+    fn effective_capability_consents_for(
         &self,
         workspace: &str,
         docker_resource: Option<&str>,
-    ) -> Vec<crate::ApprovalGrant> {
-        self.grants
+    ) -> Vec<crate::NamedCapability> {
+        self.consents
             .iter()
-            .filter(|grant| grant.workspace == workspace)
-            .filter_map(|grant| match (&grant.capability, docker_resource) {
+            .filter(|consent| consent.workspace == workspace)
+            .filter_map(|consent| match (&consent.capability, docker_resource) {
                 (PersistedCapability::DockerDaemon { resource }, Some(endpoint))
                     if resource == endpoint =>
                 {
-                    Some(crate::ApprovalGrant {
-                        matcher: crate::ApprovalMatcher::Capability {
-                            capability: crate::NamedCapability::docker_daemon(resource),
-                        },
-                        scope: crate::ApprovalScope::Workspace,
-                    })
+                    Some(crate::NamedCapability::docker_daemon(resource))
                 }
                 (PersistedCapability::DockerDaemon { .. }, _) => None,
             })
             .collect()
     }
 
-    fn remember(&mut self, grant: WorkspaceCapabilityGrant) {
+    fn remember(&mut self, consent: WorkspaceCapabilityConsent) {
         if let Some(existing) = self
-            .grants
+            .consents
             .iter_mut()
-            .find(|existing| existing.key() == grant.key())
+            .find(|existing| existing.key() == consent.key())
         {
-            *existing = grant;
+            *existing = consent;
         } else {
-            self.grants.push(grant);
+            self.consents.push(consent);
         }
         self.normalize();
     }
@@ -168,35 +163,35 @@ impl WorkspaceCapabilityGrantDocument {
     fn normalize(&mut self) {
         self.schema = Some(SCHEMA_REFERENCE.to_owned());
         self.schema_version = SCHEMA_VERSION;
-        self.grants.sort_unstable_by(|left, right| {
+        self.consents.sort_unstable_by(|left, right| {
             left.workspace.cmp(&right.workspace).then_with(|| {
                 capability_sort_key(&left.capability).cmp(capability_sort_key(&right.capability))
             })
         });
     }
 
-    fn validate(&mut self) -> Result<(), WorkspaceGrantDocumentError> {
+    fn validate(&mut self) -> Result<(), WorkspaceConsentDocumentError> {
         if self.schema_version != SCHEMA_VERSION {
-            return Err(WorkspaceGrantDocumentError::WrongVersion {
+            return Err(WorkspaceConsentDocumentError::WrongVersion {
                 expected: SCHEMA_VERSION,
                 found: self.schema_version,
             });
         }
-        if self.grants.len() > MAX_WORKSPACE_CAPABILITY_GRANTS {
-            return Err(WorkspaceGrantDocumentError::TooManyGrants {
-                count: self.grants.len(),
-                maximum: MAX_WORKSPACE_CAPABILITY_GRANTS,
+        if self.consents.len() > MAX_WORKSPACE_CAPABILITY_CONSENTS {
+            return Err(WorkspaceConsentDocumentError::TooManyConsents {
+                count: self.consents.len(),
+                maximum: MAX_WORKSPACE_CAPABILITY_CONSENTS,
             });
         }
 
         let mut keys = HashSet::new();
-        for grant in &self.grants {
-            grant.validate()?;
-            let key = (grant.workspace.clone(), grant.capability_kind());
+        for consent in &self.consents {
+            consent.validate()?;
+            let key = (consent.workspace.clone(), consent.capability_kind());
             if !keys.insert(key) {
-                return Err(WorkspaceGrantDocumentError::DuplicateGrant {
-                    workspace: grant.workspace.clone(),
-                    capability: grant.capability_kind(),
+                return Err(WorkspaceConsentDocumentError::DuplicateConsent {
+                    workspace: consent.workspace.clone(),
+                    capability: consent.capability_kind(),
                 });
             }
         }
@@ -205,7 +200,7 @@ impl WorkspaceCapabilityGrantDocument {
     }
 }
 
-impl Default for WorkspaceCapabilityGrantDocument {
+impl Default for WorkspaceCapabilityConsentDocument {
     fn default() -> Self {
         Self::empty()
     }
@@ -298,11 +293,11 @@ where
 }
 
 #[derive(Clone, Copy, Debug)]
-struct WorkspaceGrantCodec;
+struct WorkspaceConsentCodec;
 
-impl DocumentCodec for WorkspaceGrantCodec {
-    type Current = WorkspaceCapabilityGrantDocument;
-    type Error = WorkspaceGrantDocumentError;
+impl DocumentCodec for WorkspaceConsentCodec {
+    type Current = WorkspaceCapabilityConsentDocument;
+    type Error = WorkspaceConsentDocumentError;
 
     fn current_version(&self) -> u64 {
         SCHEMA_VERSION
@@ -313,43 +308,43 @@ impl DocumentCodec for WorkspaceGrantCodec {
     }
 
     fn decode(&self, _version: u64, document: Value) -> Result<Self::Current, Self::Error> {
-        let mut document = serde_json::from_value::<WorkspaceCapabilityGrantDocument>(document)
-            .map_err(WorkspaceGrantDocumentError::Structure)?;
+        let mut document = serde_json::from_value::<WorkspaceCapabilityConsentDocument>(document)
+            .map_err(WorkspaceConsentDocumentError::Structure)?;
         document.validate()?;
         Ok(document)
     }
 }
 
-struct SupportedWorkspaceGrantDocumentSchema;
+struct SupportedWorkspaceConsentDocumentSchema;
 
-impl JsonSchema for SupportedWorkspaceGrantDocumentSchema {
+impl JsonSchema for SupportedWorkspaceConsentDocumentSchema {
     fn schema_name() -> Cow<'static, str> {
-        Cow::Borrowed("SupportedWorkspaceCapabilityGrantDocuments")
+        Cow::Borrowed("SupportedWorkspaceCapabilityConsentDocuments")
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        let version_zero = generator.subschema_for::<WorkspaceCapabilityGrantDocument>();
+        let version_zero = generator.subschema_for::<WorkspaceCapabilityConsentDocument>();
         json_schema!({
             "oneOf": [version_zero]
         })
     }
 }
 
-/// Core-owned synchronous persistence for the dedicated Workspace capability-grant document.
+/// Core-owned synchronous persistence for the dedicated Workspace capability-consent document.
 ///
 /// All methods that access storage perform blocking filesystem I/O. Call them through
 /// `tokio::task::spawn_blocking` (or an equivalent blocking executor) from async code.
 #[derive(Clone, Debug)]
-pub struct WorkspaceCapabilityGrantStore {
+pub struct WorkspaceCapabilityConsentStore {
     file: ConfigFile,
 }
 
-impl WorkspaceCapabilityGrantStore {
+impl WorkspaceCapabilityConsentStore {
     pub fn new(config_directory: impl AsRef<Path>) -> Result<Self, ConfigFileError> {
         ConfigFile::new(
             config_directory
                 .as_ref()
-                .join(WORKSPACE_CAPABILITY_GRANTS_DOCUMENT),
+                .join(WORKSPACE_CAPABILITY_CONSENTS_DOCUMENT),
         )
         .map(|file| Self { file })
     }
@@ -371,27 +366,27 @@ impl WorkspaceCapabilityGrantStore {
     /// Loads the document using blocking filesystem I/O.
     pub fn load(
         &self,
-    ) -> LoadOutcome<WorkspaceCapabilityGrantDocument, WorkspaceGrantDocumentError> {
-        self.file.load(&WorkspaceGrantCodec)
+    ) -> LoadOutcome<WorkspaceCapabilityConsentDocument, WorkspaceConsentDocumentError> {
+        self.file.load(&WorkspaceConsentCodec)
     }
 
     /// Refreshes the generated schema using blocking filesystem I/O.
     pub fn refresh_schema(&self) -> Result<RefreshOutcome, PersistenceError> {
         self.file
-            .refresh_schema::<SupportedWorkspaceGrantDocumentSchema>()
+            .refresh_schema::<SupportedWorkspaceConsentDocumentSchema>()
     }
 
     /// Reloads and updates the document while holding a bounded, blocking writer lock.
     pub fn remember(
         &self,
-        grant: WorkspaceCapabilityGrant,
+        consent: WorkspaceCapabilityConsent,
     ) -> Result<
-        WorkspaceCapabilityGrantDocument,
-        UpdateError<WorkspaceGrantDocumentError, Infallible>,
+        WorkspaceCapabilityConsentDocument,
+        UpdateError<WorkspaceConsentDocumentError, Infallible>,
     > {
-        self.file.update(&WorkspaceGrantCodec, |document| {
+        self.file.update(&WorkspaceConsentCodec, |document| {
             let mut document = document.unwrap_or_default();
-            document.remember(grant);
+            document.remember(consent);
             Ok(document)
         })
     }
@@ -399,18 +394,18 @@ impl WorkspaceCapabilityGrantStore {
     /// Explicitly archives an invalid document using blocking filesystem I/O.
     pub fn archive_invalid(&self, archive_path: impl AsRef<Path>) -> Result<(), ArchiveError> {
         self.file
-            .archive_invalid(&WorkspaceGrantCodec, archive_path)
+            .archive_invalid(&WorkspaceConsentCodec, archive_path)
     }
 }
 
 #[derive(Debug, Error)]
-pub enum WorkspaceGrantDocumentError {
-    #[error("Workspace capability-grant document has invalid structure: {0}")]
+pub enum WorkspaceConsentDocumentError {
+    #[error("Workspace capability-consent document has invalid structure: {0}")]
     Structure(#[source] serde_json::Error),
     #[error("expected schema version {expected}, found {found}")]
     WrongVersion { expected: u64, found: u64 },
-    #[error("document contains {count} grants; the maximum is {maximum}")]
-    TooManyGrants { count: usize, maximum: usize },
+    #[error("document contains {count} consents; the maximum is {maximum}")]
+    TooManyConsents { count: usize, maximum: usize },
     #[error(
         "Workspace path must be a recognized, lexically canonical absolute path: {workspace:?}"
     )]
@@ -421,8 +416,8 @@ pub enum WorkspaceGrantDocumentError {
     InvalidDockerResource { resource: String },
     #[error("canonical Workspace path `{path}` is not valid UTF-8")]
     NonUtf8Workspace { path: PathBuf },
-    #[error("duplicate {capability:?} grant for Workspace {workspace:?}")]
-    DuplicateGrant {
+    #[error("duplicate {capability:?} consent for Workspace {workspace:?}")]
+    DuplicateConsent {
         workspace: String,
         capability: crate::CapabilityKind,
     },
@@ -440,7 +435,7 @@ fn document_example() -> Value {
     serde_json::json!({
         "$schema": SCHEMA_REFERENCE,
         "schema_version": 0,
-        "grants": [{
+        "consents": [{
             "workspace": "/canonical/workspace",
             "capability": {
                 "name": "docker_daemon",
@@ -457,23 +452,23 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn grant(workspace: &str, resource: &str) -> WorkspaceCapabilityGrant {
-        let grant = WorkspaceCapabilityGrant {
+    fn consent(workspace: &str, resource: &str) -> WorkspaceCapabilityConsent {
+        let consent = WorkspaceCapabilityConsent {
             workspace: workspace.to_owned(),
             capability: PersistedCapability::DockerDaemon {
                 resource: resource.to_owned(),
             },
         };
-        grant.validate().unwrap();
-        grant
+        consent.validate().unwrap();
+        consent
     }
 
-    fn store(root: &Path) -> WorkspaceCapabilityGrantStore {
-        WorkspaceCapabilityGrantStore::new(root.join("config")).unwrap()
+    fn store(root: &Path) -> WorkspaceCapabilityConsentStore {
+        WorkspaceCapabilityConsentStore::new(root.join("config")).unwrap()
     }
 
     #[test]
-    fn missing_document_loads_without_grants() {
+    fn missing_document_loads_without_consents() {
         // Arrange
         let root = tempdir().unwrap();
         let store = store(root.path());
@@ -491,7 +486,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = store(root.path());
         std::fs::create_dir_all(store.document_path().parent().unwrap()).unwrap();
-        let persisted = br#"{"schema_version":0,"grants":[]}"#;
+        let persisted = br#"{"schema_version":0,"consents":[]}"#;
         std::fs::write(store.document_path(), persisted).unwrap();
 
         // Act
@@ -513,7 +508,7 @@ mod tests {
         std::fs::create_dir_all(store.document_path().parent().unwrap()).unwrap();
         std::fs::write(
             store.document_path(),
-            br#"{"schema_version":1,"grants":[]}"#,
+            br#"{"schema_version":1,"consents":[]}"#,
         )
         .unwrap();
 
@@ -528,18 +523,18 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_excess_grants_are_invalid_all_or_nothing() {
+    fn duplicate_and_excess_consents_are_invalid_all_or_nothing() {
         for document in [
             json!({
                 "schema_version": 0,
-                "grants": [
-                    document_example()["grants"][0].clone(),
-                    document_example()["grants"][0].clone()
+                "consents": [
+                    document_example()["consents"][0].clone(),
+                    document_example()["consents"][0].clone()
                 ]
             }),
             json!({
                 "schema_version": 0,
-                "grants": (0..=MAX_WORKSPACE_CAPABILITY_GRANTS)
+                "consents": (0..=MAX_WORKSPACE_CAPABILITY_CONSENTS)
                     .map(|index| json!({
                         "workspace": format!("/workspace/{index}"),
                         "capability": {
@@ -579,7 +574,7 @@ mod tests {
         std::fs::create_dir_all(store.document_path().parent().unwrap()).unwrap();
         std::fs::write(
             store.document_path(),
-            br#"{"$schema":null,"schema_version":0,"grants":[]}"#,
+            br#"{"$schema":null,"schema_version":0,"consents":[]}"#,
         )
         .unwrap();
 
@@ -590,7 +585,7 @@ mod tests {
         assert!(matches!(
             outcome,
             LoadOutcome::Invalid(InvalidDocument::Rejected(
-                WorkspaceGrantDocumentError::Structure(_)
+                WorkspaceConsentDocumentError::Structure(_)
             ))
         ));
     }
@@ -649,7 +644,7 @@ mod tests {
         let documents = [
             json!({
                 "schema_version": 0,
-                "grants": [{
+                "consents": [{
                     "workspace": "/workspace/../other",
                     "capability": {
                         "name": "docker_daemon",
@@ -659,7 +654,7 @@ mod tests {
             }),
             json!({
                 "schema_version": 0,
-                "grants": [{
+                "consents": [{
                     "workspace": "/workspace",
                     "capability": {
                         "name": "docker_daemon",
@@ -671,38 +666,41 @@ mod tests {
 
         for document in documents {
             // Act
-            let result = WorkspaceGrantCodec.decode(SCHEMA_VERSION, document);
+            let result = WorkspaceConsentCodec.decode(SCHEMA_VERSION, document);
 
             // Assert
             assert!(matches!(
                 result,
-                Err(WorkspaceGrantDocumentError::InvalidWorkspace { .. }
-                    | WorkspaceGrantDocumentError::InvalidDockerResource { .. })
+                Err(WorkspaceConsentDocumentError::InvalidWorkspace { .. }
+                    | WorkspaceConsentDocumentError::InvalidDockerResource { .. })
             ));
         }
     }
 
     #[test]
-    fn effective_grants_require_exact_workspace_and_endpoint_identities() {
+    fn effective_consents_require_exact_workspace_and_endpoint_identities() {
         // Arrange
-        let document = WorkspaceCapabilityGrantDocument {
+        let document = WorkspaceCapabilityConsentDocument {
             schema: Some(SCHEMA_REFERENCE.to_owned()),
             schema_version: SCHEMA_VERSION,
-            grants: vec![grant("/workspace", "unix:///configured.sock")],
+            consents: vec![consent("/workspace", "unix:///configured.sock")],
         };
 
         // Act
-        let exact =
-            document.effective_approval_grants_for("/workspace", Some("unix:///configured.sock"));
+        let exact = document
+            .effective_capability_consents_for("/workspace", Some("unix:///configured.sock"));
         let other_workspace =
-            document.effective_approval_grants_for("/other", Some("unix:///configured.sock"));
+            document.effective_capability_consents_for("/other", Some("unix:///configured.sock"));
         let other_endpoint =
-            document.effective_approval_grants_for("/workspace", Some("unix:///other.sock"));
-        let unavailable_endpoint = document.effective_approval_grants_for("/workspace", None);
+            document.effective_capability_consents_for("/workspace", Some("unix:///other.sock"));
+        let unavailable_endpoint = document.effective_capability_consents_for("/workspace", None);
 
         // Assert
         assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].lifetime(), crate::ApprovalLifetime::Workspace);
+        assert_eq!(
+            exact[0],
+            crate::NamedCapability::docker_daemon("unix:///configured.sock")
+        );
         assert!(other_workspace.is_empty());
         assert!(other_endpoint.is_empty());
         assert!(unavailable_endpoint.is_empty());
@@ -714,21 +712,21 @@ mod tests {
         let root = tempdir().unwrap();
         let store = store(root.path());
         store
-            .remember(grant("/z-workspace", "unix:///old.sock"))
+            .remember(consent("/z-workspace", "unix:///old.sock"))
             .unwrap();
         store
-            .remember(grant("/a-workspace", "unix:///a.sock"))
+            .remember(consent("/a-workspace", "unix:///a.sock"))
             .unwrap();
 
         // Act
         let document = store
-            .remember(grant("/z-workspace", "unix:///new.sock"))
+            .remember(consent("/z-workspace", "unix:///new.sock"))
             .unwrap();
 
         // Assert
-        assert_eq!(document.grants.len(), 2);
-        assert_eq!(document.grants[0].workspace(), "/a-workspace");
-        assert_eq!(document.grants[1].resource(), "unix:///new.sock");
+        assert_eq!(document.consents.len(), 2);
+        assert_eq!(document.consents[0].workspace(), "/a-workspace");
+        assert_eq!(document.consents[1].resource(), "unix:///new.sock");
         let persisted = std::fs::read_to_string(store.document_path()).unwrap();
         assert!(persisted.ends_with('\n'));
         assert!(persisted.find("/a-workspace").unwrap() < persisted.find("/z-workspace").unwrap());
@@ -744,7 +742,7 @@ mod tests {
         let document = json!({
             "$schema": SCHEMA_REFERENCE,
             "schema_version": 0,
-            "grants": (0..MAX_WORKSPACE_CAPABILITY_GRANTS)
+            "consents": (0..MAX_WORKSPACE_CAPABILITY_CONSENTS)
                 .map(|index| json!({
                     "workspace": format!("/workspace/{index:03}"),
                     "capability": {
@@ -762,13 +760,13 @@ mod tests {
         let original = std::fs::read(store.document_path()).unwrap();
 
         // Act
-        let result = store.remember(grant("/one-too-many", "unix:///docker.sock"));
+        let result = store.remember(consent("/one-too-many", "unix:///docker.sock"));
 
         // Assert
         assert!(matches!(
             result,
             Err(UpdateError::InvalidCurrent(
-                WorkspaceGrantDocumentError::TooManyGrants { .. }
+                WorkspaceConsentDocumentError::TooManyConsents { .. }
             ))
         ));
         assert_eq!(std::fs::read(store.document_path()).unwrap(), original);
@@ -787,11 +785,11 @@ mod tests {
         assert_eq!(outcome, RefreshOutcome::Written);
         assert_eq!(
             store.schema_path().file_name().unwrap(),
-            WORKSPACE_CAPABILITY_GRANTS_SCHEMA
+            WORKSPACE_CAPABILITY_CONSENTS_SCHEMA
         );
         assert_eq!(
             std::fs::read(store.schema_path()).unwrap(),
-            include_bytes!("../schema/workspace-capability-grants.schema.json")
+            include_bytes!("../schema/workspace-capability-consents.schema.json")
         );
     }
 
@@ -816,7 +814,7 @@ mod tests {
     fn schema_is_draft_2020_12_useful_and_pinned_to_the_checked_in_copy() {
         // Arrange / Act
         let generated =
-            cane_config::generate_schema::<SupportedWorkspaceGrantDocumentSchema>().unwrap();
+            cane_config::generate_schema::<SupportedWorkspaceConsentDocumentSchema>().unwrap();
         let schema: Value = serde_json::from_slice(&generated).unwrap();
 
         // Assert
@@ -826,19 +824,19 @@ mod tests {
         );
         assert_eq!(
             schema["oneOf"][0]["$ref"],
-            "#/$defs/WorkspaceCapabilityGrantDocument"
+            "#/$defs/WorkspaceCapabilityConsentDocument"
         );
         assert_eq!(
-            schema["$defs"]["WorkspaceCapabilityGrantDocument"]["properties"]["grants"]["maxItems"],
+            schema["$defs"]["WorkspaceCapabilityConsentDocument"]["properties"]["consents"]["maxItems"],
             256
         );
         assert_eq!(
-            schema["$defs"]["WorkspaceCapabilityGrantDocument"]["examples"][0],
+            schema["$defs"]["WorkspaceCapabilityConsentDocument"]["examples"][0],
             document_example()
         );
         assert_eq!(
             generated,
-            include_bytes!("../schema/workspace-capability-grants.schema.json")
+            include_bytes!("../schema/workspace-capability-consents.schema.json")
         );
     }
 
@@ -851,7 +849,7 @@ mod tests {
         std::fs::write(store.document_path(), b"invalid").unwrap();
 
         // Act
-        let result = store.remember(grant("/workspace", "unix:///docker.sock"));
+        let result = store.remember(consent("/workspace", "unix:///docker.sock"));
 
         // Assert
         assert!(matches!(

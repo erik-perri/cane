@@ -1,33 +1,35 @@
 use crate::journal::ApprovalId;
 use crate::protocol::{AgentExit, ApprovalRequirement, EventSink};
-use crate::{AgentEvent, ApprovalDecision, ApprovalGrant, ApprovalLifetime, ApprovalSubject};
+use crate::{
+    AgentEvent, ApprovalDecision, ApprovalGrant, ApprovalLifetime, ApprovalSubject, NamedCapability,
+};
 use tokio::sync::oneshot;
 
 pub struct ApprovalGate {
-    run_approvals: Vec<ApprovalAuthorization>,
+    run_authorizations: Vec<EffectiveAuthorization>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ApprovalAuthorization {
-    Granted {
+pub enum EffectiveAuthorization {
+    ApprovalGrant {
         approval_id: ApprovalId,
         grant: ApprovalGrant,
     },
-    WorkspaceConfigured {
-        grant: ApprovalGrant,
+    WorkspaceCapabilityConsent {
+        capability: NamedCapability,
     },
     NotRequired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApprovalCheck {
-    Authorized(ApprovalAuthorization),
+    Authorized(EffectiveAuthorization),
     RequiresDecision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApprovalOutcome {
-    Authorized(ApprovalAuthorization),
+    Authorized(EffectiveAuthorization),
     Denied { reason: String },
     InvalidGrant { reason: String },
 }
@@ -35,7 +37,7 @@ pub enum ApprovalOutcome {
 impl ApprovalGate {
     pub fn new() -> Self {
         Self {
-            run_approvals: Vec::new(),
+            run_authorizations: Vec::new(),
         }
     }
 
@@ -45,22 +47,45 @@ impl ApprovalGate {
         subject: &ApprovalSubject,
     ) -> ApprovalCheck {
         if requirement == ApprovalRequirement::None {
-            return ApprovalCheck::Authorized(ApprovalAuthorization::NotRequired);
+            return ApprovalCheck::Authorized(EffectiveAuthorization::NotRequired);
         }
 
-        self.run_approvals
+        self.run_authorizations
             .iter()
             .find(|authorization| match authorization {
-                ApprovalAuthorization::Granted { grant, .. }
-                | ApprovalAuthorization::WorkspaceConfigured { grant } => grant.authorizes(subject),
-                ApprovalAuthorization::NotRequired => false,
+                EffectiveAuthorization::ApprovalGrant { grant, .. } => grant.authorizes(subject),
+                EffectiveAuthorization::WorkspaceCapabilityConsent { capability } => {
+                    matches!(
+                        subject,
+                        ApprovalSubject::Capability {
+                            capability: requested,
+                            ..
+                        } if requested == capability
+                    )
+                }
+                EffectiveAuthorization::NotRequired => false,
             })
             .cloned()
             .map_or(ApprovalCheck::RequiresDecision, ApprovalCheck::Authorized)
     }
 
+    #[cfg(test)]
     pub fn apply_decision(
         &mut self,
+        available_lifetimes: &[ApprovalLifetime],
+        approval_id: ApprovalId,
+        decision: &ApprovalDecision,
+        subject: &ApprovalSubject,
+    ) -> ApprovalOutcome {
+        let outcome = self.evaluate_decision(available_lifetimes, approval_id, decision, subject);
+        if let ApprovalOutcome::Authorized(authorization) = &outcome {
+            self.activate(authorization);
+        }
+        outcome
+    }
+
+    pub fn evaluate_decision(
+        &self,
         available_lifetimes: &[ApprovalLifetime],
         approval_id: ApprovalId,
         decision: &ApprovalDecision,
@@ -80,13 +105,10 @@ impl ApprovalGate {
                     };
                 }
 
-                let authorization = ApprovalAuthorization::Granted {
+                let authorization = EffectiveAuthorization::ApprovalGrant {
                     approval_id,
                     grant: grant.clone(),
                 };
-                if grant.lifetime() != ApprovalLifetime::Invocation {
-                    self.run_approvals.push(authorization.clone());
-                }
                 ApprovalOutcome::Authorized(authorization)
             }
             ApprovalDecision::Deny { reason } => ApprovalOutcome::Denied {
@@ -95,11 +117,27 @@ impl ApprovalGate {
         }
     }
 
-    pub fn seed_workspace_grants(&mut self, grants: impl IntoIterator<Item = ApprovalGrant>) {
-        self.run_approvals.extend(
-            grants
-                .into_iter()
-                .map(|grant| ApprovalAuthorization::WorkspaceConfigured { grant }),
+    pub fn activate(&mut self, authorization: &EffectiveAuthorization) {
+        let reusable = match authorization {
+            EffectiveAuthorization::ApprovalGrant { grant, .. } => {
+                grant.lifetime() != ApprovalLifetime::Invocation
+            }
+            EffectiveAuthorization::WorkspaceCapabilityConsent { .. } => true,
+            EffectiveAuthorization::NotRequired => false,
+        };
+        if reusable {
+            self.run_authorizations.push(authorization.clone());
+        }
+    }
+
+    pub fn seed_workspace_consents(
+        &mut self,
+        capabilities: impl IntoIterator<Item = NamedCapability>,
+    ) {
+        self.run_authorizations.extend(
+            capabilities.into_iter().map(|capability| {
+                EffectiveAuthorization::WorkspaceCapabilityConsent { capability }
+            }),
         );
     }
 }
@@ -167,7 +205,7 @@ mod tests {
         // Assert
         assert_eq!(
             result,
-            ApprovalCheck::Authorized(ApprovalAuthorization::NotRequired)
+            ApprovalCheck::Authorized(EffectiveAuthorization::NotRequired)
         );
     }
 
@@ -207,14 +245,14 @@ mod tests {
         // Assert
         assert_eq!(
             outcome,
-            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
+            ApprovalOutcome::Authorized(EffectiveAuthorization::ApprovalGrant {
                 approval_id: approval_id(),
                 grant: run_grant.clone(),
             })
         );
         assert_eq!(
             matching,
-            ApprovalCheck::Authorized(ApprovalAuthorization::Granted {
+            ApprovalCheck::Authorized(EffectiveAuthorization::ApprovalGrant {
                 approval_id: approval_id(),
                 grant: run_grant,
             })
@@ -250,14 +288,14 @@ mod tests {
         // Assert
         assert_eq!(
             outcome,
-            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
+            ApprovalOutcome::Authorized(EffectiveAuthorization::ApprovalGrant {
                 approval_id: approval_id(),
                 grant: run_grant.clone(),
             })
         );
         assert_eq!(
             reused,
-            ApprovalCheck::Authorized(ApprovalAuthorization::Granted {
+            ApprovalCheck::Authorized(EffectiveAuthorization::ApprovalGrant {
                 approval_id: approval_id(),
                 grant: run_grant,
             })
@@ -266,16 +304,11 @@ mod tests {
     }
 
     #[test]
-    fn configured_workspace_grants_retain_their_source_and_match_exactly() {
+    fn configured_workspace_consents_retain_their_source_and_match_exactly() {
         // Arrange
         let mut gate = ApprovalGate::new();
-        let configured = ApprovalSubject::capability(
-            crate::NamedCapability::docker_daemon("unix:///configured.sock"),
-            "seed",
-            "shell",
-        )
-        .grant(ApprovalLifetime::Workspace);
-        gate.seed_workspace_grants([configured.clone()]);
+        let configured = crate::NamedCapability::docker_daemon("unix:///configured.sock");
+        gate.seed_workspace_consents([configured.clone()]);
         let matching = ApprovalSubject::capability(
             crate::NamedCapability::docker_daemon("unix:///configured.sock"),
             "shell-1",
@@ -294,8 +327,8 @@ mod tests {
         // Assert
         assert_eq!(
             authorized,
-            ApprovalCheck::Authorized(ApprovalAuthorization::WorkspaceConfigured {
-                grant: configured,
+            ApprovalCheck::Authorized(EffectiveAuthorization::WorkspaceCapabilityConsent {
+                capability: configured,
             })
         );
         assert_eq!(requires_decision, ApprovalCheck::RequiresDecision);
@@ -326,14 +359,14 @@ mod tests {
         // Assert
         assert_eq!(
             once,
-            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
+            ApprovalOutcome::Authorized(EffectiveAuthorization::ApprovalGrant {
                 approval_id: approval_id(),
                 grant: once_grant,
             })
         );
         assert_eq!(
             run,
-            ApprovalOutcome::Authorized(ApprovalAuthorization::Granted {
+            ApprovalOutcome::Authorized(EffectiveAuthorization::ApprovalGrant {
                 approval_id: approval_id(),
                 grant: run_grant.clone(),
             })
@@ -343,7 +376,7 @@ mod tests {
                 ApprovalRequirement::Required,
                 &subject("edit-2", "edit_file")
             ),
-            ApprovalCheck::Authorized(ApprovalAuthorization::Granted {
+            ApprovalCheck::Authorized(EffectiveAuthorization::ApprovalGrant {
                 approval_id: approval_id(),
                 grant: run_grant,
             })

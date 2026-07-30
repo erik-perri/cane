@@ -8,7 +8,7 @@ mod provider;
 mod session;
 mod tools;
 mod workspace;
-mod workspace_grants;
+mod workspace_consents;
 
 pub use agent::{
     AgentHandle, AgentShellConfig, AgentShellConfigError, AgentStartError, spawn_agent,
@@ -25,8 +25,9 @@ pub use provider::{
 pub use session::SessionConfig;
 pub use tools::{ShellIntegration, ToolDefinition};
 pub use workspace::Workspace;
-pub use workspace_grants::{
-    MAX_WORKSPACE_CAPABILITY_GRANTS, WORKSPACE_CAPABILITY_GRANTS_DOCUMENT,
-    WORKSPACE_CAPABILITY_GRANTS_SCHEMA, WorkspaceCapabilityGrant, WorkspaceCapabilityGrantDocument,
-    WorkspaceCapabilityGrantStore, WorkspaceGrantDocumentError,
+pub use workspace_consents::{
+    MAX_WORKSPACE_CAPABILITY_CONSENTS, WORKSPACE_CAPABILITY_CONSENTS_DOCUMENT,
+    WORKSPACE_CAPABILITY_CONSENTS_SCHEMA, WorkspaceCapabilityConsent,
+    WorkspaceCapabilityConsentDocument, WorkspaceCapabilityConsentStore,
+    WorkspaceConsentDocumentError,
 };

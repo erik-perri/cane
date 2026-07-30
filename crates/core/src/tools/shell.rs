@@ -20,7 +20,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const PREVIEW_CHANNEL_CAPACITY: usize = 16;
-const DOCKER_CAPABILITY_LIFETIMES: &[ApprovalLifetime] = &[ApprovalLifetime::Run];
+const DOCKER_CAPABILITY_LIFETIMES: &[ApprovalLifetime] =
+    &[ApprovalLifetime::Run, ApprovalLifetime::Workspace];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShellIntegration {
@@ -545,7 +546,7 @@ mod tests {
         assert_eq!(
             capability_request,
             CapabilityRequest {
-                available_lifetimes: &[ApprovalLifetime::Run],
+                available_lifetimes: &[ApprovalLifetime::Run, ApprovalLifetime::Workspace,],
                 capability: NamedCapability::docker_daemon(endpoint.resource()),
             }
         );

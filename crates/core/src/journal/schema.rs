@@ -136,6 +136,8 @@ pub enum JournalEntry {
     ProviderRoundCancelled(ProviderRoundCancelled),
     ApprovalRequested(ApprovalRequested),
     ApprovalDecided(ApprovalDecided),
+    WorkspaceCapabilityConsentPersisted(WorkspaceCapabilityConsentPersisted),
+    WorkspaceCapabilityConsentPersistenceFailed(WorkspaceCapabilityConsentPersistenceFailed),
     ToolStarted(ToolStarted),
     ToolCompleted(ToolCompleted),
     ToolFailed(ToolFailed),
@@ -156,7 +158,7 @@ pub struct SessionStarted {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunStarted {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub approval_grants: Vec<EffectiveApprovalGrant>,
+    pub capability_consents: Vec<EffectiveCapabilityConsent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitContext>,
     pub max_output_tokens: u32,
@@ -169,14 +171,14 @@ pub struct RunStarted {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EffectiveApprovalGrant {
-    pub grant: ApprovalGrant,
-    pub source: ApprovalGrantSource,
+pub struct EffectiveCapabilityConsent {
+    pub capability: NamedCapability,
+    pub source: CapabilityConsentSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ApprovalGrantSource {
+pub enum CapabilityConsentSource {
     WorkspaceConfiguration,
 }
 
@@ -266,6 +268,17 @@ fn legacy_approval_lifetimes() -> Vec<ApprovalLifetime> {
 pub struct ApprovalDecided {
     pub approval_id: ApprovalId,
     pub decision: JournalApprovalDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceCapabilityConsentPersisted {
+    pub approval_id: ApprovalId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceCapabilityConsentPersistenceFailed {
+    pub approval_id: ApprovalId,
+    pub error: ErrorDetail,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -602,7 +615,7 @@ mod tests {
             "2026-07-26T18:42:00.500Z".parse().unwrap(),
             session_id(),
             JournalEntry::RunStarted(RunStarted {
-                approval_grants: Vec::new(),
+                capability_consents: Vec::new(),
                 git: None,
                 max_output_tokens: 32_000,
                 model: "test-model".to_string(),
@@ -714,14 +727,9 @@ mod tests {
             }],
             mode: ShellMode::Sandboxed,
         };
-        let effective_grant = EffectiveApprovalGrant {
-            grant: ApprovalSubject::capability(
-                NamedCapability::docker_daemon("unix:///var/run/docker.sock"),
-                "shell-1",
-                "shell",
-            )
-            .grant(ApprovalLifetime::Workspace),
-            source: ApprovalGrantSource::WorkspaceConfiguration,
+        let effective_consent = EffectiveCapabilityConsent {
+            capability: NamedCapability::docker_daemon("unix:///var/run/docker.sock"),
+            source: CapabilityConsentSource::WorkspaceConfiguration,
         };
         let values = [
             serde_json::to_value(&request).unwrap(),
@@ -729,7 +737,7 @@ mod tests {
             serde_json::to_value(&started).unwrap(),
             serde_json::to_value(&completed).unwrap(),
             serde_json::to_value(&policy).unwrap(),
-            serde_json::to_value(&effective_grant).unwrap(),
+            serde_json::to_value(&effective_consent).unwrap(),
         ];
 
         // Act
@@ -741,7 +749,7 @@ mod tests {
         let decoded_completed: ToolExecutionCompleted =
             serde_json::from_value(values[3].clone()).unwrap();
         let decoded_policy: ShellPolicy = serde_json::from_value(values[4].clone()).unwrap();
-        let decoded_effective_grant: EffectiveApprovalGrant =
+        let decoded_effective_consent: EffectiveCapabilityConsent =
             serde_json::from_value(values[5].clone()).unwrap();
 
         // Assert
@@ -751,8 +759,45 @@ mod tests {
         assert_eq!(decoded_started, started);
         assert_eq!(decoded_completed, completed);
         assert_eq!(decoded_policy, policy);
-        assert_eq!(decoded_effective_grant, effective_grant);
+        assert_eq!(decoded_effective_consent, effective_consent);
         assert_eq!(grant.lifetime(), ApprovalLifetime::Run);
+    }
+
+    #[test]
+    fn workspace_consent_persistence_records_are_typed_and_correlated() {
+        // Arrange
+        let approval_id: ApprovalId = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAY".parse().unwrap();
+        let persisted = JournalEntry::WorkspaceCapabilityConsentPersisted(
+            WorkspaceCapabilityConsentPersisted { approval_id },
+        );
+        let failed = JournalEntry::WorkspaceCapabilityConsentPersistenceFailed(
+            WorkspaceCapabilityConsentPersistenceFailed {
+                approval_id,
+                error: ErrorDetail {
+                    category: "configuration_persistence".to_string(),
+                    message: "disk full".to_string(),
+                },
+            },
+        );
+
+        // Act
+        let persisted_value = serde_json::to_value(&persisted).unwrap();
+        let failed_value = serde_json::to_value(&failed).unwrap();
+        let decoded_persisted: JournalEntry =
+            serde_json::from_value(persisted_value.clone()).unwrap();
+        let decoded_failed: JournalEntry = serde_json::from_value(failed_value.clone()).unwrap();
+
+        // Assert
+        assert_eq!(
+            persisted_value["type"],
+            "workspace_capability_consent_persisted"
+        );
+        assert_eq!(
+            failed_value["type"],
+            "workspace_capability_consent_persistence_failed"
+        );
+        assert_eq!(decoded_persisted, persisted);
+        assert_eq!(decoded_failed, failed);
     }
 
     #[test]

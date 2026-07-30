@@ -72,9 +72,10 @@ async fn main() -> anyhow::Result<()> {
     .context("could not locate Cane's home directory")?;
     let sessions_directory = cane_home.join("sessions");
     let shell = configure_shell(shell_mode, &workspace)?;
-    let workspace_grants = cane_core::WorkspaceCapabilityGrantStore::new(cane_home.join("config"))?;
+    let workspace_consents =
+        cane_core::WorkspaceCapabilityConsentStore::new(cane_home.join("config"))?;
     let sessions = cane_core::SessionConfig::new(CANE_VERSION, "", sessions_directory)
-        .with_workspace_capability_grants(workspace_grants);
+        .with_workspace_capability_consents(workspace_consents);
 
     if shell_mode == CliShellMode::Unsafe {
         eprintln!("{}", unsafe_shell_warning());

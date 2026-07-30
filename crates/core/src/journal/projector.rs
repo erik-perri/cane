@@ -55,6 +55,14 @@ struct ApprovalState {
     available_lifetimes: Vec<ApprovalLifetime>,
     decision: Option<ApprovalDecision>,
     subject: ApprovalSubject,
+    workspace_consent_persistence: Option<WorkspaceConsentPersistenceState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceConsentPersistenceState {
+    Pending,
+    Persisted,
+    Failed,
 }
 
 struct TurnState {
@@ -69,7 +77,7 @@ struct TurnState {
 }
 
 struct RunState {
-    configured_grants: Vec<ApprovalGrant>,
+    configured_consents: Vec<NamedCapability>,
     id: RunId,
     run_approvals: HashMap<ApprovalId, ApprovalGrant>,
     turn: Option<TurnState>,
@@ -107,12 +115,12 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                 if let Some(policy) = &started.shell_policy {
                     validate_shell_policy(policy, record.sequence)?;
                 }
-                validate_effective_grants(&started.approval_grants, record.sequence)?;
+                validate_effective_consents(&started.capability_consents, record.sequence)?;
                 active_run = Some(RunState {
-                    configured_grants: started
-                        .approval_grants
+                    configured_consents: started
+                        .capability_consents
                         .iter()
-                        .map(|record| record.grant.clone())
+                        .map(|record| record.capability.clone())
                         .collect(),
                     id: started.run_id,
                     run_approvals: HashMap::new(),
@@ -246,6 +254,7 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                             available_lifetimes: requested.available_lifetimes.clone(),
                             decision: None,
                             subject: requested.subject.clone(),
+                            workspace_consent_persistence: None,
                         },
                     )
                     .is_some()
@@ -300,9 +309,16 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     current.decision = Some(decision.clone());
                     match decision {
                         ApprovalDecision::Granted(grant)
-                            if grant.lifetime() != ApprovalLifetime::Invocation =>
+                            if grant.lifetime() == ApprovalLifetime::Run =>
                         {
                             Some(grant)
+                        }
+                        ApprovalDecision::Granted(grant)
+                            if grant.lifetime() == ApprovalLifetime::Workspace =>
+                        {
+                            current.workspace_consent_persistence =
+                                Some(WorkspaceConsentPersistenceState::Pending);
+                            None
                         }
                         ApprovalDecision::Granted(_) | ApprovalDecision::Deny => None,
                     }
@@ -310,6 +326,25 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                 if let Some(grant) = run_approval {
                     run.run_approvals.insert(decided.approval_id, grant);
                 }
+            }
+            JournalEntry::WorkspaceCapabilityConsentPersisted(persisted) => {
+                let run = active_run_mut(&mut active_run, record.sequence)?;
+                let grant = resolve_workspace_consent_persistence(
+                    run,
+                    persisted.approval_id,
+                    WorkspaceConsentPersistenceState::Persisted,
+                    record.sequence,
+                )?;
+                run.run_approvals.insert(persisted.approval_id, grant);
+            }
+            JournalEntry::WorkspaceCapabilityConsentPersistenceFailed(failed) => {
+                let run = active_run_mut(&mut active_run, record.sequence)?;
+                resolve_workspace_consent_persistence(
+                    run,
+                    failed.approval_id,
+                    WorkspaceConsentPersistenceState::Failed,
+                    record.sequence,
+                )?;
             }
             JournalEntry::ToolStarted(started) => {
                 let run = active_run_mut(&mut active_run, record.sequence)?;
@@ -331,7 +366,7 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     record.sequence,
                 )?;
                 validate_execution_start(
-                    &run.configured_grants,
+                    &run.configured_consents,
                     &run.run_approvals,
                     turn,
                     started,
@@ -592,6 +627,49 @@ fn add_tool_results(
     Ok(())
 }
 
+fn resolve_workspace_consent_persistence(
+    run: &mut RunState,
+    approval_id: ApprovalId,
+    resolved: WorkspaceConsentPersistenceState,
+    sequence: u64,
+) -> Result<ApprovalGrant, ProjectionError> {
+    let Some(turn) = run.turn.as_mut() else {
+        return Err(invalid(sequence, "record has no active turn"));
+    };
+    let Some(approval) = turn.approvals.get_mut(&approval_id) else {
+        return Err(invalid(
+            sequence,
+            "Workspace capability consent persistence has no matching approval",
+        ));
+    };
+    if !matches!(approval.subject, ApprovalSubject::Capability { .. }) {
+        return Err(invalid(
+            sequence,
+            "Workspace capability consent persistence refers to a tool approval",
+        ));
+    }
+    let Some(ApprovalDecision::Granted(grant)) = &approval.decision else {
+        return Err(invalid(
+            sequence,
+            "Workspace capability consent persistence has no matching grant decision",
+        ));
+    };
+    if grant.lifetime() != ApprovalLifetime::Workspace {
+        return Err(invalid(
+            sequence,
+            "Workspace capability consent persistence refers to a non-Workspace grant",
+        ));
+    }
+    if approval.workspace_consent_persistence != Some(WorkspaceConsentPersistenceState::Pending) {
+        return Err(invalid(
+            sequence,
+            "Workspace capability consent persistence is resolved more than once",
+        ));
+    }
+    approval.workspace_consent_persistence = Some(resolved);
+    Ok(grant.clone())
+}
+
 fn authorize_tool_start(
     run_approvals: &HashMap<ApprovalId, ApprovalGrant>,
     turn: &TurnState,
@@ -719,27 +797,30 @@ fn validate_shell_policy(policy: &ShellPolicy, sequence: u64) -> Result<(), Proj
     Ok(())
 }
 
-fn validate_effective_grants(
-    grants: &[super::EffectiveApprovalGrant],
+fn validate_effective_consents(
+    consents: &[super::EffectiveCapabilityConsent],
     sequence: u64,
 ) -> Result<(), ProjectionError> {
     let mut seen = HashSet::new();
-    for record in grants {
-        if record.grant.lifetime() != ApprovalLifetime::Workspace {
+    for record in consents {
+        if record.capability.resource().trim().is_empty() {
             return Err(invalid(
                 sequence,
-                "configured approval grant has an invalid scope",
+                "configured capability consent has an empty resource",
             ));
         }
-        if !seen.insert(&record.grant) {
-            return Err(invalid(sequence, "configured approval grant is repeated"));
+        if !seen.insert(&record.capability) {
+            return Err(invalid(
+                sequence,
+                "configured capability consent is repeated",
+            ));
         }
     }
     Ok(())
 }
 
 fn validate_execution_start(
-    configured_grants: &[ApprovalGrant],
+    configured_consents: &[NamedCapability],
     run_approvals: &HashMap<ApprovalId, ApprovalGrant>,
     turn: &TurnState,
     started: &super::ToolStarted,
@@ -780,18 +861,10 @@ fn validate_execution_start(
                 )?;
             }
             CapabilityAuthorizationSource::WorkspaceConfiguration => {
-                let subject = ApprovalSubject::capability(
-                    capability.clone(),
-                    &started.tool_call_id,
-                    &started.tool_name,
-                );
-                if !configured_grants
-                    .iter()
-                    .any(|grant| grant.authorizes(&subject))
-                {
+                if !configured_consents.contains(capability) {
                     return Err(invalid(
                         sequence,
-                        "execution capability has no matching configured grant",
+                        "execution capability has no matching configured consent",
                     ));
                 }
             }
@@ -917,6 +990,14 @@ fn validate_commit(
             "turn committed with an undecided approval",
         ));
     }
+    if turn.approvals.values().any(|approval| {
+        approval.workspace_consent_persistence == Some(WorkspaceConsentPersistenceState::Pending)
+    }) {
+        return Err(invalid(
+            sequence,
+            "turn committed with unresolved Workspace capability consent persistence",
+        ));
+    }
 
     if let TurnCommitOutcome::Completed { stop_reason } = outcome
         && turn.last_assistant_stop.as_ref() != Some(stop_reason)
@@ -1023,10 +1104,11 @@ fn invalid(sequence: u64, detail: impl Into<String>) -> ProjectionError {
 mod tests {
     use super::*;
     use crate::journal::{
-        CapturedStream, CommandTermination, ErrorDetail, MessageAdded, ProviderRoundCompleted,
-        ProviderRoundFailed, ProviderRoundStarted, RunEndReason, RunEnded, RunStarted,
-        SessionStarted, ShellBoundaries, ShellExposedRoot, ShellSandboxBackend, ToolCompleted,
-        ToolStarted, TurnAborted, TurnCommitted, TurnStarted,
+        ApprovalDecided, ApprovalRequested, CapturedStream, CommandTermination, ErrorDetail,
+        MessageAdded, ProviderRoundCompleted, ProviderRoundFailed, ProviderRoundStarted,
+        RunEndReason, RunEnded, RunStarted, SessionStarted, ShellBoundaries, ShellExposedRoot,
+        ShellSandboxBackend, ToolCompleted, ToolStarted, TurnAborted, TurnCommitted, TurnStarted,
+        WorkspaceCapabilityConsentPersisted, WorkspaceCapabilityConsentPersistenceFailed,
     };
     use crate::{
         ProviderAdapter, ProviderDescriptor, ToolInput, ToolResultData, journal::FilesystemAccess,
@@ -1073,7 +1155,7 @@ mod tests {
 
     fn run_started() -> JournalEntry {
         JournalEntry::RunStarted(RunStarted {
-            approval_grants: Vec::new(),
+            capability_consents: Vec::new(),
             git: None,
             max_output_tokens: 32_000,
             model: "test-model".to_string(),
@@ -1152,6 +1234,175 @@ mod tests {
             reason: RunEndReason::UserQuit,
             run_id: run_id(),
         })
+    }
+
+    fn workspace_consent_approval_entries() -> (
+        ApprovalId,
+        ApprovalGrant,
+        NamedCapability,
+        Vec<JournalEntry>,
+    ) {
+        let approval_id: ApprovalId = "appr_01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().unwrap();
+        let capability = NamedCapability::docker_daemon("unix:///var/run/docker.sock");
+        let subject = ApprovalSubject::capability(capability.clone(), "shell-1", "shell");
+        let grant = subject.grant(ApprovalLifetime::Workspace);
+        let assistant = Message {
+            content: vec![ContentBlock::ToolUse {
+                id: "shell-1".to_string(),
+                input: ToolInput::Valid(serde_json::json!({ "command": "docker ps" })),
+                name: "shell".to_string(),
+            }],
+            role: Role::Assistant,
+        };
+        let entries = vec![
+            session_started(),
+            run_started(),
+            turn_started(),
+            message_added(user_text("Check Docker")),
+            provider_started(),
+            provider_completed(StopReason::ToolUse),
+            message_added(assistant),
+            JournalEntry::ApprovalRequested(ApprovalRequested {
+                approval_id,
+                available_lifetimes: vec![ApprovalLifetime::Run, ApprovalLifetime::Workspace],
+                subject,
+                turn_id: turn_id(),
+            }),
+            JournalEntry::ApprovalDecided(ApprovalDecided {
+                approval_id,
+                decision: JournalApprovalDecision::Grant {
+                    grant: grant.clone(),
+                },
+            }),
+        ];
+        (approval_id, grant, capability, entries)
+    }
+
+    fn capability_tool_started(
+        approval_id: ApprovalId,
+        capability: NamedCapability,
+    ) -> JournalEntry {
+        JournalEntry::ToolStarted(ToolStarted {
+            authorization: ToolAuthorization::NotRequired,
+            execution: Some(ToolExecutionStarted::Shell {
+                capabilities: vec![ExecutionCapability {
+                    capability,
+                    source: CapabilityAuthorizationSource::Approval { approval_id },
+                }],
+            }),
+            tool_call_id: "shell-1".to_string(),
+            tool_name: "shell".to_string(),
+            turn_id: turn_id(),
+        })
+    }
+
+    #[test]
+    fn workspace_decision_without_persistence_is_not_effective() {
+        // Arrange
+        let (approval_id, _grant, capability, mut entries) = workspace_consent_approval_entries();
+        entries.push(capability_tool_started(approval_id, capability));
+
+        // Act
+        let error = project_journal(&records(entries)).unwrap_err();
+
+        // Assert
+        assert_eq!(
+            error.detail,
+            "execution capability has no matching approval grant"
+        );
+    }
+
+    #[test]
+    fn crash_after_workspace_decision_remains_projectable_without_restoring_authority() {
+        // Arrange
+        let (_approval_id, _grant, _capability, entries) = workspace_consent_approval_entries();
+
+        // Act
+        let projection = project_journal(&records(entries)).unwrap();
+
+        // Assert
+        assert!(
+            projection
+                .warnings
+                .contains(&ProjectionWarning::UnterminatedRun { run_id: run_id() })
+        );
+        assert!(
+            projection
+                .warnings
+                .contains(&ProjectionWarning::UnterminatedTurn { turn_id: turn_id() })
+        );
+    }
+
+    #[test]
+    fn persisted_workspace_consent_makes_the_approval_effective() {
+        // Arrange
+        let (approval_id, _grant, capability, mut entries) = workspace_consent_approval_entries();
+        entries.push(JournalEntry::WorkspaceCapabilityConsentPersisted(
+            WorkspaceCapabilityConsentPersisted { approval_id },
+        ));
+        entries.push(capability_tool_started(approval_id, capability));
+
+        // Act
+        let projection = project_journal(&records(entries)).unwrap();
+
+        // Assert
+        assert!(
+            projection
+                .warnings
+                .contains(&ProjectionWarning::UnterminatedTurn { turn_id: turn_id() })
+        );
+    }
+
+    #[test]
+    fn failed_workspace_consent_persistence_never_activates_the_approval() {
+        // Arrange
+        let (approval_id, _grant, capability, mut entries) = workspace_consent_approval_entries();
+        entries.push(JournalEntry::WorkspaceCapabilityConsentPersistenceFailed(
+            WorkspaceCapabilityConsentPersistenceFailed {
+                approval_id,
+                error: ErrorDetail {
+                    category: "configuration_persistence".to_string(),
+                    message: "disk full".to_string(),
+                },
+            },
+        ));
+        entries.push(capability_tool_started(approval_id, capability));
+
+        // Act
+        let error = project_journal(&records(entries)).unwrap_err();
+
+        // Assert
+        assert_eq!(
+            error.detail,
+            "execution capability has no matching approval grant"
+        );
+    }
+
+    #[test]
+    fn workspace_consent_persistence_cannot_be_resolved_twice() {
+        // Arrange
+        let (approval_id, _grant, _capability, mut entries) = workspace_consent_approval_entries();
+        entries.push(JournalEntry::WorkspaceCapabilityConsentPersisted(
+            WorkspaceCapabilityConsentPersisted { approval_id },
+        ));
+        entries.push(JournalEntry::WorkspaceCapabilityConsentPersistenceFailed(
+            WorkspaceCapabilityConsentPersistenceFailed {
+                approval_id,
+                error: ErrorDetail {
+                    category: "configuration_persistence".to_string(),
+                    message: "late failure".to_string(),
+                },
+            },
+        ));
+
+        // Act
+        let error = project_journal(&records(entries)).unwrap_err();
+
+        // Assert
+        assert_eq!(
+            error.detail,
+            "Workspace capability consent persistence is resolved more than once"
+        );
     }
 
     #[test]
@@ -1293,7 +1544,7 @@ mod tests {
         let journal = records(vec![
             session_started(),
             JournalEntry::RunStarted(RunStarted {
-                approval_grants: Vec::new(),
+                capability_consents: Vec::new(),
                 git: None,
                 max_output_tokens: 32_000,
                 model: "test-model".to_string(),
@@ -1452,6 +1703,7 @@ mod tests {
                     available_lifetimes: vec![ApprovalLifetime::Invocation, ApprovalLifetime::Run],
                     decision: Some(ApprovalDecision::Granted(once_grant)),
                     subject: approved_subject,
+                    workspace_consent_persistence: None,
                 },
             )]),
             awaiting_assistant: None,
@@ -1501,6 +1753,7 @@ mod tests {
                     available_lifetimes: vec![ApprovalLifetime::Invocation],
                     decision: Some(ApprovalDecision::Granted(recorded_grant)),
                     subject: approved_subject,
+                    workspace_consent_persistence: None,
                 },
             )]),
             awaiting_assistant: None,
@@ -1578,11 +1831,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_configured_capabilities_require_an_effective_run_grant() {
+    fn workspace_configured_capabilities_require_an_effective_consent() {
         // Arrange
         let capability = NamedCapability::docker_daemon("unix:///var/run/docker.sock");
-        let subject = ApprovalSubject::capability(capability.clone(), "shell-1", "shell");
-        let configured_grants = vec![subject.grant(ApprovalLifetime::Workspace)];
+        let configured_consents = vec![capability.clone()];
         let turn = TurnState {
             approvals: HashMap::new(),
             awaiting_assistant: None,
@@ -1616,12 +1868,12 @@ mod tests {
         // Act
         let missing = validate_execution_start(&[], &HashMap::new(), &turn, &started, 1);
         let matching =
-            validate_execution_start(&configured_grants, &HashMap::new(), &turn, &started, 2);
+            validate_execution_start(&configured_consents, &HashMap::new(), &turn, &started, 2);
 
         // Assert
         assert_eq!(
             missing.unwrap_err().detail,
-            "execution capability has no matching configured grant"
+            "execution capability has no matching configured consent"
         );
         assert!(matching.is_ok());
     }
@@ -1630,7 +1882,7 @@ mod tests {
     fn shell_completion_diagnostics_require_matching_start_diagnostics() {
         // Arrange
         let mut active_run = Some(RunState {
-            configured_grants: Vec::new(),
+            configured_consents: Vec::new(),
             id: run_id(),
             run_approvals: HashMap::new(),
             turn: Some(TurnState {
