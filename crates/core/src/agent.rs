@@ -2698,6 +2698,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let policy = sandbox_policy(&root);
         let workspace = Workspace::new(policy.workspace().to_path_buf()).unwrap();
+        let expected_workspace = workspace.root().to_str().unwrap().to_string();
         let socket_path = root.path().join("docker.sock");
         let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let endpoint = DockerEndpoint::validate(socket_path).unwrap();
@@ -2769,7 +2770,7 @@ mod tests {
         assert_eq!(loaded.document.consents().len(), 1);
         assert_eq!(
             loaded.document.consents()[0].workspace(),
-            policy.workspace().to_str().unwrap()
+            expected_workspace
         );
         assert_eq!(
             loaded.document.consents()[0].resource(),
