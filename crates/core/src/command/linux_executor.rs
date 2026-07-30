@@ -1,8 +1,9 @@
 use super::{
     CapturedOutput, CommandDeadline, CommandExecutionError, CommandExecutionMode, CommandExecutor,
     CommandExecutorDescriptor, CommandOutputChunk, CommandOutputSender, CommandOutputStream,
-    CommandRequest, CommandResult, CommandTermination, LinuxSandboxPlan, MAX_COMMAND_RESULT_BYTES,
-    SandboxDiagnosticInput, SandboxDiagnosticReport, compile_linux_sandbox_plan, diagnose_sandbox,
+    CommandRequest, CommandResult, CommandTermination, DockerExecutableName, LinuxSandboxPlan,
+    MAX_COMMAND_RESULT_BYTES, SandboxDiagnosticInput, SandboxDiagnosticReport,
+    compile_linux_sandbox_plan, diagnose_sandbox,
 };
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -20,6 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 const OUTPUT_READ_BYTES: usize = 8 * 1024;
 const PIPE_EVENT_CAPACITY: usize = 16;
+const PRIVATE_DOCKER_BIN: &str = "/tmp/cane-docker-bin";
+const PRIVATE_DOCKER_CONFIG: &str = "/tmp/cane-docker-config";
+const PRIVATE_DOCKER_PLUGIN_DIR: &str = "/tmp/cane-docker-config/cli-plugins";
 const PRIVATE_DOCKER_HOST: &str = "unix:///tmp/cane-docker.sock";
 const PRIVATE_DOCKER_SOCKET: &str = "/tmp/cane-docker.sock";
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
@@ -103,8 +107,42 @@ impl BubblewrapExecutor {
                 .arg(endpoint.path())
                 .arg(PRIVATE_DOCKER_SOCKET);
         }
+        if !request.docker_executables.is_empty() {
+            process
+                .arg("--dir")
+                .arg(PRIVATE_DOCKER_BIN)
+                .arg("--dir")
+                .arg(PRIVATE_DOCKER_CONFIG);
+            for executable in &request.docker_executables {
+                process
+                    .arg("--ro-bind")
+                    .arg(executable.path())
+                    .arg(Path::new(PRIVATE_DOCKER_BIN).join(executable.name().as_str()));
+            }
+            if let Some(compose) = request
+                .docker_executables
+                .iter()
+                .find(|executable| executable.name() == DockerExecutableName::DockerCompose)
+            {
+                process
+                    .arg("--dir")
+                    .arg(PRIVATE_DOCKER_PLUGIN_DIR)
+                    .arg("--ro-bind")
+                    .arg(compose.path())
+                    .arg(
+                        Path::new(PRIVATE_DOCKER_PLUGIN_DIR)
+                            .join(DockerExecutableName::DockerCompose.as_str()),
+                    );
+            }
+        }
         process.arg("--chdir").arg(&request.workdir);
 
+        let private_docker_path = (!request.docker_executables.is_empty()).then(|| {
+            request.environment.get("PATH").map_or_else(
+                || PRIVATE_DOCKER_BIN.to_string(),
+                |path| format!("{PRIVATE_DOCKER_BIN}:{path}"),
+            )
+        });
         for (name, value) in request.environment {
             process.arg("--setenv").arg(name).arg(value);
         }
@@ -113,6 +151,15 @@ impl BubblewrapExecutor {
                 .arg("--setenv")
                 .arg("DOCKER_HOST")
                 .arg(PRIVATE_DOCKER_HOST);
+        }
+        if let Some(path) = private_docker_path {
+            process
+                .arg("--setenv")
+                .arg("PATH")
+                .arg(path)
+                .arg("--setenv")
+                .arg("DOCKER_CONFIG")
+                .arg(PRIVATE_DOCKER_CONFIG);
         }
         process
             .arg("--")
@@ -218,6 +265,11 @@ fn validate_request(
             ));
         }
         validate_os_argument("environment value", value)?;
+    }
+    if request.docker_endpoint.is_none() && !request.docker_executables.is_empty() {
+        return Err(execution_failure_message(
+            "Docker executables require an authorized Docker endpoint",
+        ));
     }
 
     let workdir = std::fs::canonicalize(&request.workdir)
@@ -530,7 +582,8 @@ fn execution_failure_message(message: impl Into<String>) -> CommandExecutionErro
 mod tests {
     use super::*;
     use crate::command::{
-        CommandSandboxPolicyConfig, DockerEndpoint, build_command_sandbox_policy,
+        CommandSandboxPolicyConfig, DockerEndpoint, DockerExecutable, DockerExecutableName,
+        build_command_sandbox_policy,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -624,7 +677,11 @@ mod tests {
                 command.to_string(),
             ],
             docker_endpoint: None,
-            environment: BTreeMap::from([("TEST_VALUE".to_string(), "explicit".to_string())]),
+            docker_executables: Vec::new(),
+            environment: BTreeMap::from([
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("TEST_VALUE".to_string(), "explicit".to_string()),
+            ]),
             executable: "/bin/bash".to_string(),
             workdir: workspace.to_path_buf(),
         }
@@ -645,12 +702,24 @@ mod tests {
         let socket_path = fixture._root.path().join("docker.sock");
         let _socket = UnixListener::bind(&socket_path).unwrap();
         let endpoint = DockerEndpoint::validate(&socket_path).unwrap();
+        let docker_binary = fixture._root.path().join("docker");
+        fs::write(&docker_binary, "#!/bin/true\n").unwrap();
+        fs::set_permissions(&docker_binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let executable =
+            DockerExecutable::validate(DockerExecutableName::Docker, &docker_binary).unwrap();
+        let compose_binary = fixture._root.path().join("docker-compose");
+        fs::write(&compose_binary, "#!/bin/true\n").unwrap();
+        fs::set_permissions(&compose_binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let compose =
+            DockerExecutable::validate(DockerExecutableName::DockerCompose, &compose_binary)
+                .unwrap();
         let mut docker_request = request(&fixture.workspace, "docker ps");
         docker_request.environment.insert(
             "DOCKER_HOST".to_string(),
             "unix:///host/guess.sock".to_string(),
         );
         docker_request.docker_endpoint = Some(endpoint.clone());
+        docker_request.docker_executables = vec![executable.clone(), compose.clone()];
         let ordinary_request = request(&fixture.workspace, "cargo test");
 
         // Act
@@ -661,6 +730,16 @@ mod tests {
         let docker_host_values = docker_arguments
             .windows(3)
             .filter(|arguments| arguments[0] == "--setenv" && arguments[1] == "DOCKER_HOST")
+            .map(|arguments| arguments[2].as_str())
+            .collect::<Vec<_>>();
+        let docker_path_values = docker_arguments
+            .windows(3)
+            .filter(|arguments| arguments[0] == "--setenv" && arguments[1] == "PATH")
+            .map(|arguments| arguments[2].as_str())
+            .collect::<Vec<_>>();
+        let docker_config_values = docker_arguments
+            .windows(3)
+            .filter(|arguments| arguments[0] == "--setenv" && arguments[1] == "DOCKER_CONFIG")
             .map(|arguments| arguments[2].as_str())
             .collect::<Vec<_>>();
 
@@ -677,6 +756,27 @@ mod tests {
             docker_host_values,
             ["unix:///host/guess.sock", PRIVATE_DOCKER_HOST]
         );
+        assert!(docker_arguments.windows(3).any(|arguments| {
+            arguments
+                == [
+                    "--ro-bind",
+                    executable.path().to_str().unwrap(),
+                    "/tmp/cane-docker-bin/docker",
+                ]
+        }));
+        assert!(docker_arguments.windows(3).any(|arguments| {
+            arguments
+                == [
+                    "--ro-bind",
+                    compose.path().to_str().unwrap(),
+                    "/tmp/cane-docker-config/cli-plugins/docker-compose",
+                ]
+        }));
+        assert_eq!(
+            docker_path_values,
+            ["/usr/bin", "/tmp/cane-docker-bin:/usr/bin"]
+        );
+        assert_eq!(docker_config_values, [PRIVATE_DOCKER_CONFIG]);
         assert!(
             !ordinary_arguments
                 .iter()
@@ -686,6 +786,11 @@ mod tests {
             !ordinary_arguments
                 .iter()
                 .any(|argument| argument == PRIVATE_DOCKER_HOST)
+        );
+        assert!(
+            !ordinary_arguments
+                .iter()
+                .any(|argument| argument == PRIVATE_DOCKER_BIN)
         );
     }
 
@@ -1231,6 +1336,7 @@ else:
         let request = CommandRequest {
             arguments: Vec::new(),
             docker_endpoint: None,
+            docker_executables: Vec::new(),
             environment: BTreeMap::from([("ONLY_VALUE".to_string(), "prepared".to_string())]),
             executable: "/usr/bin/env".to_string(),
             workdir: workspace.path().to_path_buf(),

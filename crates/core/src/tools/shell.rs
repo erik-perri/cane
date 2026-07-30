@@ -1,7 +1,8 @@
 use crate::Workspace;
 use crate::command::{
-    CommandDeadline, CommandEnvironmentConfig, CommandExecutionError, CommandExecutor,
-    DockerEndpoint, PreparedShellCommand, format_command_result, prepare_shell_command,
+    CommandClassification, CommandDeadline, CommandEnvironmentConfig, CommandExecutionError,
+    CommandExecutor, DockerEndpoint, DockerExecutableName, DockerIntegration, PreparedShellCommand,
+    format_command_result, prepare_shell_command,
 };
 use crate::journal::{
     CapturedStream, CommandTermination as JournalCommandTermination, ExecutionCapability,
@@ -25,31 +26,38 @@ const DOCKER_CAPABILITY_LIFETIMES: &[ApprovalLifetime] =
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShellIntegration {
-    Docker(DockerEndpoint),
+    Docker(DockerIntegration),
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct ShellIntegrations {
-    docker_endpoint: Option<DockerEndpoint>,
+    docker: Option<DockerIntegration>,
 }
 
 impl ShellIntegrations {
     pub(crate) fn insert(&mut self, integration: ShellIntegration) {
         match integration {
-            ShellIntegration::Docker(endpoint) => self.docker_endpoint = Some(endpoint),
+            ShellIntegration::Docker(integration) => self.docker = Some(integration),
         }
     }
 
-    fn docker_endpoint_for(&self, prepared: &PreparedShellCommand) -> Option<DockerEndpoint> {
-        if prepared.classification().is_direct_docker_invocation() {
-            self.docker_endpoint.clone()
-        } else {
-            None
-        }
+    fn docker_integration_for(&self, prepared: &PreparedShellCommand) -> Option<DockerIntegration> {
+        let CommandClassification::Simple(command) = prepared.classification() else {
+            return None;
+        };
+        let name = match command.executable() {
+            "docker" => DockerExecutableName::Docker,
+            "docker-compose" => DockerExecutableName::DockerCompose,
+            _ => return None,
+        };
+        self.docker
+            .as_ref()
+            .filter(|integration| integration.supports(name))
+            .cloned()
     }
 
     pub(crate) fn docker_endpoint(&self) -> Option<&DockerEndpoint> {
-        self.docker_endpoint.as_ref()
+        self.docker.as_ref().map(DockerIntegration::endpoint)
     }
 }
 
@@ -84,7 +92,7 @@ impl Tool for ShellTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "shell".to_string(),
-            description: shell_description(self.integrations.docker_endpoint.is_some()),
+            description: shell_description(self.integrations.docker.is_some()),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -112,11 +120,11 @@ impl Tool for ShellTool {
     async fn prepare(&self, input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
         let prepared = prepare_shell_command(&self.environment, input, &self.workspace)
             .map_err(|error| error.to_string())?;
-        let docker_endpoint = self.integrations.docker_endpoint_for(&prepared);
+        let docker = self.integrations.docker_integration_for(&prepared);
 
         Ok(Box::new(PreparedShellInvocation {
             authorized_capability: None,
-            docker_endpoint,
+            docker,
             events: self.events.clone(),
             executor: Arc::clone(&self.executor),
             prepared,
@@ -142,7 +150,7 @@ fn shell_description(docker_available: bool) -> String {
 
 struct PreparedShellInvocation {
     authorized_capability: Option<AuthorizedCapability>,
-    docker_endpoint: Option<DockerEndpoint>,
+    docker: Option<DockerIntegration>,
     events: EventSink,
     executor: Arc<dyn CommandExecutor>,
     prepared: PreparedShellCommand,
@@ -159,25 +167,23 @@ impl PreparedInvocation for PreparedShellInvocation {
     }
 
     fn capability_request(&self) -> Option<CapabilityRequest> {
-        self.docker_endpoint
-            .as_ref()
-            .map(|endpoint| CapabilityRequest {
-                available_lifetimes: DOCKER_CAPABILITY_LIFETIMES,
-                capability: NamedCapability::docker_daemon(endpoint.resource()),
-            })
+        self.docker.as_ref().map(|integration| CapabilityRequest {
+            available_lifetimes: DOCKER_CAPABILITY_LIFETIMES,
+            capability: NamedCapability::docker_daemon(integration.endpoint().resource()),
+        })
     }
 
     fn authorize_capability(&mut self, authorization: AuthorizedCapability) -> Result<(), String> {
-        let endpoint = self
-            .docker_endpoint
+        let integration = self
+            .docker
             .as_ref()
             .ok_or_else(|| "shell invocation did not request Docker access".to_string())?;
-        let expected = NamedCapability::docker_daemon(endpoint.resource());
+        let expected = NamedCapability::docker_daemon(integration.endpoint().resource());
         if authorization.capability != expected {
             return Err("capability authorization does not match the Docker endpoint".to_string());
         }
 
-        self.prepared.authorize_docker(endpoint.clone());
+        self.prepared.authorize_docker(integration.clone());
         self.authorized_capability = Some(authorization);
         Ok(())
     }
@@ -267,6 +273,8 @@ mod tests {
     };
     use crate::tools::{ShellToolConfig, ToolSet, ToolTestExt};
     use async_trait::async_trait;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -331,12 +339,12 @@ mod tests {
         Arc<FakeExecutor>,
         mpsc::Receiver<AgentEvent>,
     ) {
-        shell_tool_with_endpoint(result, None)
+        shell_tool_with_docker(result, None)
     }
 
-    fn shell_tool_with_endpoint(
+    fn shell_tool_with_docker(
         result: Result<CommandResult, CommandExecutionError>,
-        docker_endpoint: Option<DockerEndpoint>,
+        docker: Option<DockerIntegration>,
     ) -> (
         TempDir,
         ShellTool,
@@ -357,8 +365,8 @@ mod tests {
         .unwrap();
         let (events, event_receiver) = mpsc::channel(16);
         let mut integrations = ShellIntegrations::default();
-        if let Some(endpoint) = docker_endpoint {
-            integrations.insert(ShellIntegration::Docker(endpoint));
+        if let Some(integration) = docker {
+            integrations.insert(ShellIntegration::Docker(integration));
         }
         let tool = ShellTool::new(
             workspace,
@@ -519,12 +527,21 @@ mod tests {
         let socket_path = socket_root.path().join("docker.sock");
         let _socket = UnixListener::bind(&socket_path).unwrap();
         let endpoint = DockerEndpoint::validate(&socket_path).unwrap();
+        let docker_binary = socket_root.path().join("docker");
+        fs::write(&docker_binary, "#!/bin/true\n").unwrap();
+        fs::set_permissions(&docker_binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = crate::command::DockerExecutable::validate(
+            DockerExecutableName::Docker,
+            &docker_binary,
+        )
+        .unwrap();
+        let docker =
+            DockerIntegration::new(endpoint.clone()).with_executables([executable.clone()]);
         let result = CommandResult {
             output: CapturedOutput::complete(Vec::new()),
             termination: CommandTermination::Exited { code: 0 },
         };
-        let (_root, tool, executor, _events) =
-            shell_tool_with_endpoint(Ok(result), Some(endpoint.clone()));
+        let (_root, tool, executor, _events) = shell_tool_with_docker(Ok(result), Some(docker));
         let mut invocation = tool
             .prepare(serde_json::json!({ "command": "docker ps" }))
             .await
@@ -569,6 +586,12 @@ mod tests {
                 .docker_endpoint,
             Some(endpoint)
         );
+        assert_eq!(
+            executor.observations.lock().unwrap()[0]
+                .request
+                .docker_executables,
+            vec![executable]
+        );
     }
 
     #[tokio::test]
@@ -582,7 +605,8 @@ mod tests {
             output: CapturedOutput::complete(Vec::new()),
             termination: CommandTermination::Exited { code: 0 },
         };
-        let (_root, tool, executor, _events) = shell_tool_with_endpoint(Ok(result), Some(endpoint));
+        let (_root, tool, executor, _events) =
+            shell_tool_with_docker(Ok(result), Some(endpoint.into()));
         let invocation = tool
             .prepare(serde_json::json!({ "command": "docker ps | cat" }))
             .await

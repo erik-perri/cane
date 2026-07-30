@@ -2119,7 +2119,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        .with_integration(ShellIntegration::Docker(endpoint.clone().into()));
         let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         std::fs::write(
             store.document_path(),
@@ -2260,7 +2260,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(docker_endpoint.clone()));
+        .with_integration(ShellIntegration::Docker(docker_endpoint.clone().into()));
         let config = SessionConfig::new("test-cane-version", "", sessions.path());
         let mut handle = spawn_agent_with_shell(test_provider(&server), workspace, config, shell)
             .await
@@ -2445,7 +2445,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        .with_integration(ShellIntegration::Docker(endpoint.clone().into()));
         let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         std::fs::write(
             store.document_path(),
@@ -2550,7 +2550,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        .with_integration(ShellIntegration::Docker(endpoint.clone().into()));
         let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         let persisted = serde_json::to_vec(&json!({
             "schema_version": 0,
@@ -2712,7 +2712,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        .with_integration(ShellIntegration::Docker(endpoint.clone().into()));
         let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         let config = SessionConfig::new("test-cane-version", "", sessions.path())
             .with_workspace_capability_consents(store.clone());
@@ -2852,7 +2852,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        .with_integration(ShellIntegration::Docker(endpoint.clone().into()));
         let second_config = SessionConfig::new("test-cane-version", "", sessions.path())
             .with_workspace_capability_consents(store);
         let mut second_handle = spawn_agent_with_shell(
@@ -2940,7 +2940,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(endpoint));
+        .with_integration(ShellIntegration::Docker(endpoint.into()));
         let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         let config = SessionConfig::new("test-cane-version", "", sessions.path())
             .with_workspace_capability_consents(store.clone());
@@ -3065,7 +3065,7 @@ mod tests {
             &policy,
         )
         .unwrap()
-        .with_integration(ShellIntegration::Docker(endpoint.clone()));
+        .with_integration(ShellIntegration::Docker(endpoint.clone().into()));
         let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
         let invalid = b"invalid Workspace consents";
         std::fs::write(store.document_path(), invalid).unwrap();

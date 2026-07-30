@@ -209,14 +209,15 @@ async fn run_with_input(
                     respond_to,
                     subject,
                 } => {
-                    let options = approval_options(&available_lifetimes);
+                    let options = approval_options(&available_lifetimes, &subject);
                     if let Some(notice) = capability_notice(&subject) {
                         writeln!(output, "\n{notice}")?;
                     }
                     writeln!(
                         output,
-                        "\n[approval request: {} {command_input}] {options}",
-                        subject.tool_name(),
+                        "\n[{}: {} {command_input}] {options}",
+                        approval_request_label(&subject),
+                        subject.tool_name()
                     )?;
                     output.flush()?;
 
@@ -260,6 +261,15 @@ fn capability_notice(subject: &ApprovalSubject) -> Option<String> {
     }
 }
 
+fn approval_request_label(subject: &ApprovalSubject) -> &'static str {
+    match subject {
+        ApprovalSubject::Capability { capability, .. } => match capability.kind() {
+            CapabilityKind::DockerDaemon => "Docker daemon capability approval",
+        },
+        ApprovalSubject::ToolCall { .. } => "tool invocation approval",
+    }
+}
+
 async fn read_decision(
     input: &mut InputLines,
     output: &mut impl Write,
@@ -299,19 +309,22 @@ async fn read_decision(
     }
 }
 
-fn approval_options(available_lifetimes: &[ApprovalLifetime]) -> String {
+fn approval_options(available_lifetimes: &[ApprovalLifetime], subject: &ApprovalSubject) -> String {
     let mut options = Vec::new();
     if available_lifetimes.contains(&ApprovalLifetime::Invocation) {
-        options.push("y");
+        options.push("y = allow once");
     }
-    options.push("n");
     if available_lifetimes.contains(&ApprovalLifetime::Run) {
-        options.push("a");
+        options.push("a = allow for this Run");
     }
     if available_lifetimes.contains(&ApprovalLifetime::Workspace) {
-        options.push("w");
+        options.push(match subject {
+            ApprovalSubject::Capability { .. } => "w = remember this capability for this Workspace",
+            ApprovalSubject::ToolCall { .. } => "w = allow for this Workspace",
+        });
     }
-    format!("[{}]", options.join(","))
+    options.push("n = deny");
+    format!("[{}]", options.join(", "))
 }
 
 async fn read_input(
@@ -562,7 +575,7 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert_eq!(
             output,
-            "> \n[approval request: write_file null] [y,n,a]\n> \n> "
+            "> \n[tool invocation approval: write_file null] [y = allow once, a = allow for this Run, n = deny]\n> \n> "
         );
     }
 
@@ -804,15 +817,27 @@ mod tests {
     }
 
     #[test]
-    fn approval_options_only_list_offered_grant_lifetimes() {
+    fn approval_options_explain_only_the_offered_grant_lifetimes() {
         // Arrange
         let available_lifetimes = vec![ApprovalLifetime::Run, ApprovalLifetime::Workspace];
+        let subject = ApprovalSubject::capability(
+            cane_core::NamedCapability::docker_daemon("unix:///run/docker.sock"),
+            "shell-1",
+            "shell",
+        );
 
         // Act
-        let options = approval_options(&available_lifetimes);
+        let options = approval_options(&available_lifetimes, &subject);
 
         // Assert
-        assert_eq!(options, "[n,a,w]");
+        assert_eq!(
+            options,
+            "[a = allow for this Run, w = remember this capability for this Workspace, n = deny]"
+        );
+        assert_eq!(
+            approval_request_label(&subject),
+            "Docker daemon capability approval"
+        );
     }
 
     #[test]

@@ -1107,8 +1107,9 @@ mod tests {
         ApprovalDecided, ApprovalRequested, CapturedStream, CommandTermination, ErrorDetail,
         MessageAdded, ProviderRoundCompleted, ProviderRoundFailed, ProviderRoundStarted,
         RunEndReason, RunEnded, RunStarted, SessionStarted, ShellBoundaries, ShellExposedRoot,
-        ShellSandboxBackend, ToolCompleted, ToolStarted, TurnAborted, TurnCommitted, TurnStarted,
-        WorkspaceCapabilityConsentPersisted, WorkspaceCapabilityConsentPersistenceFailed,
+        ShellSandboxBackend, ToolCompleted, ToolRejected, ToolStarted, TurnAborted, TurnCommitted,
+        TurnStarted, WorkspaceCapabilityConsentPersisted,
+        WorkspaceCapabilityConsentPersistenceFailed,
     };
     use crate::{
         ProviderAdapter, ProviderDescriptor, ToolInput, ToolResultData, journal::FilesystemAccess,
@@ -1376,6 +1377,37 @@ mod tests {
             error.detail,
             "execution capability has no matching approval grant"
         );
+    }
+
+    #[test]
+    fn tool_rejection_error_category_is_diagnostic_only() {
+        fn rejected_projection(error_category: &str) -> SessionProjection {
+            let (approval_id, _grant, _capability, mut entries) =
+                workspace_consent_approval_entries();
+            entries.push(JournalEntry::WorkspaceCapabilityConsentPersistenceFailed(
+                WorkspaceCapabilityConsentPersistenceFailed {
+                    approval_id,
+                    error: ErrorDetail {
+                        category: "configuration_persistence".to_string(),
+                        message: "disk full".to_string(),
+                    },
+                },
+            ));
+            entries.push(JournalEntry::ToolRejected(ToolRejected {
+                error_category: error_category.to_string(),
+                tool_call_id: "shell-1".to_string(),
+                tool_name: "shell".to_string(),
+                turn_id: turn_id(),
+            }));
+            project_journal(&records(entries)).unwrap()
+        }
+
+        // Act
+        let expected = rejected_projection("workspace_capability_consent_persistence_failed");
+        let renamed = rejected_projection("arbitrary_diagnostic_label");
+
+        // Assert
+        assert_eq!(renamed, expected);
     }
 
     #[test]

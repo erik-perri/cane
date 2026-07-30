@@ -523,6 +523,43 @@ mod tests {
     }
 
     #[test]
+    fn remember_never_overwrites_unsupported_or_unreadable_configuration() {
+        // Arrange
+        let unsupported_root = tempdir().unwrap();
+        let unsupported_store = store(unsupported_root.path());
+        std::fs::create_dir_all(unsupported_store.document_path().parent().unwrap()).unwrap();
+        let unsupported = br#"{"schema_version":99,"consents":[]}"#;
+        std::fs::write(unsupported_store.document_path(), unsupported).unwrap();
+
+        let unreadable_root = tempdir().unwrap();
+        let unreadable_store = store(unreadable_root.path());
+        std::fs::create_dir_all(unreadable_store.document_path()).unwrap();
+
+        // Act
+        let unsupported_result =
+            unsupported_store.remember(consent("/workspace", "unix:///docker.sock"));
+        let unreadable_result =
+            unreadable_store.remember(consent("/workspace", "unix:///docker.sock"));
+
+        // Assert
+        assert!(matches!(
+            unsupported_result,
+            Err(UpdateError::Load(LoadFailure::UnsupportedVersion {
+                version: 99
+            }))
+        ));
+        assert_eq!(
+            std::fs::read(unsupported_store.document_path()).unwrap(),
+            unsupported
+        );
+        assert!(matches!(
+            unreadable_result,
+            Err(UpdateError::Load(LoadFailure::Io(_)))
+        ));
+        assert!(unreadable_store.document_path().is_dir());
+    }
+
+    #[test]
     fn duplicate_and_excess_consents_are_invalid_all_or_nothing() {
         for document in [
             json!({

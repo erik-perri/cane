@@ -15,7 +15,10 @@ pub use diagnostics::{
     DiagnosticImportance, DiagnosticStatus, SandboxDiagnosticFinding, SandboxDiagnosticInput,
     SandboxDiagnosticReport, diagnose_sandbox,
 };
-pub use docker::{DockerEndpoint, DockerEndpointError};
+pub use docker::{
+    DockerEndpoint, DockerEndpointError, DockerExecutable, DockerExecutableError,
+    DockerExecutableName, DockerIntegration,
+};
 #[cfg(target_os = "linux")]
 pub use linux::{
     BubblewrapInstallation, BubblewrapResolutionError, LinuxSandboxOperation, LinuxSandboxPlan,
@@ -114,6 +117,7 @@ impl CommandEnvironmentConfig {
 pub struct CommandRequest {
     pub arguments: Vec<String>,
     pub docker_endpoint: Option<DockerEndpoint>,
+    pub docker_executables: Vec<DockerExecutable>,
     pub environment: BTreeMap<String, String>,
     pub executable: String,
     pub workdir: PathBuf,
@@ -128,8 +132,9 @@ pub struct PreparedShellCommand {
 }
 
 impl PreparedShellCommand {
-    pub(crate) fn authorize_docker(&mut self, endpoint: DockerEndpoint) {
-        self.request.docker_endpoint = Some(endpoint);
+    pub(crate) fn authorize_docker(&mut self, integration: DockerIntegration) {
+        self.request.docker_endpoint = Some(integration.endpoint().clone());
+        self.request.docker_executables = integration.executables().to_vec();
     }
 
     pub fn classification(&self) -> &CommandClassification {
@@ -250,6 +255,7 @@ pub fn prepare_shell_command(
             command.clone(),
         ],
         docker_endpoint: None,
+        docker_executables: Vec::new(),
         environment: environment.environment(),
         executable: BASH_PATH.to_string(),
         workdir,

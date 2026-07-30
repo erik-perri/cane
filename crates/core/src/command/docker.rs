@@ -6,6 +6,109 @@ use thiserror::Error;
 #[cfg(unix)]
 const UNIX_ENDPOINT_SCHEME: &str = "unix://";
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DockerExecutableName {
+    Docker,
+    DockerCompose,
+}
+
+impl DockerExecutableName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::DockerCompose => "docker-compose",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct DockerExecutable {
+    name: DockerExecutableName,
+    path: PathBuf,
+}
+
+impl DockerExecutable {
+    pub fn validate(
+        name: DockerExecutableName,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, DockerExecutableError> {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(DockerExecutableError::RelativePath {
+                path: path.to_path_buf(),
+            });
+        }
+
+        validate_platform_executable(name, path)
+    }
+
+    pub fn name(&self) -> DockerExecutableName {
+        self.name
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DockerIntegration {
+    endpoint: DockerEndpoint,
+    executables: Vec<DockerExecutable>,
+}
+
+impl DockerIntegration {
+    pub fn new(endpoint: DockerEndpoint) -> Self {
+        Self {
+            endpoint,
+            executables: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_executables(
+        mut self,
+        executables: impl IntoIterator<Item = DockerExecutable>,
+    ) -> Self {
+        for executable in executables {
+            if let Some(existing) = self
+                .executables
+                .iter_mut()
+                .find(|existing| existing.name == executable.name)
+            {
+                *existing = executable;
+            } else {
+                self.executables.push(executable);
+            }
+        }
+        self.executables
+            .sort_unstable_by_key(|executable| executable.name);
+        self
+    }
+
+    pub fn endpoint(&self) -> &DockerEndpoint {
+        &self.endpoint
+    }
+
+    pub fn executables(&self) -> &[DockerExecutable] {
+        &self.executables
+    }
+
+    pub fn supports(&self, name: DockerExecutableName) -> bool {
+        self.executables.is_empty()
+            || self
+                .executables
+                .iter()
+                .any(|executable| executable.name == name)
+    }
+}
+
+impl From<DockerEndpoint> for DockerIntegration {
+    fn from(endpoint: DockerEndpoint) -> Self {
+        Self::new(endpoint)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DockerEndpoint {
     path: PathBuf,
@@ -79,6 +182,48 @@ fn endpoint_from_canonical_path(
     })
 }
 
+#[cfg(unix)]
+fn validate_platform_executable(
+    name: DockerExecutableName,
+    path: &Path,
+) -> Result<DockerExecutable, DockerExecutableError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let canonical_path =
+        fs::canonicalize(path).map_err(|error| DockerExecutableError::Unavailable {
+            detail: error.to_string(),
+            path: path.to_path_buf(),
+        })?;
+    let metadata =
+        fs::metadata(&canonical_path).map_err(|error| DockerExecutableError::Unavailable {
+            detail: error.to_string(),
+            path: canonical_path.clone(),
+        })?;
+    if !metadata.is_file() {
+        return Err(DockerExecutableError::NotRegularFile {
+            path: canonical_path,
+        });
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(DockerExecutableError::NotExecutable {
+            path: canonical_path,
+        });
+    }
+
+    Ok(DockerExecutable {
+        name,
+        path: canonical_path,
+    })
+}
+
+#[cfg(not(unix))]
+fn validate_platform_executable(
+    _name: DockerExecutableName,
+    _path: &Path,
+) -> Result<DockerExecutable, DockerExecutableError> {
+    Err(DockerExecutableError::UnsupportedPlatform)
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum DockerEndpointError {
     #[error("Docker endpoint path `{path}` must be absolute")]
@@ -97,10 +242,28 @@ pub enum DockerEndpointError {
     UnsupportedPlatform,
 }
 
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum DockerExecutableError {
+    #[error("Docker executable path `{path}` must be absolute")]
+    RelativePath { path: PathBuf },
+
+    #[error("Docker executable path `{path}` is unavailable: {detail}")]
+    Unavailable { detail: String, path: PathBuf },
+
+    #[error("Docker executable path `{path}` is not a regular file")]
+    NotRegularFile { path: PathBuf },
+
+    #[error("Docker executable path `{path}` is not executable")]
+    NotExecutable { path: PathBuf },
+
+    #[error("Docker executable discovery is not supported on this platform")]
+    UnsupportedPlatform,
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use tempfile::TempDir;
 
@@ -155,5 +318,31 @@ mod tests {
                 path: fs::canonicalize(regular_path).unwrap(),
             })
         );
+    }
+
+    #[test]
+    fn executable_validation_canonicalizes_symlinks_and_requires_an_executable_file() {
+        // Arrange
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("docker-target");
+        let link = root.path().join("docker");
+        let non_executable = root.path().join("not-executable");
+        fs::write(&target, "#!/bin/true\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&non_executable, "not executable").unwrap();
+        symlink(&target, &link).unwrap();
+
+        // Act
+        let executable = DockerExecutable::validate(DockerExecutableName::Docker, &link).unwrap();
+        let rejected =
+            DockerExecutable::validate(DockerExecutableName::DockerCompose, &non_executable);
+
+        // Assert
+        assert_eq!(executable.name(), DockerExecutableName::Docker);
+        assert_eq!(executable.path(), fs::canonicalize(target).unwrap());
+        assert!(matches!(
+            rejected,
+            Err(DockerExecutableError::NotExecutable { .. })
+        ));
     }
 }

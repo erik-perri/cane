@@ -199,6 +199,9 @@ fn configure_shell(
                 policy.executable_path(),
                 policy.private_temp(),
             )?;
+            let docker = docker_endpoint.and_then(|endpoint| {
+                discover_docker_integration(endpoint, policy.executable_path())
+            });
 
             cane_core::AgentShellConfig::sandboxed(
                 environment,
@@ -206,31 +209,33 @@ fn configure_shell(
                 report.bubblewrap_version.clone(),
                 policy,
             )
-            .map(|config| match docker_endpoint {
-                Some(endpoint) => {
-                    config.with_integration(cane_core::ShellIntegration::Docker(endpoint))
+            .map(|config| match docker {
+                Some(integration) => {
+                    config.with_integration(cane_core::ShellIntegration::Docker(integration))
                 }
                 None => config,
             })
             .map_err(Into::into)
         }
         CliShellMode::Unsafe => {
+            let executable_path = unsafe_visible_path();
             let environment =
-                command_environment(Path::new("/tmp"), &unsafe_visible_path(), Path::new("/tmp"))?;
+                command_environment(Path::new("/tmp"), &executable_path, Path::new("/tmp"))?;
             let executor = cane_core::command::UnsafeExecutor::new(workspace.root().to_path_buf());
-            let docker_endpoint = discover_docker_endpoint(
+            let docker = discover_docker_endpoint(
                 std::env::var_os("DOCKER_HOST"),
                 std::env::var_os("XDG_RUNTIME_DIR"),
-            );
+            )
+            .and_then(|endpoint| discover_docker_integration(endpoint, &executable_path));
 
             cane_core::AgentShellConfig::unsafe_host(
                 environment,
                 Arc::new(executor),
                 workspace.root().to_path_buf(),
             )
-            .map(|config| match docker_endpoint {
-                Some(endpoint) => {
-                    config.with_integration(cane_core::ShellIntegration::Docker(endpoint))
+            .map(|config| match docker {
+                Some(integration) => {
+                    config.with_integration(cane_core::ShellIntegration::Docker(integration))
                 }
                 None => config,
             })
@@ -357,6 +362,31 @@ fn discover_docker_endpoint_from(
     non_empty_path(xdg_runtime_directory)
         .map(|directory| directory.join("docker.sock"))
         .and_then(|path| cane_core::command::DockerEndpoint::validate(path).ok())
+}
+
+fn discover_docker_integration(
+    endpoint: cane_core::command::DockerEndpoint,
+    executable_path: &[PathBuf],
+) -> Option<cane_core::command::DockerIntegration> {
+    let executables = discover_docker_executables(executable_path);
+    (!executables.is_empty())
+        .then(|| cane_core::command::DockerIntegration::new(endpoint).with_executables(executables))
+}
+
+fn discover_docker_executables(
+    executable_path: &[PathBuf],
+) -> Vec<cane_core::command::DockerExecutable> {
+    [
+        cane_core::command::DockerExecutableName::Docker,
+        cane_core::command::DockerExecutableName::DockerCompose,
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        executable_path.iter().find_map(|directory| {
+            cane_core::command::DockerExecutable::validate(name, directory.join(name.as_str())).ok()
+        })
+    })
+    .collect()
 }
 
 fn resolve_cane_home(cane_home: Option<OsString>, user_home: Option<OsString>) -> Option<PathBuf> {
@@ -552,5 +582,43 @@ mod tests {
         // Assert
         assert_eq!(system.path(), fs::canonicalize(system_socket).unwrap());
         assert_eq!(rootless.path(), fs::canonicalize(rootless_socket).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_executable_discovery_canonicalizes_targets_outside_the_visible_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::net::UnixListener;
+        use tempfile::TempDir;
+
+        // Arrange
+        let root = TempDir::new().unwrap();
+        let visible_bin = root.path().join("visible/bin");
+        let external_bin = root.path().join("external");
+        fs::create_dir_all(&visible_bin).unwrap();
+        fs::create_dir_all(&external_bin).unwrap();
+        let target = external_bin.join("docker");
+        fs::write(&target, "#!/bin/true\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, visible_bin.join("docker")).unwrap();
+        let socket_path = root.path().join("docker.sock");
+        let _socket = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = cane_core::command::DockerEndpoint::validate(&socket_path).unwrap();
+
+        // Act
+        let executables = discover_docker_executables(std::slice::from_ref(&visible_bin));
+        let integration =
+            discover_docker_integration(endpoint.clone(), std::slice::from_ref(&visible_bin));
+        let unavailable = discover_docker_integration(endpoint, &[]);
+
+        // Assert
+        assert_eq!(executables.len(), 1);
+        assert_eq!(
+            executables[0].name(),
+            cane_core::command::DockerExecutableName::Docker
+        );
+        assert_eq!(executables[0].path(), fs::canonicalize(target).unwrap());
+        assert!(integration.is_some());
+        assert!(unavailable.is_none());
     }
 }
