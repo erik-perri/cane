@@ -467,6 +467,15 @@ mod tests {
         WorkspaceCapabilityConsentStore::new(root.join("config")).unwrap()
     }
 
+    fn normalize_schema_line_endings(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        if text.contains("\r\n") {
+            std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        }
+    }
+
     #[test]
     fn missing_document_loads_without_consents() {
         // Arrange
@@ -824,9 +833,12 @@ mod tests {
             store.schema_path().file_name().unwrap(),
             WORKSPACE_CAPABILITY_CONSENTS_SCHEMA
         );
+        let written = std::fs::read(store.schema_path()).unwrap();
         assert_eq!(
-            std::fs::read(store.schema_path()).unwrap(),
-            include_bytes!("../schema/workspace-capability-consents.schema.json")
+            normalize_schema_line_endings(&written),
+            normalize_schema_line_endings(include_bytes!(
+                "../schema/workspace-capability-consents.schema.json"
+            ))
         );
     }
 
@@ -872,8 +884,10 @@ mod tests {
             document_example()
         );
         assert_eq!(
-            generated,
-            include_bytes!("../schema/workspace-capability-consents.schema.json")
+            normalize_schema_line_endings(&generated),
+            normalize_schema_line_endings(include_bytes!(
+                "../schema/workspace-capability-consents.schema.json"
+            ))
         );
     }
 
