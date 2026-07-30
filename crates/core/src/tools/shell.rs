@@ -288,8 +288,11 @@ mod tests {
     };
     use crate::tools::{ShellToolConfig, ToolSet, ToolTestExt};
     use async_trait::async_trait;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -540,6 +543,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_docker_command_requires_separate_run_capability_authorization() {
         // Arrange
@@ -614,6 +618,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn compound_invocation_with_a_direct_docker_segment_requests_daemon_access_for_all() {
         // Arrange
@@ -662,6 +667,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn docker_mentions_and_opaque_wrappers_request_no_daemon_access() {
         // Arrange

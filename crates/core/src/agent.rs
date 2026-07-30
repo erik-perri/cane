@@ -2227,6 +2227,7 @@ mod tests {
             .expect("agent task panicked");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_is_explainable_from_approval_execution_and_journal_records() {
         // Arrange
