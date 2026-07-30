@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "PersistedCapability": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Access to one canonical local Unix Docker daemon endpoint.",
+          "properties": {
+            "name": {
+              "const": "docker_daemon",
+              "type": "string"
+            },
+            "resource": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "resource"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorkspaceCapabilityGrant": {
+      "additionalProperties": false,
+      "description": "One capability authorization persisted for one canonical Workspace.",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/PersistedCapability"
+        },
+        "workspace": {
+          "description": "The canonical Workspace path serialized for the current platform.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace",
+        "capability"
+      ],
+      "type": "object"
+    },
+    "WorkspaceCapabilityGrantDocument": {
+      "additionalProperties": false,
+      "description": "The current in-memory Workspace capability-grant document.",
+      "examples": [
+        {
+          "$schema": "./workspace-capability-grants.schema.json",
+          "grants": [
+            {
+              "capability": {
+                "name": "docker_daemon",
+                "resource": "unix:///canonical/docker.sock"
+              },
+              "workspace": "/canonical/workspace"
+            }
+          ],
+          "schema_version": 0
+        }
+      ],
+      "properties": {
+        "$schema": {
+          "description": "Advisory editor schema reference. Runtime decoding remains authoritative.",
+          "type": "string"
+        },
+        "grants": {
+          "description": "Complete, deterministically ordered grant set.",
+          "items": {
+            "$ref": "#/$defs/WorkspaceCapabilityGrant"
+          },
+          "maxItems": 256,
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 0,
+          "description": "Persisted format discriminator.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "grants"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/WorkspaceCapabilityGrantDocument"
+    }
+  ],
+  "title": "SupportedWorkspaceCapabilityGrantDocuments"
+}

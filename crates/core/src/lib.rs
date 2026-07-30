@@ -8,6 +8,7 @@ mod provider;
 mod session;
 mod tools;
 mod workspace;
+mod workspace_grants;
 
 pub use agent::{
     AgentHandle, AgentShellConfig, AgentShellConfigError, AgentStartError, spawn_agent,
@@ -24,3 +25,8 @@ pub use provider::{
 pub use session::SessionConfig;
 pub use tools::{ShellIntegration, ToolDefinition};
 pub use workspace::Workspace;
+pub use workspace_grants::{
+    MAX_WORKSPACE_CAPABILITY_GRANTS, WORKSPACE_CAPABILITY_GRANTS_DOCUMENT,
+    WORKSPACE_CAPABILITY_GRANTS_SCHEMA, WorkspaceCapabilityGrant, WorkspaceCapabilityGrantDocument,
+    WorkspaceCapabilityGrantStore, WorkspaceGrantDocumentError,
+};

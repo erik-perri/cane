@@ -136,6 +136,7 @@ name = "cane-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cane-config",
  "dunce",
  "futures-util",
  "globset",
@@ -146,6 +147,7 @@ dependencies = [
  "jiff",
  "libc",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
