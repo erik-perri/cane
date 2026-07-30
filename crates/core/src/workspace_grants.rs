@@ -114,6 +114,44 @@ impl WorkspaceCapabilityGrantDocument {
         &self.grants
     }
 
+    pub(crate) fn effective_approval_grants(
+        &self,
+        workspace: &crate::Workspace,
+        docker_endpoint: Option<&crate::command::DockerEndpoint>,
+    ) -> Vec<crate::ApprovalGrant> {
+        let Some(workspace) = workspace.root().to_str() else {
+            return Vec::new();
+        };
+        self.effective_approval_grants_for(
+            workspace,
+            docker_endpoint.map(crate::command::DockerEndpoint::resource),
+        )
+    }
+
+    fn effective_approval_grants_for(
+        &self,
+        workspace: &str,
+        docker_resource: Option<&str>,
+    ) -> Vec<crate::ApprovalGrant> {
+        self.grants
+            .iter()
+            .filter(|grant| grant.workspace == workspace)
+            .filter_map(|grant| match (&grant.capability, docker_resource) {
+                (PersistedCapability::DockerDaemon { resource }, Some(endpoint))
+                    if resource == endpoint =>
+                {
+                    Some(crate::ApprovalGrant {
+                        matcher: crate::ApprovalMatcher::Capability {
+                            capability: crate::NamedCapability::docker_daemon(resource),
+                        },
+                        scope: crate::ApprovalScope::Workspace,
+                    })
+                }
+                (PersistedCapability::DockerDaemon { .. }, _) => None,
+            })
+            .collect()
+    }
+
     fn remember(&mut self, grant: WorkspaceCapabilityGrant) {
         if let Some(existing) = self
             .grants
@@ -642,6 +680,32 @@ mod tests {
                     | WorkspaceGrantDocumentError::InvalidDockerResource { .. })
             ));
         }
+    }
+
+    #[test]
+    fn effective_grants_require_exact_workspace_and_endpoint_identities() {
+        // Arrange
+        let document = WorkspaceCapabilityGrantDocument {
+            schema: Some(SCHEMA_REFERENCE.to_owned()),
+            schema_version: SCHEMA_VERSION,
+            grants: vec![grant("/workspace", "unix:///configured.sock")],
+        };
+
+        // Act
+        let exact =
+            document.effective_approval_grants_for("/workspace", Some("unix:///configured.sock"));
+        let other_workspace =
+            document.effective_approval_grants_for("/other", Some("unix:///configured.sock"));
+        let other_endpoint =
+            document.effective_approval_grants_for("/workspace", Some("unix:///other.sock"));
+        let unavailable_endpoint = document.effective_approval_grants_for("/workspace", None);
+
+        // Assert
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].lifetime(), crate::ApprovalLifetime::Workspace);
+        assert!(other_workspace.is_empty());
+        assert!(other_endpoint.is_empty());
+        assert!(unavailable_endpoint.is_empty());
     }
 
     #[test]

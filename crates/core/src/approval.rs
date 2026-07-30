@@ -13,6 +13,9 @@ pub enum ApprovalAuthorization {
         approval_id: ApprovalId,
         grant: ApprovalGrant,
     },
+    WorkspaceConfigured {
+        grant: ApprovalGrant,
+    },
     NotRequired,
 }
 
@@ -48,7 +51,8 @@ impl ApprovalGate {
         self.run_approvals
             .iter()
             .find(|authorization| match authorization {
-                ApprovalAuthorization::Granted { grant, .. } => grant.authorizes(subject),
+                ApprovalAuthorization::Granted { grant, .. }
+                | ApprovalAuthorization::WorkspaceConfigured { grant } => grant.authorizes(subject),
                 ApprovalAuthorization::NotRequired => false,
             })
             .cloned()
@@ -89,6 +93,14 @@ impl ApprovalGate {
                 reason: reason.clone(),
             },
         }
+    }
+
+    pub fn seed_workspace_grants(&mut self, grants: impl IntoIterator<Item = ApprovalGrant>) {
+        self.run_approvals.extend(
+            grants
+                .into_iter()
+                .map(|grant| ApprovalAuthorization::WorkspaceConfigured { grant }),
+        );
     }
 }
 
@@ -251,6 +263,42 @@ mod tests {
             })
         );
         assert_eq!(changed, ApprovalCheck::RequiresDecision);
+    }
+
+    #[test]
+    fn configured_workspace_grants_retain_their_source_and_match_exactly() {
+        // Arrange
+        let mut gate = ApprovalGate::new();
+        let configured = ApprovalSubject::capability(
+            crate::NamedCapability::docker_daemon("unix:///configured.sock"),
+            "seed",
+            "shell",
+        )
+        .grant(ApprovalLifetime::Workspace);
+        gate.seed_workspace_grants([configured.clone()]);
+        let matching = ApprovalSubject::capability(
+            crate::NamedCapability::docker_daemon("unix:///configured.sock"),
+            "shell-1",
+            "shell",
+        );
+        let different = ApprovalSubject::capability(
+            crate::NamedCapability::docker_daemon("unix:///other.sock"),
+            "shell-2",
+            "shell",
+        );
+
+        // Act
+        let authorized = gate.check(ApprovalRequirement::Required, &matching);
+        let requires_decision = gate.check(ApprovalRequirement::Required, &different);
+
+        // Assert
+        assert_eq!(
+            authorized,
+            ApprovalCheck::Authorized(ApprovalAuthorization::WorkspaceConfigured {
+                grant: configured,
+            })
+        );
+        assert_eq!(requires_decision, ApprovalCheck::RequiresDecision);
     }
 
     #[test]

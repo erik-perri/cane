@@ -111,6 +111,10 @@ async fn run_with_input(
                         writeln!(output, "\nerror: {error}")?;
                         continue;
                     }
+                    Some(AgentEvent::Warning(warning)) => {
+                        writeln!(output, "\nwarning: {warning}")?;
+                        continue;
+                    }
                     Some(event) => {
                         return Err(anyhow::anyhow!(
                             "agent emitted an unexpected event while idle: {event:?}"
@@ -197,6 +201,7 @@ async fn run_with_input(
                 },
 
                 AgentEvent::Error(e) => writeln!(output, "\nerror: {e}")?,
+                AgentEvent::Warning(warning) => writeln!(output, "\nwarning: {warning}")?,
 
                 AgentEvent::ApprovalRequest {
                     available_lifetimes,

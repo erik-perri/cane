@@ -36,6 +36,7 @@ pub enum AgentEvent {
     TurnComplete {
         outcome: TurnOutcome,
     },
+    Warning(String),
     Error(String),
 }
 

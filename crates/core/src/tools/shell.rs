@@ -46,6 +46,10 @@ impl ShellIntegrations {
             None
         }
     }
+
+    pub(crate) fn docker_endpoint(&self) -> Option<&DockerEndpoint> {
+        self.docker_endpoint.as_ref()
+    }
 }
 
 pub(super) struct ShellTool {

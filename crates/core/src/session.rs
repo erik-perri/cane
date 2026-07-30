@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+use crate::WorkspaceCapabilityGrantStore;
+
+#[derive(Clone, Debug)]
 pub struct SessionConfig {
     cane_version: String,
     instructions: String,
     sessions_directory: PathBuf,
+    workspace_grants: Option<WorkspaceCapabilityGrantStore>,
 }
 
 impl SessionConfig {
@@ -17,7 +20,17 @@ impl SessionConfig {
             cane_version: cane_version.into(),
             instructions: instructions.into(),
             sessions_directory: sessions_directory.into(),
+            workspace_grants: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_workspace_capability_grants(
+        mut self,
+        store: WorkspaceCapabilityGrantStore,
+    ) -> Self {
+        self.workspace_grants = Some(store);
+        self
     }
 
     pub fn cane_version(&self) -> &str {
@@ -30,5 +43,9 @@ impl SessionConfig {
 
     pub fn sessions_directory(&self) -> &Path {
         &self.sessions_directory
+    }
+
+    pub(crate) fn workspace_grants(&self) -> Option<&WorkspaceCapabilityGrantStore> {
+        self.workspace_grants.as_ref()
     }
 }
