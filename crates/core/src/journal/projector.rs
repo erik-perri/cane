@@ -5,14 +5,15 @@ use super::{
     TurnAbortOutcome, TurnCommitOutcome, TurnId,
 };
 use crate::{
-    ApprovalGrant, ApprovalLifetime, ApprovalSubject, ContentBlock, Message, NamedCapability, Role,
-    StopReason,
+    ApprovalGrant, ApprovalLifetime, ApprovalSubject, Checklist, ContentBlock, Message,
+    NamedCapability, Role, StopReason, ToolInput,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionProjection {
+    pub checklist: Checklist,
     pub instructions: String,
     pub messages: Vec<Message>,
     pub session_id: SessionId,
@@ -95,6 +96,7 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
     };
 
     let mut active_run: Option<RunState> = None;
+    let mut checklist = Checklist::default();
     let mut messages = Vec::new();
 
     for record in &records[1..] {
@@ -440,6 +442,7 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
                     ));
                 }
                 validate_commit(&turn, &committed.outcome, record.sequence)?;
+                project_committed_checklist(&mut checklist, &turn.messages, record.sequence)?;
                 messages.extend(turn.messages);
             }
             JournalEntry::TurnAborted(aborted) => {
@@ -486,11 +489,87 @@ pub fn project_journal(records: &[JournalRecord]) -> Result<SessionProjection, P
     }
 
     Ok(SessionProjection {
+        checklist,
         instructions: started.instructions.clone(),
         messages,
         session_id: first.session_id,
         warnings,
     })
+}
+
+fn project_committed_checklist(
+    checklist: &mut Checklist,
+    messages: &[Message],
+    sequence: u64,
+) -> Result<(), ProjectionError> {
+    if checklist.is_fully_completed() {
+        *checklist = Checklist::default();
+    }
+
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+
+        let has_checklist_call = message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { name, .. } if name == "update_checklist"
+            )
+        });
+        if !has_checklist_call {
+            continue;
+        }
+
+        let Some(result_message) = messages.get(index + 1) else {
+            return Err(invalid(
+                sequence,
+                "update_checklist call has no following tool-result message",
+            ));
+        };
+        let results: HashMap<_, _> = result_message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult(result) => Some((result.tool_use_id.as_str(), result)),
+                _ => None,
+            })
+            .collect();
+
+        for block in &message.content {
+            let ContentBlock::ToolUse { id, input, name } = block else {
+                continue;
+            };
+            if name != "update_checklist" {
+                continue;
+            }
+
+            let Some(result) = results.get(id.as_str()) else {
+                return Err(invalid(
+                    sequence,
+                    format!("update_checklist call `{id}` has no matching tool result"),
+                ));
+            };
+            if result.is_error {
+                continue;
+            }
+
+            let ToolInput::Valid(input) = input else {
+                return Err(invalid(
+                    sequence,
+                    format!("successful update_checklist call `{id}` has no parsed JSON input"),
+                ));
+            };
+            *checklist = crate::checklist::parse_checklist(input).map_err(|error| {
+                invalid(
+                    sequence,
+                    format!("successful update_checklist call `{id}` is invalid: {error}"),
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn add_message(
@@ -1131,6 +1210,14 @@ mod tests {
         "round_01ARZ3NDEKTSV4RRFFQ69G5FAY".parse().unwrap()
     }
 
+    fn second_turn_id() -> TurnId {
+        "turn_01ARZ3NDEKTSV4RRFFQ69G5FB0".parse().unwrap()
+    }
+
+    fn second_round_id() -> ProviderRoundId {
+        "round_01ARZ3NDEKTSV4RRFFQ69G5FB1".parse().unwrap()
+    }
+
     fn records(entries: Vec<JournalEntry>) -> Vec<JournalRecord> {
         entries
             .into_iter()
@@ -1228,6 +1315,174 @@ mod tests {
             turn_id: turn_id(),
             usage: None,
         })
+    }
+
+    #[derive(Clone)]
+    struct HistoricalToolCall {
+        id: &'static str,
+        input: ToolInput,
+        is_error: bool,
+        name: &'static str,
+    }
+
+    fn checklist_call(id: &'static str, input: serde_json::Value) -> HistoricalToolCall {
+        HistoricalToolCall {
+            id,
+            input: ToolInput::Valid(input),
+            is_error: false,
+            name: "update_checklist",
+        }
+    }
+
+    fn historical_tool_turn(
+        turn_id: TurnId,
+        round_id: ProviderRoundId,
+        calls: &[HistoricalToolCall],
+        reverse_results: bool,
+    ) -> Vec<JournalEntry> {
+        let assistant = Message {
+            content: calls
+                .iter()
+                .map(|call| ContentBlock::ToolUse {
+                    id: call.id.to_string(),
+                    input: call.input.clone(),
+                    name: call.name.to_string(),
+                })
+                .collect(),
+            role: Role::Assistant,
+        };
+        let mut results: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                ContentBlock::ToolResult(ToolResultData {
+                    content: "historical acknowledgement text".to_string(),
+                    is_error: call.is_error,
+                    tool_use_id: call.id.to_string(),
+                })
+            })
+            .collect();
+        if reverse_results {
+            results.reverse();
+        }
+
+        let mut entries = vec![
+            JournalEntry::TurnStarted(TurnStarted {
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::MessageAdded(MessageAdded {
+                message: user_text("Work"),
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::ProviderRoundStarted(ProviderRoundStarted {
+                model: "test-model".to_string(),
+                provider: provider(),
+                provider_round_id: round_id,
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::ProviderRoundCompleted(ProviderRoundCompleted {
+                latency_ms: 10,
+                provider_cost: None,
+                provider_round_id: round_id,
+                request_id: None,
+                run_id: run_id(),
+                stop_reason: StopReason::ToolUse,
+                turn_id,
+                usage: None,
+            }),
+            JournalEntry::MessageAdded(MessageAdded {
+                message: assistant,
+                run_id: run_id(),
+                turn_id,
+            }),
+        ];
+
+        for call in calls {
+            if call.is_error {
+                entries.push(JournalEntry::ToolRejected(ToolRejected {
+                    error_category: "invalid_input".to_string(),
+                    tool_call_id: call.id.to_string(),
+                    tool_name: call.name.to_string(),
+                    turn_id,
+                }));
+            } else {
+                entries.push(JournalEntry::ToolStarted(ToolStarted {
+                    authorization: ToolAuthorization::NotRequired,
+                    execution: None,
+                    tool_call_id: call.id.to_string(),
+                    tool_name: call.name.to_string(),
+                    turn_id,
+                }));
+                entries.push(JournalEntry::ToolCompleted(ToolCompleted {
+                    duration_ms: 1,
+                    execution: None,
+                    tool_call_id: call.id.to_string(),
+                    turn_id,
+                }));
+            }
+        }
+
+        entries.extend([
+            JournalEntry::MessageAdded(MessageAdded {
+                message: Message {
+                    content: results,
+                    role: Role::User,
+                },
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::TurnCommitted(TurnCommitted {
+                outcome: TurnCommitOutcome::Paused {
+                    reason: "pause after tools".to_string(),
+                },
+                turn_id,
+            }),
+        ]);
+        entries
+    }
+
+    fn committed_text_turn(turn_id: TurnId, round_id: ProviderRoundId) -> Vec<JournalEntry> {
+        vec![
+            JournalEntry::TurnStarted(TurnStarted {
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::MessageAdded(MessageAdded {
+                message: user_text("Next"),
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::ProviderRoundStarted(ProviderRoundStarted {
+                model: "test-model".to_string(),
+                provider: provider(),
+                provider_round_id: round_id,
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::ProviderRoundCompleted(ProviderRoundCompleted {
+                latency_ms: 10,
+                provider_cost: None,
+                provider_round_id: round_id,
+                request_id: None,
+                run_id: run_id(),
+                stop_reason: StopReason::EndTurn,
+                turn_id,
+                usage: None,
+            }),
+            JournalEntry::MessageAdded(MessageAdded {
+                message: assistant_text("Done"),
+                run_id: run_id(),
+                turn_id,
+            }),
+            JournalEntry::TurnCommitted(TurnCommitted {
+                outcome: TurnCommitOutcome::Completed {
+                    stop_reason: StopReason::EndTurn,
+                },
+                turn_id,
+            }),
+        ]
     }
 
     fn run_ended() -> JournalEntry {
@@ -1465,8 +1720,267 @@ mod tests {
         // Assert
         assert_eq!(projection.instructions, "Be helpful.");
         assert_eq!(projection.messages, vec![user, assistant]);
+        assert!(projection.checklist.is_empty());
         assert_eq!(projection.session_id, session_id());
         assert!(projection.warnings.is_empty());
+    }
+
+    #[test]
+    fn successful_committed_update_projects_the_normalized_checklist() {
+        let call = checklist_call(
+            "checklist-1",
+            serde_json::json!({
+                "checklist": [{ "step": " Implement replay ", "status": "in_progress" }]
+            }),
+        );
+        let mut entries = vec![session_started(), run_started()];
+        entries.extend(historical_tool_turn(turn_id(), round_id(), &[call], false));
+        entries.push(run_ended());
+
+        let projection = project_journal(&records(entries)).unwrap();
+
+        assert_eq!(projection.checklist.steps().len(), 1);
+        assert_eq!(projection.checklist.steps()[0].text(), "Implement replay");
+        assert_eq!(
+            projection.checklist.steps()[0].status(),
+            crate::ChecklistStepStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn successful_updates_follow_assistant_call_order_not_result_order() {
+        let calls = [
+            checklist_call(
+                "checklist-1",
+                serde_json::json!({
+                    "checklist": [{ "step": "First", "status": "in_progress" }]
+                }),
+            ),
+            checklist_call(
+                "checklist-2",
+                serde_json::json!({
+                    "checklist": [
+                        { "step": "First", "status": "completed" },
+                        { "step": "Second", "status": "pending" }
+                    ]
+                }),
+            ),
+        ];
+        let mut entries = vec![session_started(), run_started()];
+        entries.extend(historical_tool_turn(turn_id(), round_id(), &calls, true));
+        entries.push(run_ended());
+
+        let projection = project_journal(&records(entries)).unwrap();
+
+        assert_eq!(projection.checklist.steps().len(), 2);
+        assert_eq!(projection.checklist.steps()[0].text(), "First");
+        assert_eq!(
+            projection.checklist.steps()[0].status(),
+            crate::ChecklistStepStatus::Completed
+        );
+        assert_eq!(projection.checklist.steps()[1].text(), "Second");
+    }
+
+    #[test]
+    fn failed_update_is_ignored_without_parsing_and_a_later_success_wins() {
+        let calls = [
+            HistoricalToolCall {
+                id: "checklist-bad",
+                input: ToolInput::Invalid("{ definitely not JSON".to_string()),
+                is_error: true,
+                name: "update_checklist",
+            },
+            checklist_call(
+                "checklist-good",
+                serde_json::json!({
+                    "checklist": [{ "step": "Accepted", "status": "pending" }]
+                }),
+            ),
+        ];
+        let mut entries = vec![session_started(), run_started()];
+        entries.extend(historical_tool_turn(turn_id(), round_id(), &calls, false));
+        entries.push(run_ended());
+
+        let projection = project_journal(&records(entries)).unwrap();
+
+        assert_eq!(projection.checklist.steps().len(), 1);
+        assert_eq!(projection.checklist.steps()[0].text(), "Accepted");
+    }
+
+    #[test]
+    fn checklist_success_does_not_depend_on_historical_result_text() {
+        let call = checklist_call(
+            "checklist-1",
+            serde_json::json!({
+                "checklist": [{ "step": "Stable", "status": "pending" }]
+            }),
+        );
+        let mut original = vec![session_started(), run_started()];
+        original.extend(historical_tool_turn(turn_id(), round_id(), &[call], false));
+        original.push(run_ended());
+        let mut renamed = original.clone();
+        for entry in &mut renamed {
+            let JournalEntry::MessageAdded(added) = entry else {
+                continue;
+            };
+            for block in &mut added.message.content {
+                if let ContentBlock::ToolResult(result) = block {
+                    result.content = "A completely different acknowledgement".to_string();
+                }
+            }
+        }
+
+        let original = project_journal(&records(original)).unwrap();
+        let renamed = project_journal(&records(renamed)).unwrap();
+
+        assert_eq!(renamed.checklist, original.checklist);
+        assert_eq!(renamed.checklist.steps()[0].text(), "Stable");
+    }
+
+    #[test]
+    fn supposedly_successful_unreconstructable_updates_fail_projection() {
+        let cases = [
+            HistoricalToolCall {
+                id: "checklist-raw",
+                input: ToolInput::Invalid("{ malformed".to_string()),
+                is_error: false,
+                name: "update_checklist",
+            },
+            HistoricalToolCall {
+                id: "checklist-invalid",
+                input: ToolInput::Valid(serde_json::json!({})),
+                is_error: false,
+                name: "update_checklist",
+            },
+        ];
+
+        for call in cases {
+            let mut entries = vec![session_started(), run_started()];
+            entries.extend(historical_tool_turn(turn_id(), round_id(), &[call], false));
+            entries.push(run_ended());
+
+            let error = project_journal(&records(entries)).unwrap_err();
+
+            assert!(error.detail.contains("successful update_checklist call"));
+            assert!(
+                error.detail.contains("no parsed JSON input")
+                    || error.detail.contains("invalid checklist input")
+            );
+        }
+    }
+
+    #[test]
+    fn aborted_and_unterminated_updates_do_not_change_projected_checklist() {
+        let call = checklist_call(
+            "checklist-1",
+            serde_json::json!({
+                "checklist": [{ "step": "Uncommitted", "status": "in_progress" }]
+            }),
+        );
+        let mut uncommitted_turn =
+            historical_tool_turn(turn_id(), round_id(), std::slice::from_ref(&call), false);
+        assert!(matches!(
+            uncommitted_turn.pop(),
+            Some(JournalEntry::TurnCommitted(_))
+        ));
+
+        let mut aborted_entries = vec![session_started(), run_started()];
+        aborted_entries.extend(uncommitted_turn.clone());
+        aborted_entries.push(JournalEntry::TurnAborted(TurnAborted {
+            outcome: TurnAbortOutcome::Failed { error: None },
+            turn_id: turn_id(),
+        }));
+        aborted_entries.push(run_ended());
+
+        let mut unterminated_entries = vec![session_started(), run_started()];
+        unterminated_entries.extend(uncommitted_turn);
+
+        let aborted = project_journal(&records(aborted_entries)).unwrap();
+        let unterminated = project_journal(&records(unterminated_entries)).unwrap();
+
+        assert!(aborted.checklist.is_empty());
+        assert!(unterminated.checklist.is_empty());
+        assert!(
+            unterminated
+                .warnings
+                .contains(&ProjectionWarning::UnterminatedTurn { turn_id: turn_id() })
+        );
+    }
+
+    #[test]
+    fn completed_checklist_retires_only_when_a_later_turn_commits() {
+        let completed = checklist_call(
+            "checklist-1",
+            serde_json::json!({
+                "checklist": [{ "step": "Done", "status": "completed" }]
+            }),
+        );
+        let mut first_turn = vec![session_started(), run_started()];
+        first_turn.extend(historical_tool_turn(
+            turn_id(),
+            round_id(),
+            &[completed],
+            false,
+        ));
+
+        let remains = project_journal(&records({
+            let mut entries = first_turn.clone();
+            entries.push(run_ended());
+            entries
+        }))
+        .unwrap();
+
+        first_turn.extend(committed_text_turn(second_turn_id(), second_round_id()));
+        first_turn.push(run_ended());
+        let retired = project_journal(&records(first_turn)).unwrap();
+
+        assert_eq!(remains.checklist.steps().len(), 1);
+        assert_eq!(
+            remains.checklist.steps()[0].status(),
+            crate::ChecklistStepStatus::Completed
+        );
+        assert!(retired.checklist.is_empty());
+    }
+
+    #[test]
+    fn explicit_empty_update_clears_unfinished_state_and_names_match_exactly() {
+        let calls = [
+            checklist_call(
+                "checklist-1",
+                serde_json::json!({
+                    "checklist": [{ "step": "Active", "status": "in_progress" }]
+                }),
+            ),
+            checklist_call("checklist-2", serde_json::json!({ "checklist": [] })),
+        ];
+        let mut cleared_entries = vec![session_started(), run_started()];
+        cleared_entries.extend(historical_tool_turn(turn_id(), round_id(), &calls, false));
+        cleared_entries.push(run_ended());
+
+        let alias = HistoricalToolCall {
+            id: "checklist-alias",
+            input: ToolInput::Valid(serde_json::json!({
+                "checklist": [{ "step": "Ignored", "status": "completed" }]
+            })),
+            is_error: false,
+            name: "Update_Checklist",
+        };
+        let mut alias_entries = vec![session_started(), run_started()];
+        alias_entries.extend(historical_tool_turn(turn_id(), round_id(), &[alias], false));
+        alias_entries.push(run_ended());
+
+        assert!(
+            project_journal(&records(cleared_entries))
+                .unwrap()
+                .checklist
+                .is_empty()
+        );
+        assert!(
+            project_journal(&records(alias_entries))
+                .unwrap()
+                .checklist
+                .is_empty()
+        );
     }
 
     #[test]
