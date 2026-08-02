@@ -464,6 +464,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_accepts_empty_startup_checklists_while_idle() {
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (event_tx, events) = mpsc::channel(1);
+        let agent = TestAgent {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let input = GatedEof {
+            released: false,
+            release: release_rx,
+        };
+        let frontend = tokio::spawn(async move {
+            let first = event_tx
+                .send(AgentEvent::ChecklistUpdated(Checklist::default()))
+                .await;
+            let second = event_tx
+                .send(AgentEvent::ChecklistUpdated(Checklist::default()))
+                .await;
+            let third = event_tx
+                .send(AgentEvent::ChecklistUpdated(Checklist::default()))
+                .await;
+            release_tx.send(()).unwrap();
+            (first, second, third, command_rx.recv().await)
+        });
+        let mut output = Vec::new();
+
+        let result = run(agent, input, &mut output).await;
+        let (first, second, third, command) = frontend.await.unwrap();
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert!(third.is_ok());
+        assert_eq!(String::from_utf8(output).unwrap(), "> ");
+        assert_eq!(
+            command,
+            Some(AgentCommand::Shutdown(ShutdownReason::InputClosed))
+        );
+    }
+
+    #[tokio::test]
     async fn run_suppresses_successful_update_checklist_tool_noise() {
         let (commands, mut command_rx) = mpsc::channel(1);
         let (event_tx, events) = mpsc::channel(8);
