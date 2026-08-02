@@ -184,7 +184,12 @@ impl OpenAiClient {
         }
     }
 
-    fn build_request(&self, history: &[Message], tools: &[ToolDefinition]) -> OpenAiRequest {
+    fn build_request(
+        &self,
+        history: &[Message],
+        tools: &[ToolDefinition],
+        dynamic_context: Option<&str>,
+    ) -> OpenAiRequest {
         let openai_tools = tools
             .iter()
             .map(|tool| OpenAiRequestTool {
@@ -197,11 +202,17 @@ impl OpenAiClient {
             })
             .collect();
 
+        let dynamic_context = dynamic_context.filter(|context| !context.is_empty());
         let mut messages = Vec::new();
-        if !self.instructions.is_empty() {
-            messages.push(OpenAiRequestMessage::System {
-                content: self.instructions.clone(),
-            });
+        if !self.instructions.is_empty() || dynamic_context.is_some() {
+            let mut content = self.instructions.clone();
+            if let Some(dynamic_context) = dynamic_context {
+                if !content.is_empty() {
+                    content.push_str("\n\n");
+                }
+                content.push_str(dynamic_context);
+            }
+            messages.push(OpenAiRequestMessage::System { content });
         }
         messages.extend(to_wire(history));
 
@@ -223,10 +234,11 @@ impl OpenAiClient {
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
+        dynamic_context: Option<&str>,
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<ModelTurn, ProviderError> {
-        let body = self.build_request(messages, tools);
+        let body = self.build_request(messages, tools, dynamic_context);
 
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -816,7 +828,7 @@ mod tests {
         .unwrap();
 
         // Act
-        let request = client.build_request(&user_history(), &[]);
+        let request = client.build_request(&user_history(), &[], None);
 
         // Assert
         assert_eq!(
@@ -824,6 +836,67 @@ mod tests {
             [
                 OpenAiRequestMessage::System {
                     content: "Use the configured shell contract.".to_string(),
+                },
+                OpenAiRequestMessage::User {
+                    content: "What's in Cargo.toml?".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn request_appends_dynamic_context_to_session_instructions() {
+        let client = OpenAiClient::new(
+            "https://example.test/v1".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            1024,
+            "Use the configured shell contract.".to_string(),
+        )
+        .unwrap();
+
+        let request = client.build_request(
+            &user_history(),
+            &[],
+            Some("<current_checklist>\n[pending] Verify\n</current_checklist>"),
+        );
+
+        assert_eq!(
+            request.messages,
+            [
+                OpenAiRequestMessage::System {
+                    content: "Use the configured shell contract.\n\n<current_checklist>\n[pending] Verify\n</current_checklist>".to_string(),
+                },
+                OpenAiRequestMessage::User {
+                    content: "What's in Cargo.toml?".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dynamic_context_creates_a_system_message_without_session_instructions() {
+        let client = OpenAiClient::new(
+            "https://example.test/v1".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            1024,
+            String::new(),
+        )
+        .unwrap();
+
+        let request = client.build_request(
+            &user_history(),
+            &[],
+            Some("<current_checklist>\n[pending] Verify\n</current_checklist>"),
+        );
+
+        assert_eq!(
+            request.messages,
+            [
+                OpenAiRequestMessage::System {
+                    content: "<current_checklist>\n[pending] Verify\n</current_checklist>"
+                        .to_string(),
                 },
                 OpenAiRequestMessage::User {
                     content: "What's in Cargo.toml?".to_string(),
@@ -993,7 +1066,7 @@ mod tests {
 
         // Act
         test_client(&server)
-            .stream_message(&user_history(), &tools, &tx, &cancel)
+            .stream_message(&user_history(), &tools, None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1049,7 +1122,7 @@ mod tests {
 
         // Act
         test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1076,7 +1149,7 @@ mod tests {
 
         // Act
         let error = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap_err();
 
@@ -1112,7 +1185,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1173,7 +1246,7 @@ mod tests {
 
         // Act
         let turn = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1259,7 +1332,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1313,7 +1386,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1358,7 +1431,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1403,7 +1476,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1457,7 +1530,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1518,7 +1591,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1579,7 +1652,7 @@ mod tests {
             stop_reason,
             ..
         } = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap();
 
@@ -1624,7 +1697,7 @@ mod tests {
 
         // Act
         let error = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap_err();
 
@@ -1649,7 +1722,7 @@ mod tests {
 
         // Act
         let error = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap_err();
 
@@ -1684,7 +1757,7 @@ mod tests {
         // Act
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            test_client(&server).stream_message(&user_history(), &[], &tx, &cancel),
+            test_client(&server).stream_message(&user_history(), &[], None, &tx, &cancel),
         )
         .await
         .expect("stream_message should return promptly on cancellation, not hang");
@@ -1723,7 +1796,7 @@ mod tests {
 
         // Act
         let error = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap_err();
 
@@ -1771,7 +1844,7 @@ mod tests {
 
             // Act
             let error = test_client(&server)
-                .stream_message(&user_history(), &[], &tx, &cancel)
+                .stream_message(&user_history(), &[], None, &tx, &cancel)
                 .await
                 .unwrap_err();
 
@@ -1804,7 +1877,7 @@ mod tests {
 
         // Act
         let error = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await
             .unwrap_err();
 
@@ -1838,7 +1911,7 @@ mod tests {
 
         // Act
         let result = test_client(&server)
-            .stream_message(&user_history(), &[], &tx, &cancel)
+            .stream_message(&user_history(), &[], None, &tx, &cancel)
             .await;
 
         // Assert
@@ -1880,7 +1953,7 @@ mod tests {
             stop_reason,
             ..
         } = client
-            .stream_message(&messages, &[], &tx, &cancel)
+            .stream_message(&messages, &[], None, &tx, &cancel)
             .await
             .unwrap();
 

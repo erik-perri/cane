@@ -808,10 +808,11 @@ impl AgentSession {
             }
 
             let provider_round_id = self.journal.provider_round_started(turn_id).await?;
+            let dynamic_context = self.checklist.render_dynamic_context();
             let provider_started = Instant::now();
             let stream_result = tokio::select! {
                 _ = self.host_handle.events.closed() => return Err(AgentExit::Disconnected),
-                result = self.client.stream_message(history, self.tool_set.definitions(), self.host_handle.events.sender(), &self.host_handle.cancel) => {
+                result = self.client.stream_message(history, self.tool_set.definitions(), dynamic_context.as_deref(), self.host_handle.events.sender(), &self.host_handle.cancel) => {
                     result
                 }
             };
@@ -3961,6 +3962,13 @@ mod tests {
             crate::ChecklistStepStatus::Completed
         );
         assert_eq!(snapshots[1].steps()[1].text(), "Second");
+        assert_eq!(
+            nth_request_messages(&server, 1).await[0],
+            json!({
+                "role": "system",
+                "content": "<current_checklist>\n[completed] First\n[in_progress] Second\n</current_checklist>\n\nReassess this checklist against the latest user request, and replace or clear it if it is no longer appropriate."
+            })
+        );
     }
 
     #[tokio::test]
@@ -4054,6 +4062,14 @@ mod tests {
                 AgentEvent::TurnComplete { .. },
             ] if checklist.is_empty() && text == "New request"
         ));
+        assert_eq!(
+            nth_request_messages(&server, 1).await[0],
+            json!({
+                "role": "system",
+                "content": "<current_checklist>\n[completed] Done\n</current_checklist>"
+            })
+        );
+        assert_eq!(nth_request_messages(&server, 2).await[0]["role"], "user");
     }
 
     #[tokio::test]
@@ -4094,6 +4110,12 @@ mod tests {
                 AgentEvent::TurnComplete { .. },
             ] if text == "Still working"
         ));
+        let expected_context = json!({
+            "role": "system",
+            "content": "<current_checklist>\n[in_progress] Continue\n</current_checklist>\n\nReassess this checklist against the latest user request, and replace or clear it if it is no longer appropriate."
+        });
+        assert_eq!(nth_request_messages(&server, 1).await[0], expected_context);
+        assert_eq!(nth_request_messages(&server, 2).await[0], expected_context);
     }
 
     #[tokio::test]

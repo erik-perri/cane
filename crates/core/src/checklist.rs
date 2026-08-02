@@ -41,10 +41,6 @@ impl Checklist {
                 .all(|step| step.status == ChecklistStepStatus::Completed)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used when per-provider-round checklist context is integrated"
-    )]
     pub(crate) fn render_dynamic_context(&self) -> Option<String> {
         if self.is_empty() {
             return None;
