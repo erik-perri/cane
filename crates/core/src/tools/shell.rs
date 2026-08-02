@@ -248,10 +248,10 @@ impl PreparedInvocation for PreparedShellInvocation {
 
         let execution = shell_execution_completed(&result);
 
-        Ok(ToolExecutionOutput {
-            content: format_command_result(&result),
-            execution: Some(execution),
-        })
+        Ok(ToolExecutionOutput::completed(
+            format_command_result(&result),
+            execution,
+        ))
     }
 }
 
@@ -479,6 +479,37 @@ mod tests {
         // Assert
         assert!(without_shell.locate("shell").is_err());
         assert!(with_shell.locate("shell").is_ok());
+        assert_eq!(
+            without_shell
+                .definitions()
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "read_file",
+                "update_checklist",
+                "write_file",
+            ]
+        );
+        assert_eq!(
+            with_shell
+                .definitions()
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "read_file",
+                "shell",
+                "update_checklist",
+                "write_file",
+            ]
+        );
     }
 
     #[tokio::test]

@@ -11,8 +11,10 @@ mod grep;
 mod path_display;
 mod read_file;
 mod shell;
+mod update_checklist;
 mod write_file;
 
+use crate::Checklist;
 use crate::Workspace;
 use crate::command::{CommandEnvironmentConfig, CommandExecutor};
 use crate::journal::{CapabilityAuthorizationSource, ToolExecutionCompleted, ToolExecutionStarted};
@@ -24,6 +26,7 @@ use read_file::ReadFileTool;
 pub use shell::ShellIntegration;
 pub(crate) use shell::ShellIntegrations;
 use shell::ShellTool;
+pub(crate) use update_checklist::UpdateChecklistTool;
 use write_file::WriteFileTool;
 
 pub(crate) struct ToolSet {
@@ -58,8 +61,9 @@ pub(crate) enum ToolExecutionError {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ToolExecutionOutput {
-    pub(crate) content: String,
-    pub(crate) execution: Option<ToolExecutionCompleted>,
+    content: String,
+    execution: Option<ToolExecutionCompleted>,
+    checklist_update: Option<Checklist>,
 }
 
 impl ToolExecutionOutput {
@@ -67,7 +71,28 @@ impl ToolExecutionOutput {
         Self {
             content: content.into(),
             execution: None,
+            checklist_update: None,
         }
+    }
+
+    pub(crate) fn completed(content: impl Into<String>, execution: ToolExecutionCompleted) -> Self {
+        Self {
+            content: content.into(),
+            execution: Some(execution),
+            checklist_update: None,
+        }
+    }
+
+    pub(crate) fn checklist_update(checklist: Checklist) -> Self {
+        Self {
+            content: "Checklist updated.".to_string(),
+            execution: None,
+            checklist_update: Some(checklist),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (String, Option<ToolExecutionCompleted>, Option<Checklist>) {
+        (self.content, self.execution, self.checklist_update)
     }
 }
 
@@ -84,6 +109,7 @@ impl ToolSet {
             Box::new(GlobTool::new(Arc::clone(&workspace))),
             Box::new(GrepTool::new(Arc::clone(&workspace))),
             Box::new(ReadFileTool::new(Arc::clone(&workspace))),
+            Box::new(UpdateChecklistTool),
             Box::new(WriteFileTool::new(Arc::clone(&workspace))),
         ];
         if let Some(shell) = shell {
@@ -96,12 +122,7 @@ impl ToolSet {
             )));
         }
 
-        let tool_definitions = tools.iter().map(|tool| tool.definition()).collect();
-
-        Self {
-            tool_definitions,
-            tools,
-        }
+        Self::from_unsorted_tools(tools)
     }
 
     pub(crate) fn definitions(&self) -> &[ToolDefinition] {
@@ -109,16 +130,34 @@ impl ToolSet {
     }
 
     pub(crate) fn locate(&self, name: &str) -> Result<&dyn Tool, String> {
-        self.tools
+        self.tool_definitions
             .iter()
-            .map(Box::as_ref)
-            .find(|tool| tool.definition().name == name)
+            .zip(&self.tools)
+            .find(|(definition, _)| definition.name == name)
+            .map(|(_, tool)| tool.as_ref())
             .ok_or_else(|| format!("unknown tool: `{name}`"))
     }
 
     #[cfg(test)]
     pub(crate) fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        let tool_definitions = tools.iter().map(|tool| tool.definition()).collect();
+        Self::from_unsorted_tools(tools)
+    }
+
+    fn from_unsorted_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        let mut entries: Vec<_> = tools
+            .into_iter()
+            .map(|tool| (tool.definition(), tool))
+            .collect();
+        entries.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+
+        for pair in entries.windows(2) {
+            assert_ne!(
+                pair[0].0.name, pair[1].0.name,
+                "duplicate built-in tool name"
+            );
+        }
+
+        let (tool_definitions, tools) = entries.into_iter().unzip();
 
         Self {
             tool_definitions,
@@ -230,7 +269,7 @@ where
         let invocation = self.prepare(input).await?;
 
         match invocation.execute(CancellationToken::new()).await {
-            Ok(output) => Ok(output.content),
+            Ok(output) => Ok(output.into_parts().0),
             Err(ToolExecutionError::ToolError(error)) => Err(error),
             Err(ToolExecutionError::Cancelled) => {
                 unreachable!("a fresh test cancellation token cannot be cancelled")
@@ -242,7 +281,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+
+    struct NamedTestTool {
+        definition_calls: Arc<AtomicUsize>,
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTestTool {
+        fn definition(&self) -> ToolDefinition {
+            self.definition_calls.fetch_add(1, Ordering::SeqCst);
+            ToolDefinition {
+                name: self.name.to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn prepare(&self, _input: Value) -> Result<Box<dyn PreparedInvocation>, String> {
+            Err("test tool does not prepare invocations".to_string())
+        }
+    }
 
     #[test]
     fn locate_finds_a_registered_tool_by_name() {
@@ -270,6 +331,71 @@ mod tests {
 
         // Assert
         assert_eq!("unknown tool: `what_tool`", tool);
+    }
+
+    #[test]
+    fn built_in_definitions_are_alphabetically_sorted_and_include_update_checklist() {
+        let dir = tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().into()).unwrap();
+        let tool_set = ToolSet::new(Arc::new(workspace), None);
+
+        let names: Vec<_> = tool_set
+            .definitions()
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "read_file",
+                "update_checklist",
+                "write_file",
+            ]
+        );
+        assert!(tool_set.locate("update_checklist").is_ok());
+    }
+
+    #[test]
+    fn catalog_construction_builds_each_definition_once_and_keeps_tools_aligned() {
+        let definition_calls = Arc::new(AtomicUsize::new(0));
+        let tool_set = ToolSet::from_tools(vec![
+            Box::new(NamedTestTool {
+                definition_calls: Arc::clone(&definition_calls),
+                name: "zeta",
+            }),
+            Box::new(NamedTestTool {
+                definition_calls: Arc::clone(&definition_calls),
+                name: "alpha",
+            }),
+        ]);
+
+        assert_eq!(definition_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_set.definitions()[0].name, "alpha");
+        assert_eq!(tool_set.definitions()[1].name, "zeta");
+        assert!(tool_set.locate("alpha").is_ok());
+        assert!(tool_set.locate("zeta").is_ok());
+        assert_eq!(definition_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate built-in tool name")]
+    fn duplicate_tool_names_are_a_programming_error() {
+        let definition_calls = Arc::new(AtomicUsize::new(0));
+
+        let _ = ToolSet::from_tools(vec![
+            Box::new(NamedTestTool {
+                definition_calls: Arc::clone(&definition_calls),
+                name: "duplicate",
+            }),
+            Box::new(NamedTestTool {
+                definition_calls,
+                name: "duplicate",
+            }),
+        ]);
     }
 
     #[test]

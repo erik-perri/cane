@@ -1,5 +1,5 @@
-use crate::StopReason;
 use crate::command::CommandOutputChunk;
+use crate::{Checklist, StopReason};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use tokio::sync::mpsc;
@@ -14,6 +14,7 @@ pub enum AgentEvent {
         respond_to: oneshot::Sender<ApprovalDecision>,
         subject: ApprovalSubject,
     },
+    ChecklistUpdated(Checklist),
     CommandOutput(CommandOutputChunk),
     TextDelta(String),
     ToolStarted {

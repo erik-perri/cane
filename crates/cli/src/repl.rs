@@ -1,7 +1,7 @@
 use anyhow::Context;
 use cane_core::{
     AgentCommand, AgentEvent, AgentHandle, ApprovalDecision, ApprovalLifetime, ApprovalSubject,
-    CapabilityKind, ShutdownReason, TurnOutcome,
+    CapabilityKind, Checklist, ChecklistStepStatus, ShutdownReason, TurnOutcome,
 };
 use std::io::{BufRead, Write};
 use tokio::sync::mpsc;
@@ -100,25 +100,40 @@ async fn run_with_input(
     mut input: InputLines,
     mut output: impl Write,
 ) -> anyhow::Result<()> {
+    let mut displayed_checklist = Checklist::default();
+
     loop {
         write_prompt(&mut output)?;
-        let line = tokio::select! {
-            line = input.recv() => line?,
-            event = events.recv() => {
-                match event {
-                    None => break,
-                    Some(AgentEvent::Error(error)) => {
-                        writeln!(output, "\nerror: {error}")?;
-                        continue;
-                    }
-                    Some(AgentEvent::Warning(warning)) => {
-                        writeln!(output, "\nwarning: {warning}")?;
-                        continue;
-                    }
-                    Some(event) => {
-                        return Err(anyhow::anyhow!(
-                            "agent emitted an unexpected event while idle: {event:?}"
-                        ));
+        let line = loop {
+            tokio::select! {
+                line = input.recv() => break line?,
+                event = events.recv() => {
+                    match event {
+                        None => return Ok(()),
+                        Some(AgentEvent::Error(error)) => {
+                            writeln!(output, "\nerror: {error}")?;
+                            write_prompt(&mut output)?;
+                        }
+                        Some(AgentEvent::Warning(warning)) => {
+                            writeln!(output, "\nwarning: {warning}")?;
+                            write_prompt(&mut output)?;
+                        }
+                        Some(AgentEvent::ChecklistUpdated(checklist)) => {
+                            let rendered = !checklist.is_empty() || !displayed_checklist.is_empty();
+                            render_checklist_update(
+                                &mut output,
+                                &mut displayed_checklist,
+                                checklist,
+                            )?;
+                            if rendered {
+                                write_prompt(&mut output)?;
+                            }
+                        }
+                        Some(event) => {
+                            return Err(anyhow::anyhow!(
+                                "agent emitted an unexpected event while idle: {event:?}"
+                            ));
+                        }
                     }
                 }
             }
@@ -160,8 +175,14 @@ async fn run_with_input(
                 }
 
                 AgentEvent::ToolStarted { name, input } => {
-                    writeln!(output, "\n[tool: {name} {input}]")?;
-                    output.flush()?;
+                    if name != "update_checklist" {
+                        writeln!(output, "\n[tool: {name} {input}]")?;
+                        output.flush()?;
+                    }
+                }
+
+                AgentEvent::ChecklistUpdated(checklist) => {
+                    render_checklist_update(&mut output, &mut displayed_checklist, checklist)?
                 }
 
                 AgentEvent::ToolFinished {
@@ -242,6 +263,51 @@ async fn run_with_input(
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+fn render_checklist_update(
+    output: &mut impl Write,
+    displayed: &mut Checklist,
+    checklist: Checklist,
+) -> anyhow::Result<()> {
+    render_checklist_snapshot(
+        output,
+        displayed.is_empty(),
+        checklist
+            .steps()
+            .iter()
+            .map(|step| (step.text(), step.status())),
+    )?;
+
+    *displayed = checklist;
+    Ok(())
+}
+
+fn render_checklist_snapshot<'a>(
+    output: &mut impl Write,
+    displayed_is_empty: bool,
+    steps: impl IntoIterator<Item = (&'a str, ChecklistStepStatus)>,
+) -> anyhow::Result<()> {
+    let mut steps = steps.into_iter().peekable();
+    if steps.peek().is_none() {
+        if !displayed_is_empty {
+            writeln!(output, "\nChecklist cleared.")?;
+            output.flush()?;
+        }
+    } else {
+        writeln!(output, "\nChecklist:")?;
+        for (text, status) in steps {
+            let marker = match status {
+                ChecklistStepStatus::Completed => "[x]",
+                ChecklistStepStatus::InProgress => "[>]",
+                ChecklistStepStatus::Pending => "[ ]",
+            };
+            writeln!(output, "  {marker} {text}")?;
+        }
+        output.flush()?;
     }
 
     Ok(())
@@ -357,6 +423,93 @@ mod tests {
 
     fn tool_subject() -> ApprovalSubject {
         ApprovalSubject::tool_call("call_abc", "write_file")
+    }
+
+    #[test]
+    fn checklist_snapshots_render_portable_markers_and_clear_transitions() {
+        let mut output = Vec::new();
+
+        render_checklist_snapshot(
+            &mut output,
+            true,
+            [
+                ("Inspect", ChecklistStepStatus::Completed),
+                ("Implement", ChecklistStepStatus::InProgress),
+                ("Verify", ChecklistStepStatus::Pending),
+            ],
+        )
+        .unwrap();
+        render_checklist_snapshot(
+            &mut output,
+            false,
+            std::iter::empty::<(&str, ChecklistStepStatus)>(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\nChecklist:\n  [x] Inspect\n  [>] Implement\n  [ ] Verify\n\nChecklist cleared.\n"
+        );
+    }
+
+    #[test]
+    fn empty_startup_and_empty_to_empty_updates_print_nothing() {
+        let mut output = Vec::new();
+        let mut displayed = Checklist::default();
+
+        render_checklist_update(&mut output, &mut displayed, Checklist::default()).unwrap();
+        render_checklist_update(&mut output, &mut displayed, Checklist::default()).unwrap();
+
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_suppresses_successful_update_checklist_tool_noise() {
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (event_tx, events) = mpsc::channel(8);
+        let agent = TestAgent {
+            cancel: Default::default(),
+            commands,
+            events,
+        };
+        let frontend = tokio::spawn(async move {
+            command_rx.recv().await.unwrap();
+            event_tx
+                .send(AgentEvent::ToolStarted {
+                    name: "update_checklist".to_string(),
+                    input: Default::default(),
+                })
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::ToolFinished {
+                    name: "update_checklist".to_string(),
+                    output: "Checklist updated.".to_string(),
+                    is_error: false,
+                })
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::TextDelta("Continuing".to_string()))
+                .await
+                .unwrap();
+            event_tx
+                .send(AgentEvent::TurnComplete {
+                    outcome: TurnOutcome::Completed {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                })
+                .await
+                .unwrap();
+        });
+        let mut output = Vec::new();
+
+        run(agent, Cursor::new("start\n/quit\n"), &mut output)
+            .await
+            .unwrap();
+        frontend.await.unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "> Continuing\n> ");
     }
 
     async fn read_tool_decision(

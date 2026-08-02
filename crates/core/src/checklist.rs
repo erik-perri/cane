@@ -33,10 +33,6 @@ impl Checklist {
         self.steps.is_empty()
     }
 
-    #[allow(
-        dead_code,
-        reason = "used when completed-checklist retirement and rollback are integrated"
-    )]
     pub(crate) fn is_fully_completed(&self) -> bool {
         !self.steps.is_empty()
             && self
@@ -129,10 +125,6 @@ impl From<ChecklistStepStatusInput> for ChecklistStepStatus {
 /// This format is also persisted in successful historical tool calls, so the accepted shape is a
 /// compatibility contract. Do not change it incompatibly in place. If a second incompatible
 /// format becomes necessary, retain this parser for legacy input and add explicit dispatch.
-#[allow(
-    dead_code,
-    reason = "shared by the checklist tool and journal replay in the next integration slices"
-)]
 pub(crate) fn parse_checklist(input: &Value) -> Result<Checklist, String> {
     let input: ChecklistInput = serde_json::from_value(input.clone())
         .map_err(|error| format!("invalid checklist input: {error}"))?;

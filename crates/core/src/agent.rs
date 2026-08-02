@@ -1,4 +1,3 @@
-use crate::Workspace;
 use crate::approval::{
     ApprovalCheck, ApprovalGate, ApprovalOutcome, EffectiveAuthorization, request_approval,
 };
@@ -22,8 +21,9 @@ use crate::provider::{ModelTurn, OpenAiClient, ProviderConfig, ProviderError};
 use crate::session::SessionConfig;
 use crate::tools::{
     AuthorizedCapability, PreparedInvocation, ShellIntegration, ShellIntegrations, ShellToolConfig,
-    ToolExecutionError, ToolExecutionOutput, ToolSet,
+    ToolExecutionError, ToolSet,
 };
+use crate::{Checklist, Workspace};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_PROVIDER_ROUNDS_PER_TURN: usize = 24;
 
 pub struct AgentSession {
+    checklist: Checklist,
     client: OpenAiClient,
     configured_capability_consents: Vec<crate::NamedCapability>,
     host_handle: HostHandle,
@@ -427,6 +428,7 @@ pub async fn spawn_agent_with_shell(
         };
 
         let session = AgentSession {
+            checklist: Checklist::default(),
             client,
             configured_capability_consents,
             host_handle,
@@ -622,6 +624,11 @@ impl AgentSession {
         let mut approval_gate = ApprovalGate::new();
         approval_gate.seed_workspace_consents(self.configured_capability_consents.clone());
 
+        self.host_handle
+            .events
+            .emit(AgentEvent::ChecklistUpdated(self.checklist.clone()))
+            .await?;
+
         loop {
             let prompt = tokio::select! {
                 biased;
@@ -642,6 +649,7 @@ impl AgentSession {
                 }
             };
 
+            let checklist_at_turn_start = self.checklist.clone();
             let turn_start = history.len();
             let user_message = Message {
                 role: Role::User,
@@ -650,14 +658,33 @@ impl AgentSession {
             let turn_id = self.journal.start_turn(&user_message).await?;
             history.push(user_message);
 
+            if self.checklist.is_fully_completed() {
+                self.checklist = Checklist::default();
+                if self
+                    .host_handle
+                    .events
+                    .emit(AgentEvent::ChecklistUpdated(self.checklist.clone()))
+                    .await
+                    .is_err()
+                {
+                    let result = TurnResult::failed(
+                        "frontend_disconnected",
+                        "frontend disconnected during the active turn",
+                    );
+                    self.record_turn_outcome(turn_id, &result).await?;
+                    history.truncate(turn_start);
+                    return Err(AgentExit::Disconnected);
+                }
+            }
+
             match self
                 .run_turn(turn_id, &mut history, &mut approval_gate)
                 .await
             {
                 Ok(result) => {
                     let session_over = matches!(result, TurnResult::Cancelled);
-                    let needs_rollback =
-                        session_over || matches!(result, TurnResult::Failed { .. });
+                    let turn_failed = matches!(result, TurnResult::Failed { .. });
+                    let needs_rollback = session_over || turn_failed;
                     let outcome = result.outcome();
 
                     self.record_turn_outcome(turn_id, &result).await?;
@@ -666,6 +693,14 @@ impl AgentSession {
                         // Truncate the history on failure so we don't leave an incomplete
                         // turn in the next request.
                         history.truncate(turn_start);
+                    }
+
+                    if turn_failed && self.checklist != checklist_at_turn_start {
+                        self.checklist = checklist_at_turn_start;
+                        self.host_handle
+                            .events
+                            .emit(AgentEvent::ChecklistUpdated(self.checklist.clone()))
+                            .await?;
                     }
 
                     if session_over {
@@ -1048,6 +1083,7 @@ impl AgentSession {
         execute_invocation(
             &self.host_handle,
             &mut self.journal,
+            &mut self.checklist,
             AuthorizedToolCall {
                 authorization,
                 id,
@@ -1387,6 +1423,7 @@ fn tool_authorization(authorization: EffectiveAuthorization) -> ToolAuthorizatio
 async fn execute_invocation(
     host_handle: &HostHandle,
     journal: &mut RunJournal,
+    checklist: &mut Checklist,
     call: AuthorizedToolCall<'_>,
     invocation: Box<dyn PreparedInvocation>,
 ) -> Result<ToolResultData, AgentExit> {
@@ -1441,10 +1478,21 @@ async fn execute_invocation(
     let duration_ms = elapsed_ms(execution_started);
 
     let (content, is_error) = match execution_result {
-        Ok(ToolExecutionOutput { content, execution }) => {
+        Ok(output) => {
+            let (content, execution, checklist_update) = output.into_parts();
             journal
                 .tool_completed(duration_ms, execution, call.id, call.turn_id)
                 .await?;
+
+            if let Some(updated) = checklist_update
+                && *checklist != updated
+            {
+                *checklist = updated;
+                host_handle
+                    .events
+                    .emit(AgentEvent::ChecklistUpdated(checklist.clone()))
+                    .await?;
+            }
             (content, false)
         }
         Err(ToolExecutionError::ToolError(error)) => {
@@ -1486,7 +1534,7 @@ mod tests {
         ToolExecutionStarted, parse_journal, project_journal,
     };
     use crate::protocol::ApprovalRequirement;
-    use crate::tools::{Tool, ToolDefinition};
+    use crate::tools::{Tool, ToolDefinition, ToolExecutionOutput, UpdateChecklistTool};
     use crate::{ApprovalDecision, ApprovalLifetime};
     use async_trait::async_trait;
     use serde_json::{Value, json};
@@ -1870,6 +1918,7 @@ mod tests {
 
         (
             AgentSession {
+                checklist: Checklist::default(),
                 client,
                 configured_capability_consents: Vec::new(),
                 host_handle,
@@ -1884,9 +1933,17 @@ mod tests {
     async fn spawn_test_agent(server: &MockServer) -> (AgentHandle, TempDir) {
         let sessions = TempDir::new().unwrap();
         let config = SessionConfig::new("test-cane-version", "", sessions.path());
-        let handle = spawn_agent(test_provider(server), test_workspace(), config)
+        let mut handle = spawn_agent(test_provider(server), test_workspace(), config)
             .await
             .unwrap();
+        let startup = timeout(Duration::from_secs(1), handle.events.recv())
+            .await
+            .expect("agent did not emit its startup checklist")
+            .expect("agent stopped before emitting its startup checklist");
+        assert!(matches!(
+            startup,
+            AgentEvent::ChecklistUpdated(checklist) if checklist.is_empty()
+        ));
 
         (handle, sessions)
     }
@@ -1896,7 +1953,7 @@ mod tests {
         failure: InjectedFlushFailure,
         tools: Vec<Box<dyn Tool>>,
     ) -> FaultInjectedSession {
-        let (events_tx, events_rx) = mpsc::channel(64);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
         let (commands_tx, commands_rx) = mpsc::channel(64);
         let events = EventSink::new(events_tx);
         let (mut session, sessions) = test_session(
@@ -1914,6 +1971,15 @@ mod tests {
         let task = tokio::spawn(async move {
             run_and_report(session, &events).await;
         });
+
+        let startup = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("agent did not emit its startup checklist")
+            .expect("agent stopped before emitting its startup checklist");
+        assert!(matches!(
+            startup,
+            AgentEvent::ChecklistUpdated(checklist) if checklist.is_empty()
+        ));
 
         FaultInjectedSession {
             commands: commands_tx,
@@ -2042,7 +2108,14 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["edit_file", "glob", "grep", "read_file", "write_file"]
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "read_file",
+                "update_checklist",
+                "write_file"
+            ]
         );
         assert_eq!(
             started.shell_policy,
@@ -2208,8 +2281,9 @@ mod tests {
                 "glob",
                 "grep",
                 "read_file",
-                "write_file",
-                "shell"
+                "shell",
+                "update_checklist",
+                "write_file"
             ]
         );
         assert_eq!(
@@ -3681,6 +3755,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checklist_update_is_not_exposed_when_tool_completion_is_not_durable() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![tool_call_turn(&[(
+                "checklist-1",
+                "update_checklist",
+                json!({ "checklist": [{ "step": "Hidden", "status": "in_progress" }] }),
+            )])],
+        )
+        .await;
+        let FaultInjectedSession {
+            commands,
+            mut events,
+            journal_path,
+            sessions: _sessions,
+            task,
+        } = spawn_fault_injected_session(
+            &server,
+            InjectedFlushFailure::ToolCompleted,
+            vec![Box::new(UpdateChecklistTool)],
+        )
+        .await;
+
+        commands
+            .send(AgentCommand::UserInput("Update it".to_string()))
+            .await
+            .unwrap();
+        let observed_events = collect_until_events_close(&mut events).await;
+        task.await.unwrap();
+        let records = read_journal_records(&journal_path).await;
+
+        assert!(matches!(
+            observed_events.as_slice(),
+            [
+                AgentEvent::ToolStarted { name, .. },
+                AgentEvent::Error(error),
+            ] if name == "update_checklist"
+                && error.contains("session journal failed")
+                && error.contains("injected flush failure")
+        ));
+        assert!(
+            !observed_events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ChecklistUpdated(_)))
+        );
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::ToolCompleted(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn requests_advertise_all_registered_tools() {
         // Arrange
         let server = MockServer::start().await;
@@ -3703,8 +3830,349 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["edit_file", "glob", "grep", "read_file", "write_file"]
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "read_file",
+                "update_checklist",
+                "write_file"
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn startup_checklist_is_emitted_before_a_queued_command_is_processed() {
+        let server = MockServer::start().await;
+        mount_turns(&server, vec![text_turn("Ready")]).await;
+        let sessions = TempDir::new().unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path());
+        let mut handle = spawn_agent(test_provider(&server), test_workspace(), config)
+            .await
+            .unwrap();
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Begin".to_string()))
+            .await
+            .unwrap();
+        let startup = handle.events.recv().await.unwrap();
+        let turn = collect_turn(&mut handle.events).await;
+
+        assert!(matches!(
+            startup,
+            AgentEvent::ChecklistUpdated(checklist) if checklist.is_empty()
+        ));
+        assert!(matches!(
+            turn.as_slice(),
+            [
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete { .. }
+            ] if text == "Ready"
+        ));
+    }
+
+    #[tokio::test]
+    async fn changed_checklist_is_visible_before_tool_finished_and_identical_updates_are_quiet() {
+        let server = MockServer::start().await;
+        let update = json!({
+            "checklist": [{ "step": "Implement", "status": "in_progress" }]
+        });
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[
+                    ("checklist-1", "update_checklist", update.clone()),
+                    ("checklist-2", "update_checklist", update),
+                ]),
+                text_turn("Working"),
+            ],
+        )
+        .await;
+
+        let events = run_agent("Start", &server).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolStarted { name: first_start, .. },
+                AgentEvent::ChecklistUpdated(checklist),
+                AgentEvent::ToolFinished { name: first_finish, is_error: false, .. },
+                AgentEvent::ToolStarted { name: second_start, .. },
+                AgentEvent::ToolFinished { name: second_finish, is_error: false, .. },
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete { .. },
+            ] if first_start == "update_checklist"
+                && first_finish == "update_checklist"
+                && second_start == "update_checklist"
+                && second_finish == "update_checklist"
+                && checklist.steps().len() == 1
+                && checklist.steps()[0].text() == "Implement"
+                && text == "Working"
+        ));
+    }
+
+    #[tokio::test]
+    async fn multiple_changed_checklists_are_emitted_in_assistant_call_order() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[
+                    (
+                        "checklist-1",
+                        "update_checklist",
+                        json!({ "checklist": [{ "step": "First", "status": "in_progress" }] }),
+                    ),
+                    (
+                        "checklist-2",
+                        "update_checklist",
+                        json!({
+                            "checklist": [
+                                { "step": "First", "status": "completed" },
+                                { "step": "Second", "status": "in_progress" }
+                            ]
+                        }),
+                    ),
+                ]),
+                text_turn("Updated twice"),
+            ],
+        )
+        .await;
+
+        let events = run_agent("Start", &server).await;
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ChecklistUpdated(checklist) => Some(checklist),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].steps()[0].text(), "First");
+        assert_eq!(
+            snapshots[0].steps()[0].status(),
+            crate::ChecklistStepStatus::InProgress
+        );
+        assert_eq!(snapshots[1].steps().len(), 2);
+        assert_eq!(
+            snapshots[1].steps()[0].status(),
+            crate::ChecklistStepStatus::Completed
+        );
+        assert_eq!(snapshots[1].steps()[1].text(), "Second");
+    }
+
+    #[tokio::test]
+    async fn invalid_update_preserves_the_current_checklist_without_an_event() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[
+                    (
+                        "checklist-good",
+                        "update_checklist",
+                        json!({ "checklist": [{ "step": "Current", "status": "in_progress" }] }),
+                    ),
+                    (
+                        "checklist-bad",
+                        "update_checklist",
+                        json!({
+                            "checklist": [
+                                { "step": "Later", "status": "pending" },
+                                { "step": "Earlier", "status": "completed" }
+                            ]
+                        }),
+                    ),
+                ]),
+                text_turn("Corrected"),
+            ],
+        )
+        .await;
+
+        let events = run_agent("Start", &server).await;
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ChecklistUpdated(checklist) => Some(checklist),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].steps()[0].text(), "Current");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolRejected { name, error }
+                if name == "update_checklist"
+                    && error.contains("completed after unfinished steps")
+        )));
+    }
+
+    #[tokio::test]
+    async fn completed_checklist_is_retired_at_the_start_of_the_next_turn() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "checklist-1",
+                    "update_checklist",
+                    json!({ "checklist": [{ "step": "Done", "status": "completed" }] }),
+                )]),
+                text_turn("Finished"),
+                text_turn("New request"),
+            ],
+        )
+        .await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("First".to_string()))
+            .await
+            .unwrap();
+        let first_turn = collect_turn(&mut handle.events).await;
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Second".to_string()))
+            .await
+            .unwrap();
+        let second_turn = collect_turn(&mut handle.events).await;
+
+        assert!(first_turn.iter().any(|event| matches!(
+            event,
+            AgentEvent::ChecklistUpdated(checklist)
+                if checklist.steps().len() == 1 && checklist.steps()[0].text() == "Done"
+        )));
+        assert!(matches!(
+            second_turn.as_slice(),
+            [
+                AgentEvent::ChecklistUpdated(checklist),
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete { .. },
+            ] if checklist.is_empty() && text == "New request"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unfinished_checklist_survives_a_later_turn_without_a_redundant_event() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "checklist-1",
+                    "update_checklist",
+                    json!({ "checklist": [{ "step": "Continue", "status": "in_progress" }] }),
+                )]),
+                text_turn("Paused"),
+                text_turn("Still working"),
+            ],
+        )
+        .await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("First".to_string()))
+            .await
+            .unwrap();
+        let _ = collect_turn(&mut handle.events).await;
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Second".to_string()))
+            .await
+            .unwrap();
+        let second_turn = collect_turn(&mut handle.events).await;
+
+        assert!(matches!(
+            second_turn.as_slice(),
+            [
+                AgentEvent::TextDelta(text),
+                AgentEvent::TurnComplete { .. },
+            ] if text == "Still working"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_turn_restores_its_starting_checklist_before_turn_complete() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "checklist-1",
+                    "update_checklist",
+                    json!({ "checklist": [{ "step": "Temporary", "status": "in_progress" }] }),
+                )]),
+                ResponseTemplate::new(401).set_body_string("bad key"),
+            ],
+        )
+        .await;
+
+        let events = run_agent("Fail after updating", &server).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolStarted { .. },
+                AgentEvent::ChecklistUpdated(changed),
+                AgentEvent::ToolFinished { .. },
+                AgentEvent::Error(error),
+                AgentEvent::ChecklistUpdated(restored),
+                AgentEvent::TurnComplete { outcome: TurnOutcome::Failed },
+            ] if changed.steps()[0].text() == "Temporary"
+                && error == "api error (401): bad key"
+                && restored.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_turn_after_completed_cleanup_restores_the_completed_checklist() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "checklist-1",
+                    "update_checklist",
+                    json!({ "checklist": [{ "step": "Done", "status": "completed" }] }),
+                )]),
+                text_turn("Finished"),
+                ResponseTemplate::new(401).set_body_string("bad key"),
+            ],
+        )
+        .await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("First".to_string()))
+            .await
+            .unwrap();
+        let _ = collect_turn(&mut handle.events).await;
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Second".to_string()))
+            .await
+            .unwrap();
+        let failed_turn = collect_turn(&mut handle.events).await;
+
+        assert!(matches!(
+            failed_turn.as_slice(),
+            [
+                AgentEvent::ChecklistUpdated(cleared),
+                AgentEvent::Error(error),
+                AgentEvent::ChecklistUpdated(restored),
+                AgentEvent::TurnComplete { outcome: TurnOutcome::Failed },
+            ] if cleared.is_empty()
+                && error == "api error (401): bad key"
+                && restored.steps().len() == 1
+                && restored.steps()[0].text() == "Done"
+                && restored.steps()[0].status() == crate::ChecklistStepStatus::Completed
+        ));
     }
 
     #[tokio::test]
@@ -3800,10 +4268,10 @@ mod tests {
 
         // Assert
         assert_eq!(session_result, Ok(()));
-        assert!(
-            events.is_empty(),
-            "idle session emitted an unexpected turn outcome: {events:?}"
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ChecklistUpdated(checklist)] if checklist.is_empty()
+        ));
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "idle session made a provider request"
@@ -4646,6 +5114,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 AgentEvent::ApprovalRequest { .. } => "approval",
+                AgentEvent::ChecklistUpdated(_) => "checklist",
                 AgentEvent::CommandOutput(_) => "command_output",
                 AgentEvent::ToolStarted { .. } => "started",
                 AgentEvent::ToolFinished { .. } => "finished",
@@ -5240,9 +5709,9 @@ mod tests {
             self: Box<Self>,
             _cancel: CancellationToken,
         ) -> Result<ToolExecutionOutput, ToolExecutionError> {
-            Ok(ToolExecutionOutput {
-                content: "process exited with code 0\noutput (0 bytes, complete):\n".to_string(),
-                execution: Some(crate::journal::ToolExecutionCompleted::Shell {
+            Ok(ToolExecutionOutput::completed(
+                "process exited with code 0\noutput (0 bytes, complete):\n",
+                crate::journal::ToolExecutionCompleted::Shell {
                     stderr: crate::journal::CapturedStream {
                         bytes: 0,
                         truncated: false,
@@ -5252,8 +5721,8 @@ mod tests {
                         truncated: false,
                     },
                     termination: crate::journal::CommandTermination::Exited { code: 0 },
-                }),
-            })
+                },
+            ))
         }
     }
 
@@ -5339,6 +5808,15 @@ mod tests {
 
         let session_task = tokio::spawn(session.run());
 
+        let startup_event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("startup checklist was not emitted")
+            .expect("event channel closed unexpectedly");
+        assert!(matches!(
+            startup_event,
+            AgentEvent::ChecklistUpdated(checklist) if checklist.is_empty()
+        ));
+
         commands_tx
             .send(AgentCommand::UserInput("Run the test tool".to_string()))
             .await
@@ -5394,11 +5872,13 @@ mod tests {
         let mock_error = "Mock error".to_string();
         let mock_id = "call-1".to_string();
         let (mut journal, _sessions) = test_run_journal().await;
+        let mut checklist = Checklist::default();
 
         // Act
         let result = execute_invocation(
             &host_handle,
             &mut journal,
+            &mut checklist,
             AuthorizedToolCall {
                 authorization: EffectiveAuthorization::NotRequired,
                 id: mock_id.as_str(),
@@ -5434,6 +5914,7 @@ mod tests {
             events: EventSink::new(events_tx),
         };
         let (mut journal, _sessions) = test_run_journal().await;
+        let mut checklist = Checklist::default();
         let journal_path = journal.path().to_path_buf();
         let turn_id = TurnId::generate();
 
@@ -5441,6 +5922,7 @@ mod tests {
         let result = execute_invocation(
             &host_handle,
             &mut journal,
+            &mut checklist,
             AuthorizedToolCall {
                 authorization: EffectiveAuthorization::NotRequired,
                 id: "shell-1",
@@ -5503,11 +5985,13 @@ mod tests {
             events: event_sink,
         };
         let (mut journal, _sessions) = test_run_journal().await;
+        let mut checklist = Checklist::default();
 
         // Act
         let result = execute_invocation(
             &host_handle,
             &mut journal,
+            &mut checklist,
             AuthorizedToolCall {
                 authorization: EffectiveAuthorization::NotRequired,
                 id: "call-1",
@@ -5557,11 +6041,13 @@ mod tests {
         let invocation_started = Arc::clone(&started);
         let (mut journal, _sessions) = test_run_journal().await;
         let turn_id = TurnId::generate();
+        let mut checklist = Checklist::default();
 
         let execution = tokio::spawn(async move {
             execute_invocation(
                 &host_handle,
                 &mut journal,
+                &mut checklist,
                 AuthorizedToolCall {
                     authorization: EffectiveAuthorization::NotRequired,
                     id: "call-1",
@@ -5625,11 +6111,13 @@ mod tests {
         let invocation_started = Arc::clone(&started);
         let (mut journal, _sessions) = test_run_journal().await;
         let turn_id = TurnId::generate();
+        let mut checklist = Checklist::default();
 
         let execution = tokio::spawn(async move {
             execute_invocation(
                 &host_handle,
                 &mut journal,
+                &mut checklist,
                 AuthorizedToolCall {
                     authorization: EffectiveAuthorization::NotRequired,
                     id: "call-1",
