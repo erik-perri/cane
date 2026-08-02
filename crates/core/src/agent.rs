@@ -2036,6 +2036,30 @@ mod tests {
         .expect("agent turn never completed")
     }
 
+    async fn collect_through_checklist_tool_finished(
+        events_rx: &mut mpsc::Receiver<AgentEvent>,
+    ) -> Vec<AgentEvent> {
+        timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            loop {
+                let event = events_rx
+                    .recv()
+                    .await
+                    .expect("event channel closed before the checklist tool finished");
+                let finished = matches!(
+                    &event,
+                    AgentEvent::ToolFinished { name, .. } if name == "update_checklist"
+                );
+                events.push(event);
+                if finished {
+                    return events;
+                }
+            }
+        })
+        .await
+        .expect("checklist tool did not finish")
+    }
+
     async fn finish_and_project(handle: AgentHandle) -> (Vec<JournalRecord>, SessionProjection) {
         let journal_path = handle.journal_path().to_path_buf();
         handle
@@ -4194,6 +4218,139 @@ mod tests {
                 && restored.steps().len() == 1
                 && restored.steps()[0].text() == "Done"
                 && restored.steps()[0].status() == crate::ChecklistStepStatus::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_a_live_checklist_update_does_not_commit_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(tool_call_turn(&[(
+                "checklist-1",
+                "update_checklist",
+                json!({ "checklist": [{ "step": "Temporary", "status": "in_progress" }] }),
+            )]))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let delayed_request = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(text_turn("too late").set_delay(Duration::from_secs(30)))
+            .up_to_n_times(1)
+            .with_priority(2)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        let journal_path = handle.journal_path().to_path_buf();
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Start temporary work".to_string()))
+            .await
+            .unwrap();
+        let update_events = collect_through_checklist_tool_finished(&mut handle.events).await;
+        timeout(
+            Duration::from_secs(2),
+            delayed_request.wait_until_satisfied(),
+        )
+        .await
+        .expect("agent did not start its next provider request promptly");
+        handle.cancel.cancel();
+        let remaining_events = collect_until_events_close(&mut handle.events).await;
+        let records = read_journal_records(&journal_path).await;
+        let projection = project_journal(&records).unwrap();
+
+        assert!(matches!(
+            update_events.as_slice(),
+            [
+                AgentEvent::ToolStarted { name: started, .. },
+                AgentEvent::ChecklistUpdated(checklist),
+                AgentEvent::ToolFinished { name: finished, .. },
+            ] if started == "update_checklist"
+                && finished == "update_checklist"
+                && checklist.steps()[0].text() == "Temporary"
+        ));
+        assert!(matches!(
+            remaining_events.as_slice(),
+            [
+                AgentEvent::Error(error),
+                AgentEvent::TurnComplete { outcome: TurnOutcome::Cancelled },
+            ] if error == "cancelled"
+        ));
+        assert!(projection.messages.is_empty());
+        assert!(projection.checklist.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnection_after_a_live_checklist_update_does_not_commit_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(tool_call_turn(&[(
+                "checklist-1",
+                "update_checklist",
+                json!({ "checklist": [{ "step": "Temporary", "status": "in_progress" }] }),
+            )]))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let delayed_request = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(text_turn("too late").set_delay(Duration::from_secs(30)))
+            .up_to_n_times(1)
+            .with_priority(2)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let (mut handle, _sessions) = spawn_test_agent(&server).await;
+        let journal_path = handle.journal_path().to_path_buf();
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Start temporary work".to_string()))
+            .await
+            .unwrap();
+        let update_events = collect_through_checklist_tool_finished(&mut handle.events).await;
+        timeout(
+            Duration::from_secs(2),
+            delayed_request.wait_until_satisfied(),
+        )
+        .await
+        .expect("agent did not start its next provider request promptly");
+        let AgentHandle {
+            commands, events, ..
+        } = handle;
+        drop(events);
+        timeout(Duration::from_secs(5), commands.closed())
+            .await
+            .expect("agent remained alive after its frontend disconnected");
+        let records = read_journal_records(&journal_path).await;
+        let projection = project_journal(&records).unwrap();
+
+        assert!(matches!(
+            update_events.as_slice(),
+            [
+                AgentEvent::ToolStarted { name: started, .. },
+                AgentEvent::ChecklistUpdated(checklist),
+                AgentEvent::ToolFinished { name: finished, .. },
+            ] if started == "update_checklist"
+                && finished == "update_checklist"
+                && checklist.steps()[0].text() == "Temporary"
+        ));
+        assert!(projection.messages.is_empty());
+        assert!(projection.checklist.is_empty());
+        assert!(matches!(
+            records.last().map(|record| &record.entry),
+            Some(JournalEntry::RunEnded(crate::journal::RunEnded {
+                reason: RunEndReason::FrontendDisconnected,
+                ..
+            }))
         ));
     }
 
