@@ -1748,6 +1748,36 @@ mod tests {
     }
 
     #[test]
+    fn successful_update_in_a_paused_committed_turn_is_projected() {
+        let call = checklist_call(
+            "checklist-paused",
+            serde_json::json!({
+                "checklist": [{ "step": "Resume later", "status": "in_progress" }]
+            }),
+        );
+        let turn = historical_tool_turn(turn_id(), round_id(), &[call], false);
+        assert!(matches!(
+            turn.last(),
+            Some(JournalEntry::TurnCommitted(TurnCommitted {
+                outcome: TurnCommitOutcome::Paused { .. },
+                ..
+            }))
+        ));
+        let mut entries = vec![session_started(), run_started()];
+        entries.extend(turn);
+        entries.push(run_ended());
+
+        let projection = project_journal(&records(entries)).unwrap();
+
+        assert_eq!(projection.checklist.steps().len(), 1);
+        assert_eq!(projection.checklist.steps()[0].text(), "Resume later");
+        assert_eq!(
+            projection.checklist.steps()[0].status(),
+            crate::ChecklistStepStatus::InProgress
+        );
+    }
+
+    #[test]
     fn successful_updates_follow_assistant_call_order_not_result_order() {
         let calls = [
             checklist_call(
