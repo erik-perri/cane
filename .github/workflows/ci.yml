@@ -48,34 +48,6 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  coverage:
-    name: coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-07
-        with:
-          toolchain: stable
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2.85.4
-        with:
-          tool: cargo-llvm-cov
-          fallback: none
-      - name: Generate coverage
-        run: |
-          cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-features --no-report
-          cargo llvm-cov report --color never > coverage.txt
-      - name: Add coverage to job summary
-        run: |
-          {
-            echo "## Workspace coverage"
-            echo
-            echo '```text'
-            awk 'NR <= 2 || /^TOTAL/' coverage.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
   test:
     name: test (${{ matrix.os }})
     strategy:
@@ -89,7 +61,59 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo test --workspace
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2.85.4
+        with:
+          tool: cargo-llvm-cov
+          fallback: none
+      - name: Test and collect coverage
+        run: cargo llvm-cov --workspace --all-features --remap-path-prefix --lcov --output-path coverage.info
+      - name: Upload coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage.info
+
+  coverage:
+    name: coverage
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download coverage from every OS
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-*
+          path: coverage-data
+      - name: Install LCOV
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lcov
+      - name: Merge coverage
+        run: |
+          tracefiles=(coverage-data/*/coverage.info)
+          arguments=()
+          for tracefile in "${tracefiles[@]}"; do
+            arguments+=(--add-tracefile "$tracefile")
+          done
+          lcov "${arguments[@]}" --output-file coverage.info
+          lcov --summary coverage.info 2>&1 | tee coverage-summary.txt
+      - name: Generate HTML report
+        run: genhtml coverage.info --output-directory coverage-html
+      - name: Add coverage to job summary
+        run: |
+          {
+            echo "## Workspace coverage (all operating systems)"
+            echo
+            echo '```text'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload full HTML report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: full-coverage-report-html
+          path: coverage-html/
 
   linux-sandbox:
     name: Linux sandbox enforcement
