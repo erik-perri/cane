@@ -98,9 +98,15 @@ jobs:
             arguments+=(--add-tracefile "$tracefile")
           done
           lcov "${arguments[@]}" --output-file coverage.info
-          lcov --summary coverage.info 2>&1 | tee coverage-summary.txt
+          lcov --summary coverage.info 2>&1 \
+            | awk '/^Summary coverage rate:$/ || /^[[:space:]]*lines/' \
+            | tee coverage-summary.txt
       - name: Generate HTML report
-        run: genhtml coverage.info --output-directory coverage-html
+        run: >
+          genhtml coverage.info
+          --no-function-coverage
+          --no-branch-coverage
+          --output-directory coverage-html
       - name: Add coverage to job summary
         run: |
           {
