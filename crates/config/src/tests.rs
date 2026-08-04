@@ -143,6 +143,26 @@ impl DocumentCodec for LimitedCodec {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct UnsupportedCurrentCodec;
+
+impl DocumentCodec for UnsupportedCurrentCodec {
+    type Current = CurrentDocument;
+    type Error = String;
+
+    fn current_version(&self) -> u64 {
+        2
+    }
+
+    fn supports_version(&self, version: u64) -> bool {
+        version == CURRENT_VERSION
+    }
+
+    fn decode(&self, _version: u64, _document: Value) -> Result<Self::Current, Self::Error> {
+        panic!("an unsupported current version must be rejected before decoding")
+    }
+}
+
 #[derive(Debug, JsonSchema)]
 #[serde(untagged)]
 enum SupportedSchema {
@@ -492,6 +512,27 @@ fn schema_refresh_writes_only_when_content_differs() {
 }
 
 #[test]
+fn schema_refresh_reports_an_unreadable_existing_schema() {
+    // Arrange
+    let root = tempdir().unwrap();
+    let config = fixture(&root);
+    fs::create_dir_all(config.schema_path()).unwrap();
+
+    // Act
+    let result = config.refresh_schema::<SupportedSchema>();
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(PersistenceError::Io {
+            operation: "read schema",
+            path,
+            ..
+        }) if path == config.schema_path()
+    ));
+}
+
+#[test]
 fn concurrent_updates_reload_after_taking_the_writer_lock() {
     // Arrange
     let root = tempdir().unwrap();
@@ -803,6 +844,28 @@ fn update_rejects_a_model_that_does_not_emit_the_current_version() {
 }
 
 #[test]
+fn update_rejects_a_codec_that_does_not_support_its_current_version() {
+    // Arrange
+    let root = tempdir().unwrap();
+    let config = fixture(&root);
+
+    // Act
+    let result = config.update(&UnsupportedCurrentCodec, |_| {
+        Ok::<_, Infallible>(CurrentDocument {
+            schema_version: 2,
+            values: Vec::new(),
+        })
+    });
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(UpdateError::UnsupportedCurrentVersion { version: 2 })
+    ));
+    assert!(!config.document_path().exists());
+}
+
+#[test]
 fn update_rejects_a_current_document_that_the_codec_cannot_load() {
     // Arrange
     let root = tempdir().unwrap();
@@ -874,6 +937,55 @@ fn archiving_refuses_valid_and_unsupported_documents() {
         assert!(config.document_path().exists());
         assert!(!archive.exists());
     }
+}
+
+#[test]
+fn archiving_rejects_a_nonadjacent_destination_without_moving_the_document() {
+    // Arrange
+    let root = tempdir().unwrap();
+    let config = fixture(&root);
+    let bytes = b"{ invalid";
+    write(config.document_path(), bytes);
+    let archive = root.path().join("elsewhere/invalid.json");
+
+    // Act
+    let result = config.archive_invalid(&TestCodec, &archive);
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(ArchiveError::Persistence(
+            PersistenceError::ArchiveNotAdjacent { .. }
+        ))
+    ));
+    assert_eq!(fs::read(config.document_path()).unwrap(), bytes);
+    assert!(!archive.exists());
+}
+
+#[test]
+fn archiving_rejects_an_existing_destination_without_moving_the_document() {
+    // Arrange
+    let root = tempdir().unwrap();
+    let config = fixture(&root);
+    let bytes = b"{ invalid";
+    write(config.document_path(), bytes);
+    let archive = config.document_path().with_extension("invalid.json");
+    write(&archive, b"keep me");
+
+    // Act
+    let result = config.archive_invalid(&TestCodec, &archive);
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(ArchiveError::Persistence(PersistenceError::Io {
+            operation: "create archive",
+            path,
+            ..
+        })) if path == archive
+    ));
+    assert_eq!(fs::read(config.document_path()).unwrap(), bytes);
+    assert_eq!(fs::read(archive).unwrap(), b"keep me");
 }
 
 #[cfg(unix)]
