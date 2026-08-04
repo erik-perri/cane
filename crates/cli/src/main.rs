@@ -56,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| DEFAULT_MAX_TOKENS.to_string())
         .parse()
         .context("CANE_MAX_TOKENS must be an integer")?;
+    let prompt_caching =
+        parse_prompt_caching(std::env::var("CANE_PROMPT_CACHING").ok().as_deref(), &model)?;
     let path = std::env::current_dir()?;
 
     let provider = cane_core::ProviderConfig {
@@ -63,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         api_key,
         max_tokens,
         model,
+        prompt_caching,
     };
     let workspace = cane_core::Workspace::new(path)?;
     let cane_home = resolve_cane_home(
@@ -101,6 +104,17 @@ async fn main() -> anyhow::Result<()> {
     println!();
 
     Ok(())
+}
+
+fn parse_prompt_caching(value: Option<&str>, model: &str) -> anyhow::Result<bool> {
+    match value {
+        None => Ok(model == "gpt-5.6" || model.starts_with("gpt-5.6-")),
+        Some("0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(value) => Err(anyhow::anyhow!(
+            "CANE_PROMPT_CACHING must be 'true', 'false', '1', or '0', not '{value}'"
+        )),
+    }
 }
 
 fn parse_cli_command(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<CliCommand> {
@@ -402,6 +416,20 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::fs;
+
+    #[test]
+    fn prompt_caching_defaults_from_the_model_and_accepts_explicit_overrides() {
+        assert!(parse_prompt_caching(None, "gpt-5.6").unwrap());
+        assert!(parse_prompt_caching(None, "gpt-5.6-sol").unwrap());
+        assert!(!parse_prompt_caching(None, "gpt-5.5").unwrap());
+        assert!(!parse_prompt_caching(None, "newly-supported-model").unwrap());
+
+        assert!(!parse_prompt_caching(Some("false"), "gpt-5.6-sol").unwrap());
+        assert!(!parse_prompt_caching(Some("0"), "gpt-5.6-sol").unwrap());
+        assert!(parse_prompt_caching(Some("true"), "newly-supported-model").unwrap());
+        assert!(parse_prompt_caching(Some("1"), "newly-supported-model").unwrap());
+        assert!(parse_prompt_caching(Some("yes"), "test-model").is_err());
+    }
 
     #[test]
     fn cane_home_overrides_the_platform_home_directory() {

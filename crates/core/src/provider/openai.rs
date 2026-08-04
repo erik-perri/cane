@@ -17,6 +17,8 @@ struct OpenAiRequest {
     max_tokens: u32,
     messages: Vec<OpenAiRequestMessage>,
     model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
     stream: bool,
     stream_options: OpenAiStreamOptions,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -45,6 +47,9 @@ struct OpenAiRequestFunction {
 #[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 enum OpenAiRequestMessage {
+    Developer {
+        content: OpenAiDeveloperContent,
+    },
     System {
         content: String,
     },
@@ -60,6 +65,27 @@ enum OpenAiRequestMessage {
         content: String,
         tool_call_id: String,
     },
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+enum OpenAiDeveloperContent {
+    Text(String),
+    Parts(Vec<OpenAiRequestTextPart>),
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct OpenAiRequestTextPart {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_breakpoint: Option<OpenAiPromptCacheBreakpoint>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct OpenAiPromptCacheBreakpoint {
+    mode: String,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -83,6 +109,7 @@ pub(crate) struct OpenAiClient {
     instructions: String,
     max_tokens: u32,
     model: String,
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +177,8 @@ impl OpenAiClient {
         model: String,
         max_tokens: u32,
         instructions: String,
+        prompt_caching: bool,
+        prompt_cache_key: String,
     ) -> Result<Self, ProviderError> {
         let endpoint = endpoint_from_base_url(base_url)?;
         let http = reqwest::Client::builder()
@@ -163,6 +192,8 @@ impl OpenAiClient {
             http,
             instructions,
             max_tokens,
+            prompt_cache_key: (prompt_caching && !prompt_cache_key.is_empty())
+                .then_some(prompt_cache_key),
             model,
         })
     }
@@ -204,7 +235,19 @@ impl OpenAiClient {
 
         let dynamic_context = dynamic_context.filter(|context| !context.is_empty());
         let mut messages = Vec::new();
-        if !self.instructions.is_empty() || dynamic_context.is_some() {
+        if self.prompt_cache_key.is_some() {
+            if !self.instructions.is_empty() {
+                messages.push(OpenAiRequestMessage::Developer {
+                    content: OpenAiDeveloperContent::Parts(vec![OpenAiRequestTextPart {
+                        kind: "text".to_string(),
+                        text: self.instructions.clone(),
+                        prompt_cache_breakpoint: Some(OpenAiPromptCacheBreakpoint {
+                            mode: "explicit".to_string(),
+                        }),
+                    }]),
+                });
+            }
+        } else if !self.instructions.is_empty() || dynamic_context.is_some() {
             let mut content = self.instructions.clone();
             if let Some(dynamic_context) = dynamic_context {
                 if !content.is_empty() {
@@ -215,11 +258,19 @@ impl OpenAiClient {
             messages.push(OpenAiRequestMessage::System { content });
         }
         messages.extend(to_wire(history));
+        if self.prompt_cache_key.is_some()
+            && let Some(dynamic_context) = dynamic_context
+        {
+            messages.push(OpenAiRequestMessage::Developer {
+                content: OpenAiDeveloperContent::Text(dynamic_context.to_string()),
+            });
+        }
 
         OpenAiRequest {
             max_tokens: self.max_tokens,
             messages,
             model: self.model.clone(),
+            prompt_cache_key: self.prompt_cache_key.clone(),
             stream: true,
             stream_options: OpenAiStreamOptions {
                 include_usage: true,
@@ -799,6 +850,8 @@ mod tests {
             "test-model".to_string(),
             1024,
             String::new(),
+            false,
+            String::new(),
         )
         .unwrap();
 
@@ -824,6 +877,8 @@ mod tests {
             "test-model".to_string(),
             1024,
             "Use the configured shell contract.".to_string(),
+            false,
+            String::new(),
         )
         .unwrap();
 
@@ -852,6 +907,8 @@ mod tests {
             "test-model".to_string(),
             1024,
             "Use the configured shell contract.".to_string(),
+            false,
+            String::new(),
         )
         .unwrap();
 
@@ -875,12 +932,83 @@ mod tests {
     }
 
     #[test]
+    fn enabled_prompt_caching_marks_stable_instructions_and_appends_dynamic_context() {
+        let client = OpenAiClient::new(
+            "https://api.openai.com/v1".to_string(),
+            "test-key".to_string(),
+            "newly-supported-model".to_string(),
+            1024,
+            "Use the configured shell contract.".to_string(),
+            true,
+            "cane:sess_123".to_string(),
+        )
+        .unwrap();
+
+        let request = client.build_request(
+            &user_history(),
+            &[],
+            Some("<current_checklist>\n[pending] Verify\n</current_checklist>"),
+        );
+        let wire = serde_json::to_value(request).unwrap();
+
+        assert_eq!(wire["prompt_cache_key"], "cane:sess_123");
+        assert_eq!(
+            wire["messages"],
+            json!([
+                {
+                    "role": "developer",
+                    "content": [{
+                        "type": "text",
+                        "text": "Use the configured shell contract.",
+                        "prompt_cache_breakpoint": { "mode": "explicit" }
+                    }]
+                },
+                { "role": "user", "content": "What's in Cargo.toml?" },
+                {
+                    "role": "developer",
+                    "content": "<current_checklist>\n[pending] Verify\n</current_checklist>"
+                }
+            ])
+        );
+        assert!(wire.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn disabled_prompt_caching_emits_no_proprietary_fields() {
+        let client = OpenAiClient::new(
+            "https://api.openai.com/v1".to_string(),
+            "test-key".to_string(),
+            "gpt-5.6-sol".to_string(),
+            1024,
+            "Stable".to_string(),
+            false,
+            "cane:sess_123".to_string(),
+        )
+        .unwrap();
+
+        let wire =
+            serde_json::to_value(client.build_request(&user_history(), &[], Some("Dynamic")))
+                .unwrap();
+
+        assert!(wire.get("prompt_cache_key").is_none());
+        assert_eq!(
+            wire["messages"],
+            json!([
+                { "role": "system", "content": "Stable\n\nDynamic" },
+                { "role": "user", "content": "What's in Cargo.toml?" }
+            ])
+        );
+    }
+
+    #[test]
     fn dynamic_context_creates_a_system_message_without_session_instructions() {
         let client = OpenAiClient::new(
             "https://example.test/v1".to_string(),
             "test-key".to_string(),
             "test-model".to_string(),
             1024,
+            String::new(),
+            false,
             String::new(),
         )
         .unwrap();
@@ -970,6 +1098,8 @@ mod tests {
             "test-key".to_string(),
             "test-model".to_string(),
             1234,
+            String::new(),
+            false,
             String::new(),
         )
         .unwrap()
@@ -1929,7 +2059,16 @@ mod tests {
         let api_key = std::env::var("CANE_API_KEY").unwrap_or("none".to_string());
         let model = std::env::var("CANE_MODEL").expect("set CANE_MODEL");
 
-        let client = OpenAiClient::new(base_url, api_key, model, 8192, String::new()).unwrap();
+        let client = OpenAiClient::new(
+            base_url,
+            api_key,
+            model,
+            8192,
+            String::new(),
+            false,
+            String::new(),
+        )
+        .unwrap();
         let messages = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {

@@ -335,6 +335,7 @@ pub async fn spawn_agent_with_shell(
     sessions: SessionConfig,
     shell: AgentShellConfig,
 ) -> Result<AgentHandle, AgentStartError> {
+    let session_id = SessionId::generate();
     let workspace_path = workspace
         .root()
         .to_str()
@@ -349,6 +350,8 @@ pub async fn spawn_agent_with_shell(
         provider.model.clone(),
         provider.max_tokens,
         sessions.instructions().to_string(),
+        provider.prompt_caching,
+        format!("cane:{session_id}"),
     )?;
     let (events_tx, events_rx) = mpsc::channel(64);
     let events = EventSink::new(events_tx);
@@ -380,7 +383,6 @@ pub async fn spawn_agent_with_shell(
         }
     }
     let tool_set = ToolSet::new(Arc::new(workspace), shell_tool);
-    let session_id = SessionId::generate();
     let run_id = RunId::generate();
     let mut journal = SessionJournal::create(sessions.sessions_directory(), session_id).await?;
 
@@ -1806,6 +1808,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model: "test-model".to_string(),
             max_tokens: 1234,
+            prompt_caching: false,
         }
     }
 
@@ -1883,6 +1886,8 @@ mod tests {
             provider.api_key,
             provider.model,
             provider.max_tokens,
+            String::new(),
+            false,
             String::new(),
         )
         .unwrap();
@@ -3416,6 +3421,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model: "test-model".to_string(),
             max_tokens: 1234,
+            prompt_caching: false,
         };
 
         // Act
@@ -3991,6 +3997,87 @@ mod tests {
             json!({
                 "role": "system",
                 "content": "<current_checklist>\n[completed] First\n[in_progress] Second\n</current_checklist>\n\nReassess this checklist against the latest user request, and replace or clear it if it is no longer appropriate."
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_caching_keeps_the_cache_key_and_stable_prefix_across_checklist_changes() {
+        let server = MockServer::start().await;
+        mount_turns(
+            &server,
+            vec![
+                tool_call_turn(&[(
+                    "checklist-1",
+                    "update_checklist",
+                    json!({
+                        "checklist": [{ "step": "Verify caching", "status": "in_progress" }]
+                    }),
+                )]),
+                text_turn("Working"),
+            ],
+        )
+        .await;
+        let sessions = TempDir::new().unwrap();
+        let config = SessionConfig::new(
+            "test-cane-version",
+            "Use the configured shell contract.",
+            sessions.path(),
+        );
+        let mut provider = test_provider(&server);
+        provider.prompt_caching = true;
+        let mut handle = spawn_agent(provider, test_workspace(), config)
+            .await
+            .unwrap();
+        let cache_key = format!("cane:{}", handle.session_id());
+        let startup = handle.events.recv().await.unwrap();
+        assert!(matches!(
+            startup,
+            AgentEvent::ChecklistUpdated(checklist) if checklist.is_empty()
+        ));
+
+        handle
+            .commands
+            .send(AgentCommand::UserInput("Start".to_string()))
+            .await
+            .unwrap();
+        drop(handle.commands);
+        let _events = collect_until_events_close(&mut handle.events).await;
+        let requests = server.received_requests().await.unwrap();
+        let bodies = requests
+            .iter()
+            .map(|request| request.body_json::<Value>().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["prompt_cache_key"], cache_key);
+        assert_eq!(bodies[1]["prompt_cache_key"], cache_key);
+        assert_eq!(bodies[0]["messages"][0], bodies[1]["messages"][0]);
+        assert_eq!(
+            bodies[0]["messages"][0],
+            json!({
+                "role": "developer",
+                "content": [{
+                    "type": "text",
+                    "text": "Use the configured shell contract.",
+                    "prompt_cache_breakpoint": { "mode": "explicit" }
+                }]
+            })
+        );
+        assert_eq!(
+            bodies[0]["messages"].as_array().unwrap().last().unwrap()["role"],
+            "user"
+        );
+        assert_eq!(
+            bodies[1]["messages"].as_array().unwrap().last().unwrap(),
+            &json!({
+                "role": "developer",
+                "content": concat!(
+                    "<current_checklist>\n",
+                    "[in_progress] Verify caching\n",
+                    "</current_checklist>\n\n",
+                    "Reassess this checklist against the latest user request, and replace or clear it if it is no longer appropriate."
+                )
             })
         );
     }

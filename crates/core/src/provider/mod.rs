@@ -13,6 +13,7 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub model: String,
     pub max_tokens: u32,
+    pub prompt_caching: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
