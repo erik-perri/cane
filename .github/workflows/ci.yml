@@ -92,6 +92,7 @@ jobs:
       - name: Merge coverage
         run: |
           tracefiles=(coverage-data/*/coverage.info)
+          sed -i '/^SF:/s|\\|/|g' "${tracefiles[@]}"
           arguments=()
           for tracefile in "${tracefiles[@]}"; do
             arguments+=(--add-tracefile "$tracefile")
