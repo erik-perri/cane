@@ -2200,6 +2200,121 @@ mod tests {
         handle.join().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn unsupported_workspace_consents_warn_and_seed_no_authority() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions = TempDir::new().unwrap();
+        let config_root = TempDir::new().unwrap();
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
+        std::fs::write(
+            store.document_path(),
+            br#"{"schema_version":99,"consents":[]}"#,
+        )
+        .unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path())
+            .with_workspace_capability_consents(store);
+
+        // Act
+        let mut handle = spawn_agent(test_provider(&server), test_workspace(), config)
+            .await
+            .unwrap();
+        let warning = handle.events.recv().await.unwrap();
+        let records = read_journal_records(handle.journal_path()).await;
+
+        // Assert
+        assert!(matches!(
+            warning,
+            AgentEvent::Warning(message)
+                if message.contains("schema version 99 is not supported")
+        ));
+        let JournalEntry::RunStarted(started) = &records[1].entry else {
+            panic!("expected run_started");
+        };
+        assert!(started.capability_consents.is_empty());
+
+        handle
+            .commands
+            .send(AgentCommand::Shutdown(ShutdownReason::InputClosed))
+            .await
+            .unwrap();
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreadable_workspace_consents_warn_and_seed_no_authority() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions = TempDir::new().unwrap();
+        let config_root = TempDir::new().unwrap();
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
+        std::fs::create_dir(store.document_path()).unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path())
+            .with_workspace_capability_consents(store);
+
+        // Act
+        let mut handle = spawn_agent(test_provider(&server), test_workspace(), config)
+            .await
+            .unwrap();
+        let warning = handle.events.recv().await.unwrap();
+        let records = read_journal_records(handle.journal_path()).await;
+
+        // Assert
+        assert!(matches!(
+            warning,
+            AgentEvent::Warning(message)
+                if message.contains("Workspace capability consents are unavailable:")
+        ));
+        let JournalEntry::RunStarted(started) = &records[1].entry else {
+            panic!("expected run_started");
+        };
+        assert!(started.capability_consents.is_empty());
+
+        handle
+            .commands
+            .send(AgentCommand::Shutdown(ShutdownReason::InputClosed))
+            .await
+            .unwrap();
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_consent_schema_refresh_failure_warns_and_allows_startup() {
+        // Arrange
+        let server = MockServer::start().await;
+        let sessions = TempDir::new().unwrap();
+        let config_root = TempDir::new().unwrap();
+        let store = crate::WorkspaceCapabilityConsentStore::new(config_root.path()).unwrap();
+        std::fs::create_dir(store.schema_path()).unwrap();
+        let config = SessionConfig::new("test-cane-version", "", sessions.path())
+            .with_workspace_capability_consents(store);
+
+        // Act
+        let mut handle = spawn_agent(test_provider(&server), test_workspace(), config)
+            .await
+            .unwrap();
+        let warning = handle.events.recv().await.unwrap();
+        let records = read_journal_records(handle.journal_path()).await;
+
+        // Assert
+        assert!(matches!(
+            warning,
+            AgentEvent::Warning(message)
+                if message.contains("generated schema could not be refreshed")
+        ));
+        let JournalEntry::RunStarted(started) = &records[1].entry else {
+            panic!("expected run_started");
+        };
+        assert!(started.capability_consents.is_empty());
+
+        handle
+            .commands
+            .send(AgentCommand::Shutdown(ShutdownReason::InputClosed))
+            .await
+            .unwrap();
+        handle.join().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn exact_current_workspace_consent_is_recorded_at_startup() {
