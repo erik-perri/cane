@@ -1,5 +1,8 @@
 use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,6 +26,7 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn chat_startup_reports_each_missing_required_provider_variable() {
+    // Arrange
     let root = tempdir().unwrap();
     let cases: &[(&[(&str, &str)], &str)] = &[
         (&[], "CANE_API_KEY not set"),
@@ -37,12 +41,14 @@ fn chat_startup_reports_each_missing_required_provider_variable() {
     ];
 
     for &(environment, expected) in cases {
+        // Act
         let output = cane_command(root.path().as_os_str())
             .arg("--no-shell")
             .envs(environment.iter().copied())
             .output()
             .unwrap();
 
+        // Assert
         assert!(!output.status.success());
         assert!(
             stderr(&output).contains(expected),
@@ -54,7 +60,10 @@ fn chat_startup_reports_each_missing_required_provider_variable() {
 
 #[test]
 fn chat_startup_rejects_an_invalid_max_tokens_value() {
+    // Arrange
     let root = tempdir().unwrap();
+
+    // Act
     let output = cane_command(root.path().as_os_str())
         .arg("--no-shell")
         .env("CANE_API_KEY", "test-key")
@@ -64,6 +73,7 @@ fn chat_startup_rejects_an_invalid_max_tokens_value() {
         .output()
         .unwrap();
 
+    // Assert
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("CANE_MAX_TOKENS must be an integer"),
@@ -74,12 +84,16 @@ fn chat_startup_rejects_an_invalid_max_tokens_value() {
 
 #[test]
 fn invalid_cli_arguments_fail_before_provider_configuration_is_read() {
+    // Arrange
     let root = tempdir().unwrap();
+
+    // Act
     let output = cane_command(root.path().as_os_str())
         .args(["--no-shell", "--unsafe-shell"])
         .output()
         .unwrap();
 
+    // Assert
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("--no-shell and --unsafe-shell are mutually exclusive"),
@@ -91,7 +105,10 @@ fn invalid_cli_arguments_fail_before_provider_configuration_is_read() {
 
 #[test]
 fn doctor_prints_a_report_and_sets_status_from_required_findings() {
+    // Arrange
     let root = tempdir().unwrap();
+
+    // Act
     let output = cane_command(root.path().as_os_str())
         .arg("--doctor")
         .current_dir(root.path())
@@ -102,6 +119,7 @@ fn doctor_prints_a_report_and_sets_status_from_required_findings() {
         .lines()
         .any(|line| line.contains("[FAIL]") && line.contains("(required):"));
 
+    // Assert
     assert!(stdout.starts_with("Sandbox\n"), "stdout: {stdout}");
     assert!(stdout.contains("  platform:"), "stdout: {stdout}");
     assert!(stdout.contains("  backend:"), "stdout: {stdout}");
@@ -114,6 +132,7 @@ fn doctor_prints_a_report_and_sets_status_from_required_findings() {
 
 #[tokio::test]
 async fn no_shell_chat_completes_a_turn_against_the_configured_provider() {
+    // Arrange
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -139,10 +158,49 @@ async fn no_shell_chat_completes_a_turn_against_the_configured_provider() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    use std::io::Write;
-    child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
-    let output = child.wait_with_output().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut buffer = [0; 256];
+        let mut reported = false;
+        loop {
+            let read = stdout.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            captured.extend_from_slice(&buffer[..read]);
+            if !reported
+                && captured
+                    .windows(b"goodbye".len())
+                    .any(|part| part == b"goodbye")
+            {
+                observed_tx.send(()).unwrap();
+                reported = true;
+            }
+        }
+        captured
+    });
 
+    // Act
+    stdin.write_all(b"hello\n").unwrap();
+    if observed_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        drop(stdin);
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        let stdout = stdout_reader.join().unwrap();
+        panic!(
+            "timed out waiting for provider response; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&stdout),
+            stderr(&output)
+        );
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    let stdout = stdout_reader.join().unwrap();
+
+    // Assert
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("goodbye"));
+    assert!(String::from_utf8_lossy(&stdout).contains("goodbye"));
 }
