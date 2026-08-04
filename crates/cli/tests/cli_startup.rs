@@ -1,8 +1,6 @@
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -10,13 +8,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn cane_command(cane_home: &OsStr) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cane"));
     command
-        .env_clear()
+        .env_remove("CANE_API_KEY")
+        .env_remove("CANE_BASE_URL")
+        .env_remove("CANE_MODEL")
+        .env_remove("CANE_MAX_TOKENS")
+        .env_remove("CANE_PROMPT_CACHING")
         .env("CANE_HOME", cane_home)
         .env("RUST_LOG", "off")
         .stdin(Stdio::null());
-    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-        command.env("LLVM_PROFILE_FILE", profile);
-    }
     command
 }
 
@@ -158,53 +157,12 @@ async fn no_shell_chat_completes_a_turn_against_the_configured_provider() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let (observed_tx, observed_rx) = mpsc::channel();
-    let stdout_reader = std::thread::spawn(move || {
-        let mut captured = Vec::new();
-        let mut buffer = [0; 256];
-        let mut reported = false;
-        loop {
-            let read = stdout.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            captured.extend_from_slice(&buffer[..read]);
-            if !reported
-                && captured
-                    .windows(b"goodbye".len())
-                    .any(|part| part == b"goodbye")
-            {
-                observed_tx.send(()).unwrap();
-                reported = true;
-            }
-        }
-        captured
-    });
 
     // Act
-    stdin.write_all(b"hello\n").unwrap();
-    let observed =
-        tokio::task::spawn_blocking(move || observed_rx.recv_timeout(Duration::from_secs(5)))
-            .await
-            .unwrap();
-    if observed.is_err() {
-        drop(stdin);
-        let _ = child.kill();
-        let output = child.wait_with_output().unwrap();
-        let stdout = stdout_reader.join().unwrap();
-        panic!(
-            "timed out waiting for provider response; stdout: {}; stderr: {}",
-            String::from_utf8_lossy(&stdout),
-            stderr(&output)
-        );
-    }
-    drop(stdin);
+    child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
     let output = child.wait_with_output().unwrap();
-    let stdout = stdout_reader.join().unwrap();
 
     // Assert
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(String::from_utf8_lossy(&stdout).contains("goodbye"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("goodbye"));
 }
