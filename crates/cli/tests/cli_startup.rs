@@ -185,7 +185,11 @@ async fn no_shell_chat_completes_a_turn_against_the_configured_provider() {
 
     // Act
     stdin.write_all(b"hello\n").unwrap();
-    if observed_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+    let observed =
+        tokio::task::spawn_blocking(move || observed_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap();
+    if observed.is_err() {
         drop(stdin);
         let _ = child.kill();
         let output = child.wait_with_output().unwrap();
